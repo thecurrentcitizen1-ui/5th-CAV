@@ -1,87 +1,112 @@
-# Battalion Clerk v1
+# Battalion Clerk v1.1
 
-A lightweight Discord data collector for the 2d Battalion, 327th Infantry HLL: Vietnam community.
+Lightweight Discord data collector for the **1st Battalion, 5th Cavalry Regiment** Hell Let Loose: Vietnam community.
 
-## What v1 collects
+Battalion Clerk is intentionally **not** the administrative brain of the community. The future website/database owns personnel records, ranks, awards, qualifications, operations, readiness, equipment, and promotions. Battalion Clerk only collects Discord activity and forwards it.
 
-- Discord member joins
-- Discord member leaves
-- Voice channel joins
-- Voice channel leaves
+## v1.1 collects
+
+- Member joins and leaves
+- Voice channel joins and leaves
 - Voice channel moves
-- Discord user IDs, usernames, display names, guild/channel IDs, and timestamps associated with those events
+- Completed voice-session duration in seconds and `HH:MM:SS`
+- Discord user ID, username, display name, guild/channel IDs, and timestamps
+- Current voice users are re-seeded when the bot restarts so their next leave/move still closes a usable session
+- Clear Railway console logs for testing
 
-Battalion Clerk deliberately does **not** manage ranks, awards, personnel files, training, promotions, or other community administration. Those systems belong on the website.
+Example Railway logs:
+
+```text
+[VOICE JOIN] Garretson (123456789) -> #Operations Room
+[VOICE LEAVE] Garretson (123456789) <- #Operations Room | session=00:42:17
+[VOICE MOVE] Garretson (123456789) #Ready Room -> #Operations Room | prior_session=00:05:31
+```
 
 ## Data flow
 
-`Discord -> Battalion Clerk -> Website API`
-
-Every event is also written to a local SQLite buffer first. This prevents attendance/activity data from disappearing if the website is temporarily offline.
-
-## Discord Developer Portal setup
-
-1. Create a new application named **Battalion Clerk**.
-2. Add a bot user.
-3. In **Bot > Privileged Gateway Intents**, enable **Server Members Intent**. Member join/leave events require the members intent in discord.py.
-4. Invite the bot to the Vietnam Discord server.
-5. The bot only needs basic visibility/connectivity for collection. It does not need Administrator or Manage Roles for v1.
-
-## Install
-
-Python 3.11+ recommended.
-
-```bash
-python -m venv .venv
+```text
+Discord -> Battalion Clerk -> Website API -> Website Database
 ```
 
-Windows:
+Every event is first written to a local SQLite safety buffer. The SQLite buffer is **not intended to be the permanent source of truth**.
 
-```bash
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
+### Railway persistence
+
+Railway container files can be replaced during deploys. Until the website API/database exists, you can attach a Railway Volume and set:
+
+```text
+LOCAL_DB_PATH=/data/battalion_clerk.db
 ```
 
-macOS/Linux:
+Mount the Railway Volume at `/data`.
 
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+Once the website API is live, the website database should become the authoritative long-term store.
+
+## Railway variables
+
+Required:
+
+```text
+DISCORD_TOKEN=your_secret_bot_token
+GUILD_ID=your_discord_server_id
 ```
 
-Edit `.env` and add your bot token and guild ID.
+Optional now / used later:
 
-## Run
+```text
+LOCAL_DB_PATH=data/battalion_clerk.db
+WEBSITE_API_URL=
+WEBSITE_API_KEY=
+```
 
-```bash
+Never commit the real `DISCORD_TOKEN` or `WEBSITE_API_KEY` to GitHub.
+
+## Railway start command
+
+```text
 python bot.py
 ```
 
-## Event format sent to the future website
+## Discord Developer Portal
+
+Enable **Server Members Intent**. Battalion Clerk also requests Discord's normal guild and voice-state intents in code. It does not need Administrator, Manage Roles, or Message Content access for this collector.
+
+## Voice warning
+
+You may see a warning that PyNaCl is not installed and the bot cannot *join* Discord voice. That is harmless for Battalion Clerk v1.1. The collector does not connect to voice audio; it only watches voice-state membership changes.
+
+## Website event example
+
+A completed voice session is emitted as:
 
 ```json
 {
   "source": "battalion-clerk",
-  "event_type": "voice_join",
-  "created_at": "2026-08-14T22:00:00+00:00",
+  "event_type": "voice_session",
+  "created_at": "2026-08-14T23:00:00+00:00",
   "payload": {
     "guild_id": "123",
     "discord_user_id": "456",
     "username": "example",
     "display_name": "PFC Example",
-    "from_channel_id": null,
-    "from_channel_name": null,
-    "to_channel_id": "789",
-    "to_channel_name": "Operation Voice",
-    "timestamp": "2026-08-14T22:00:00+00:00"
+    "channel_id": "789",
+    "channel_name": "Operations Room",
+    "started_at": "2026-08-14T22:15:00+00:00",
+    "ended_at": "2026-08-14T23:00:00+00:00",
+    "duration_seconds": 2700,
+    "duration_hms": "00:45:00",
+    "close_reason": "voice_leave",
+    "recovered_after_restart": false
   }
 }
 ```
 
-## Next planned layer
+## Next layer
 
-When the Vietnam website exists, add an authenticated `/api/integrations/discord/events` endpoint. Battalion Clerk will POST these raw events there. The website can then calculate official operation attendance, time in channel, streaks, activity history, and other personnel metrics.
+The website should expose an authenticated endpoint such as:
 
-Do **not** put the Discord bot token in the website source code or GitHub repository.
+```text
+/api/integrations/discord/events
+```
+
+Battalion Clerk can then POST raw events and completed sessions there. The website can decide what counts as an official operation, minimum attendance, credited service time, and other personnel metrics.

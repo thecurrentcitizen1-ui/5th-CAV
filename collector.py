@@ -17,11 +17,19 @@ WEBSITE_API_KEY = os.getenv('WEBSITE_API_KEY', '').strip()
 
 
 class DataCollector:
+    """Stores every event locally first, then optionally forwards it to the website.
+
+    The SQLite database is a safety buffer, not the long-term source of truth.
+    On Railway, attach a Volume if you want the local buffer to survive redeploys.
+    The future website database should be the authoritative persistent store.
+    """
+
     def __init__(self) -> None:
         path = Path(DB_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(path)
         self._init_db()
+        log.info('[BUFFER READY] SQLite=%s | website_api=%s', self.db_path, 'configured' if WEBSITE_API_URL else 'not configured')
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
@@ -54,6 +62,7 @@ class DataCollector:
             delivered = await self._post_to_website(envelope)
             if delivered:
                 await asyncio.to_thread(self._mark_delivered, event_id)
+                log.info('[API DELIVERED] event=%s id=%s', event_type, event_id)
 
     def _store_local(self, event_type: str, envelope: Dict[str, Any], created_at: str) -> int:
         with self._connect() as conn:
