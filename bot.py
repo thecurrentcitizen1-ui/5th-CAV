@@ -27,6 +27,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
+collector_started = False
 
 # One active voice session per Discord member.
 # key: (guild_id, user_id) -> session metadata
@@ -85,10 +86,13 @@ async def close_session(member: discord.Member, ended_at: datetime, reason: str)
 
 @bot.event
 async def on_ready():
+    global collector_started
+    if not collector_started:
+        await collector.start()
+        collector_started = True
+
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
-    # Railway/container restarts clear in-memory sessions. Re-seed anyone who is
-    # already in voice so the next leave/move still produces a usable session.
     now = utc_now()
     voice_sessions.clear()
 
@@ -102,6 +106,13 @@ async def on_ready():
             'timestamp': iso(now),
         })
 
+        # Sync current Discord identity into the shared database. This does not
+        # create website personnel records; it only establishes source identity.
+        synced_members = 0
+        for member in guild.members:
+            await collector.upsert_member(member)
+            synced_members += 1
+
         recovered_count = 0
         for channel in guild.voice_channels:
             for member in channel.members:
@@ -111,13 +122,17 @@ async def on_ready():
                 recovered_count += 1
                 log.info('[VOICE RECOVER] %s (%s) already in #%s', member.display_name, member.id, channel.name)
 
-        log.info('[COLLECTOR READY] guild=%s (%s) recovered_voice_sessions=%s', guild.name, guild.id, recovered_count)
+        log.info(
+            '[GUILD SYNC] guild=%s (%s) members=%s recovered_voice_sessions=%s',
+            guild.name, guild.id, synced_members, recovered_count
+        )
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     if GUILD_ID and member.guild.id != GUILD_ID:
         return
+    await collector.upsert_member(member)
     await collector.record_event('member_join', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
@@ -135,20 +150,41 @@ async def on_member_remove(member: discord.Member):
     if GUILD_ID and member.guild.id != GUILD_ID:
         return
 
+    now = utc_now()
     if not member.bot and (member.guild.id, member.id) in voice_sessions:
-        session = await close_session(member, utc_now(), 'member_left_guild')
+        session = await close_session(member, now, 'member_left_guild')
         if session:
             log.info('[VOICE SESSION] %s #%s %s (member left server)', member.display_name, session['channel_name'], session['duration_hms'])
 
+    await collector.mark_member_left(member, now)
     await collector.record_event('member_leave', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
         'username': member.name,
         'display_name': member.display_name,
         'is_bot': member.bot,
-        'timestamp': iso(utc_now()),
+        'timestamp': iso(now),
     })
     log.info('[MEMBER LEAVE] %s (%s)', member.display_name, member.id)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if GUILD_ID and after.guild.id != GUILD_ID:
+        return
+    if before.name == after.name and before.display_name == after.display_name:
+        return
+    await collector.upsert_member(after)
+    await collector.record_event('member_identity_update', {
+        'guild_id': str(after.guild.id),
+        'discord_user_id': str(after.id),
+        'username': after.name,
+        'display_name': after.display_name,
+        'previous_username': before.name,
+        'previous_display_name': before.display_name,
+        'timestamp': iso(utc_now()),
+    })
+    log.info('[MEMBER UPDATE] %s (%s)', after.display_name, after.id)
 
 
 @bot.event
@@ -161,10 +197,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     before_id = str(before.channel.id) if before.channel else None
     after_id = str(after.channel.id) if after.channel else None
     if before_id == after_id:
-        # Ignore mute/deafen/stream/video toggles. Attendance is channel presence only.
         return
 
     now = utc_now()
+    await collector.upsert_member(member)
 
     if before.channel is None and after.channel is not None:
         begin_session(member, after.channel, now)
@@ -198,6 +234,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 
 if not TOKEN:
-    raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables or your local .env file.')
+    raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables.')
 
 bot.run(TOKEN)

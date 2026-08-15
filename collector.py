@@ -5,9 +5,11 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import aiohttp
+
+from database import Database
 
 log = logging.getLogger('battalion-clerk.collector')
 
@@ -17,11 +19,14 @@ WEBSITE_API_KEY = os.getenv('WEBSITE_API_KEY', '').strip()
 
 
 class DataCollector:
-    """Stores every event locally first, then optionally forwards it to the website.
+    """Collects Discord activity and persists it safely.
 
-    The SQLite database is a safety buffer, not the long-term source of truth.
-    On Railway, attach a Volume if you want the local buffer to survive redeploys.
-    The future website database should be the authoritative persistent store.
+    Persistence order:
+      1. Local SQLite safety buffer
+      2. Railway PostgreSQL (when DATABASE_URL is configured)
+      3. Optional future website API forwarding
+
+    PostgreSQL is the durable shared data store intended for the future website.
     """
 
     def __init__(self) -> None:
@@ -29,7 +34,19 @@ class DataCollector:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(path)
         self._init_db()
-        log.info('[BUFFER READY] SQLite=%s | website_api=%s', self.db_path, 'configured' if WEBSITE_API_URL else 'not configured')
+        self.database = Database()
+        log.info('[BUFFER READY] SQLite=%s', self.db_path)
+
+    async def start(self) -> None:
+        await self.database.connect()
+        log.info(
+            '[COLLECTOR READY] postgres=%s | website_api=%s',
+            'configured' if self.database.enabled else 'not configured',
+            'configured' if WEBSITE_API_URL else 'not configured',
+        )
+
+    async def close(self) -> None:
+        await self.database.close()
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
@@ -42,13 +59,39 @@ class DataCollector:
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    postgres_delivered INTEGER NOT NULL DEFAULT 0,
                     api_delivered INTEGER NOT NULL DEFAULT 0
                 )
             ''')
+            # Upgrade v1.1 databases in place if needed.
+            cols = {row[1] for row in conn.execute('PRAGMA table_info(events)').fetchall()}
+            if 'postgres_delivered' not in cols:
+                conn.execute('ALTER TABLE events ADD COLUMN postgres_delivered INTEGER NOT NULL DEFAULT 0')
+            if 'api_delivered' not in cols:
+                conn.execute('ALTER TABLE events ADD COLUMN api_delivered INTEGER NOT NULL DEFAULT 0')
             conn.commit()
 
+    async def upsert_member(self, member, left_at: Optional[datetime] = None) -> None:
+        await self.database.upsert_member(
+            guild_id=member.guild.id,
+            discord_user_id=member.id,
+            username=member.name,
+            display_name=member.display_name,
+            is_bot=member.bot,
+            joined_at=member.joined_at,
+            left_at=left_at,
+        )
+
+    async def mark_member_left(self, member, left_at: datetime) -> None:
+        await self.database.mark_member_left(
+            guild_id=member.guild.id,
+            discord_user_id=member.id,
+            left_at=left_at,
+        )
+
     async def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at_dt = datetime.now(timezone.utc)
+        created_at = created_at_dt.isoformat()
         envelope = {
             'source': 'battalion-clerk',
             'event_type': event_type,
@@ -58,10 +101,21 @@ class DataCollector:
 
         event_id = await asyncio.to_thread(self._store_local, event_type, envelope, created_at)
 
+        postgres_delivered = False
+        try:
+            await self.database.record_event(event_type, payload, created_at_dt)
+            if event_type == 'voice_session':
+                await self.database.record_voice_session(payload)
+            postgres_delivered = self.database.enabled
+            if postgres_delivered:
+                await asyncio.to_thread(self._mark_postgres_delivered, event_id)
+        except Exception:
+            log.exception('[POSTGRES ERROR] event=%s id=%s remains in local safety buffer', event_type, event_id)
+
         if WEBSITE_API_URL:
             delivered = await self._post_to_website(envelope)
             if delivered:
-                await asyncio.to_thread(self._mark_delivered, event_id)
+                await asyncio.to_thread(self._mark_api_delivered, event_id)
                 log.info('[API DELIVERED] event=%s id=%s', event_type, event_id)
 
     def _store_local(self, event_type: str, envelope: Dict[str, Any], created_at: str) -> int:
@@ -73,7 +127,12 @@ class DataCollector:
             conn.commit()
             return int(cur.lastrowid)
 
-    def _mark_delivered(self, event_id: int) -> None:
+    def _mark_postgres_delivered(self, event_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute('UPDATE events SET postgres_delivered = 1 WHERE id = ?', (event_id,))
+            conn.commit()
+
+    def _mark_api_delivered(self, event_id: int) -> None:
         with self._connect() as conn:
             conn.execute('UPDATE events SET api_delivered = 1 WHERE id = ?', (event_id,))
             conn.commit()

@@ -1,112 +1,126 @@
-# Battalion Clerk v1.1
+# Battalion Clerk v1.2
 
-Lightweight Discord data collector for the **1st Battalion, 5th Cavalry Regiment** Hell Let Loose: Vietnam community.
+Persistent Discord data collector for the **1st Battalion, 5th Cavalry Regiment** Hell Let Loose: Vietnam community.
 
-Battalion Clerk is intentionally **not** the administrative brain of the community. The future website/database owns personnel records, ranks, awards, qualifications, operations, readiness, equipment, and promotions. Battalion Clerk only collects Discord activity and forwards it.
+The design rule remains the same: **the website is the brain; Battalion Clerk is a collector.** The bot does not own ranks, awards, promotions, DEROS, readiness, equipment, or personnel decisions.
 
-## v1.1 collects
+## What v1.2 adds
 
-- Member joins and leaves
-- Voice channel joins and leaves
-- Voice channel moves
-- Completed voice-session duration in seconds and `HH:MM:SS`
-- Discord user ID, username, display name, guild/channel IDs, and timestamps
-- Current voice users are re-seeded when the bot restarts so their next leave/move still closes a usable session
-- Clear Railway console logs for testing
+- Railway PostgreSQL support through `DATABASE_URL`
+- Automatically creates its database tables at startup
+- Syncs current Discord member identity on startup
+- Tracks username/display-name changes
+- Stores member joins/leaves persistently
+- Stores every raw collector event in `discord_events`
+- Stores completed voice sessions in a dedicated `voice_sessions` table
+- Keeps a local SQLite safety buffer as a fallback
+- Includes a reserved `website_member_links` table for connecting Discord IDs to future website personnel IDs
 
-Example Railway logs:
+## Permanent data model
+
+### `discord_members`
+Source identity only:
+- Discord user ID
+- Guild/server ID
+- Username
+- Display name
+- Discord join date
+- Leave date
+- Last-seen timestamp
+
+### `discord_events`
+Raw audit/event stream:
+- member join/leave
+- username/display-name changes
+- voice join/leave/move
+- completed voice-session envelopes
+- collector ready events
+
+### `voice_sessions`
+Website-friendly completed attendance sessions:
+- member
+- channel
+- start/end timestamps
+- total duration in seconds
+- close reason
+- whether the session was recovered after a bot restart
+
+### `website_member_links`
+Reserved bridge for later:
+- Discord member ID -> website personnel ID
+
+Battalion Clerk does **not** automatically create personnel records. The future website controls linking and personnel administration.
+
+## Recommended Railway architecture
 
 ```text
-[VOICE JOIN] Garretson (123456789) -> #Operations Room
-[VOICE LEAVE] Garretson (123456789) <- #Operations Room | session=00:42:17
-[VOICE MOVE] Garretson (123456789) #Ready Room -> #Operations Room | prior_session=00:05:31
+Discord
+   |
+   v
+Battalion Clerk (Railway service)
+   |
+   v
+Railway PostgreSQL  <---- future 1/5 Cavalry website
 ```
 
-## Data flow
+The bot and website can therefore read/write the same persistent database without making Discord the source of truth.
+
+## Railway setup
+
+Keep your existing variables:
 
 ```text
-Discord -> Battalion Clerk -> Website API -> Website Database
+DISCORD_TOKEN=...
+GUILD_ID=...
 ```
 
-Every event is first written to a local SQLite safety buffer. The SQLite buffer is **not intended to be the permanent source of truth**.
-
-### Railway persistence
-
-Railway container files can be replaced during deploys. Until the website API/database exists, you can attach a Railway Volume and set:
+Add a PostgreSQL database to the same Railway project, then add this variable to the **5th-CAV / Battalion Clerk service**:
 
 ```text
-LOCAL_DB_PATH=/data/battalion_clerk.db
+DATABASE_URL=${{Postgres.DATABASE_URL}}
 ```
 
-Mount the Railway Volume at `/data`.
+Railway may give the database service a different name. Use the reference variable Railway offers for that database's `DATABASE_URL`.
 
-Once the website API is live, the website database should become the authoritative long-term store.
-
-## Railway variables
-
-Required:
-
-```text
-DISCORD_TOKEN=your_secret_bot_token
-GUILD_ID=your_discord_server_id
-```
-
-Optional now / used later:
-
-```text
-LOCAL_DB_PATH=data/battalion_clerk.db
-WEBSITE_API_URL=
-WEBSITE_API_KEY=
-```
-
-Never commit the real `DISCORD_TOKEN` or `WEBSITE_API_KEY` to GitHub.
-
-## Railway start command
+The start command remains:
 
 ```text
 python bot.py
 ```
 
-## Discord Developer Portal
-
-Enable **Server Members Intent**. Battalion Clerk also requests Discord's normal guild and voice-state intents in code. It does not need Administrator, Manage Roles, or Message Content access for this collector.
-
-## Voice warning
-
-You may see a warning that PyNaCl is not installed and the bot cannot *join* Discord voice. That is harmless for Battalion Clerk v1.1. The collector does not connect to voice audio; it only watches voice-state membership changes.
-
-## Website event example
-
-A completed voice session is emitted as:
-
-```json
-{
-  "source": "battalion-clerk",
-  "event_type": "voice_session",
-  "created_at": "2026-08-14T23:00:00+00:00",
-  "payload": {
-    "guild_id": "123",
-    "discord_user_id": "456",
-    "username": "example",
-    "display_name": "PFC Example",
-    "channel_id": "789",
-    "channel_name": "Operations Room",
-    "started_at": "2026-08-14T22:15:00+00:00",
-    "ended_at": "2026-08-14T23:00:00+00:00",
-    "duration_seconds": 2700,
-    "duration_hms": "00:45:00",
-    "close_reason": "voice_leave",
-    "recovered_after_restart": false
-  }
-}
-```
-
-## Next layer
-
-The website should expose an authenticated endpoint such as:
+After deployment, the logs should include:
 
 ```text
-/api/integrations/discord/events
+[POSTGRES READY] PostgreSQL ...
+[COLLECTOR READY] postgres=configured | website_api=not configured
+[GUILD SYNC] guild=... members=... recovered_voice_sessions=...
 ```
 
-Battalion Clerk can then POST raw events and completed sessions there. The website can decide what counts as an official operation, minimum attendance, credited service time, and other personnel metrics.
+## Local safety buffer
+
+SQLite remains enabled as a safety buffer. It is not the authoritative store once PostgreSQL is active.
+
+If you later attach a Railway Volume at `/data`, set:
+
+```text
+LOCAL_DB_PATH=/data/battalion_clerk.db
+```
+
+This is optional once PostgreSQL is working, but it gives you an additional on-service buffer.
+
+## Discord permissions/intents
+
+Keep **Server Members Intent** enabled in the Discord Developer Portal. Battalion Clerk also uses normal guild and voice-state intents. It does not need Administrator, Manage Roles, or Message Content permission.
+
+## Next website step
+
+When the website is created, it can use the same PostgreSQL database and calculate things such as:
+
+- qualifying event attendance
+- total unit activity
+- operation attendance
+- training attendance
+- last activity
+- Discord account linkage
+
+Those calculated results belong to the website, not Battalion Clerk.
