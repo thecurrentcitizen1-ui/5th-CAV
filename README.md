@@ -1,126 +1,31 @@
-# Battalion Clerk v1.2
+# 1/5 Cavalry Battalion Clerk — Duty Automation
 
-Persistent Discord data collector for the **1st Battalion, 5th Cavalry Regiment** Hell Let Loose: Vietnam community.
+Discord companion service for the website duty-credit bridge.
 
-The design rule remains the same: **the website is the brain; Battalion Clerk is a collector.** The bot does not own ranks, awards, promotions, DEROS, readiness, equipment, or personnel decisions.
+## Commands
+- `/duty-channel duty_type channel` — permanently assigns Training, Operation, or Meeting voice duty station.
+- `/duty-channel-status` — shows configured duty stations.
+- `/schedule` — files an official duty period. Only voice time overlapping this window can earn credit.
+- `/duty-status` — flushes current voice presence and shows minutes toward the 45-minute requirement.
+- `/close-duty` — files final live presence, closes the duty period, and reports credited strength.
 
-## What v1.2 adds
+## Credit rules
+- Exactly three categories: Training, Operation, Meeting.
+- 45 minutes (2700 seconds) of cumulative qualifying presence earns one credit.
+- Members may leave and return; qualifying chunks accumulate.
+- Time outside the scheduled event window does not count.
+- Presence in non-assigned channels does not count.
+- Duplicate voice chunks are rejected by the website bridge.
+- Operation duty can be linked to an existing website operation UUID and will file participation in the Soldier's combat operations record.
 
-- Railway PostgreSQL support through `DATABASE_URL`
-- Automatically creates its database tables at startup
-- Syncs current Discord member identity on startup
-- Tracks username/display-name changes
-- Stores member joins/leaves persistently
-- Stores every raw collector event in `discord_events`
-- Stores completed voice sessions in a dedicated `voice_sessions` table
-- Keeps a local SQLite safety buffer as a fallback
-- Includes a reserved `website_member_links` table for connecting Discord IDs to future website personnel IDs
+## Railway
+Deploy this folder as a separate worker service. Configure the variables in `.env.example` in Railway. The website and bot MUST share the same `CLERK_SYNC_KEY` value.
 
-## Permanent data model
+Discord Developer Portal intents required: **Server Members Intent** and **Voice States** (voice states are part of standard gateway intents; member intent must be enabled for member resolution).
 
-### `discord_members`
-Source identity only:
-- Discord user ID
-- Guild/server ID
-- Username
-- Display name
-- Discord join date
-- Leave date
-- Last-seen timestamp
 
-### `discord_events`
-Raw audit/event stream:
-- member join/leave
-- username/display-name changes
-- voice join/leave/move
-- completed voice-session envelopes
-- collector ready events
+## Guild configuration
+`TEST_GUILD_ID` is preferred for immediate slash-command synchronization. If it is not set, the bot will use `GUILD_ID`. If neither is configured, commands are synchronized globally and may take longer to appear. It is safe for both Railway variables to exist; when both are present, `TEST_GUILD_ID` takes precedence.
 
-### `voice_sessions`
-Website-friendly completed attendance sessions:
-- member
-- channel
-- start/end timestamps
-- total duration in seconds
-- close reason
-- whether the session was recovered after a bot restart
-
-### `website_member_links`
-Reserved bridge for later:
-- Discord member ID -> website personnel ID
-
-Battalion Clerk does **not** automatically create personnel records. The future website controls linking and personnel administration.
-
-## Recommended Railway architecture
-
-```text
-Discord
-   |
-   v
-Battalion Clerk (Railway service)
-   |
-   v
-Railway PostgreSQL  <---- future 1/5 Cavalry website
-```
-
-The bot and website can therefore read/write the same persistent database without making Discord the source of truth.
-
-## Railway setup
-
-Keep your existing variables:
-
-```text
-DISCORD_TOKEN=...
-GUILD_ID=...
-```
-
-Add a PostgreSQL database to the same Railway project, then add this variable to the **5th-CAV / Battalion Clerk service**:
-
-```text
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-```
-
-Railway may give the database service a different name. Use the reference variable Railway offers for that database's `DATABASE_URL`.
-
-The start command remains:
-
-```text
-python bot.py
-```
-
-After deployment, the logs should include:
-
-```text
-[POSTGRES READY] PostgreSQL ...
-[COLLECTOR READY] postgres=configured | website_api=not configured
-[GUILD SYNC] guild=... members=... recovered_voice_sessions=...
-```
-
-## Local safety buffer
-
-SQLite remains enabled as a safety buffer. It is not the authoritative store once PostgreSQL is active.
-
-If you later attach a Railway Volume at `/data`, set:
-
-```text
-LOCAL_DB_PATH=/data/battalion_clerk.db
-```
-
-This is optional once PostgreSQL is working, but it gives you an additional on-service buffer.
-
-## Discord permissions/intents
-
-Keep **Server Members Intent** enabled in the Discord Developer Portal. Battalion Clerk also uses normal guild and voice-state intents. It does not need Administrator, Manage Roles, or Message Content permission.
-
-## Next website step
-
-When the website is created, it can use the same PostgreSQL database and calculate things such as:
-
-- qualifying event attendance
-- total unit activity
-- operation attendance
-- training attendance
-- last activity
-- Discord account linkage
-
-Those calculated results belong to the website, not Battalion Clerk.
+## Startup verification
+On boot the worker validates `DISCORD_TOKEN`, `WEBSITE_BASE_URL`, and `CLERK_SYNC_KEY`, prints the selected guild synchronization source, timezone, flush interval, and website bridge URL, then starts the Discord client.
