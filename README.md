@@ -1,126 +1,59 @@
-# Battalion Clerk v1.2
+# 5th Cavalry Regiment — Phase I
 
-Persistent Discord data collector for the **1st Battalion, 5th Cavalry Regiment** Hell Let Loose: Vietnam community.
+A fresh Hell Let Loose: Vietnam website foundation for **1st Battalion, 5th Cavalry Regiment**. This is not a reskin of the War of Rights site. The older codebase was used only as a reference for workflow ideas.
 
-The design rule remains the same: **the website is the brain; Battalion Clerk is a collector.** The bot does not own ranks, awards, promotions, DEROS, readiness, equipment, or personnel decisions.
+## Phase I includes
 
-## What v1.2 adds
+- Completely new Vietnam-era visual system and responsive layout.
+- Public Headquarters, Organization, Operations and Recruiting shells.
+- Member login and role-aware staff navigation.
+- Member dashboard and 201 File shell.
+- S-1, S-2, S-3, S-4 and Battalion HQ access architecture.
+- New PostgreSQL website schema for personnel, unit organization, operations, qualifications, equipment, awards and activity credit.
+- Direct read integration with the existing **Battalion Clerk** PostgreSQL tables (`discord_members`, `voice_sessions`, `website_member_links`).
+- Automatic initial administrator creation using Railway environment variables.
 
-- Railway PostgreSQL support through `DATABASE_URL`
-- Automatically creates its database tables at startup
-- Syncs current Discord member identity on startup
-- Tracks username/display-name changes
-- Stores member joins/leaves persistently
-- Stores every raw collector event in `discord_events`
-- Stores completed voice sessions in a dedicated `voice_sessions` table
-- Keeps a local SQLite safety buffer as a fallback
-- Includes a reserved `website_member_links` table for connecting Discord IDs to future website personnel IDs
+## Railway deployment
 
-## Permanent data model
+Create a **new website service/repository** for this project. Do not overwrite the Battalion Clerk service.
 
-### `discord_members`
-Source identity only:
-- Discord user ID
-- Guild/server ID
-- Username
-- Display name
-- Discord join date
-- Leave date
-- Last-seen timestamp
+Use the same PostgreSQL service that Battalion Clerk already uses.
 
-### `discord_events`
-Raw audit/event stream:
-- member join/leave
-- username/display-name changes
-- voice join/leave/move
-- completed voice-session envelopes
-- collector ready events
-
-### `voice_sessions`
-Website-friendly completed attendance sessions:
-- member
-- channel
-- start/end timestamps
-- total duration in seconds
-- close reason
-- whether the session was recovered after a bot restart
-
-### `website_member_links`
-Reserved bridge for later:
-- Discord member ID -> website personnel ID
-
-Battalion Clerk does **not** automatically create personnel records. The future website controls linking and personnel administration.
-
-## Recommended Railway architecture
-
-```text
-Discord
-   |
-   v
-Battalion Clerk (Railway service)
-   |
-   v
-Railway PostgreSQL  <---- future 1/5 Cavalry website
-```
-
-The bot and website can therefore read/write the same persistent database without making Discord the source of truth.
-
-## Railway setup
-
-Keep your existing variables:
-
-```text
-DISCORD_TOKEN=...
-GUILD_ID=...
-```
-
-Add a PostgreSQL database to the same Railway project, then add this variable to the **5th-CAV / Battalion Clerk service**:
+### Required variables
 
 ```text
 DATABASE_URL=${{Postgres.DATABASE_URL}}
+SECRET_KEY=<long random secret>
+ADMIN_USERNAME=<your command username>
+ADMIN_PASSWORD=<strong password>
 ```
 
-Railway may give the database service a different name. Use the reference variable Railway offers for that database's `DATABASE_URL`.
-
-The start command remains:
+Railway should detect the `Procfile` automatically. If it asks for a start command:
 
 ```text
-python bot.py
+gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
 ```
 
-After deployment, the logs should include:
+On first successful startup, the app creates the Phase I schema and creates the initial administrator if one does not already exist.
+
+## Battalion Clerk integration
+
+The website intentionally does **not** control the bot. Both applications share PostgreSQL.
 
 ```text
-[POSTGRES READY] PostgreSQL ...
-[COLLECTOR READY] postgres=configured | website_api=not configured
-[GUILD SYNC] guild=... members=... recovered_voice_sessions=...
+Discord -> Battalion Clerk -> PostgreSQL <- 5th Cavalry Regiment Website
 ```
 
-## Local safety buffer
+The website can read Discord member identity and voice-session history. A future S-1 workflow will populate `website_member_links` so a Discord member can be tied to a website Soldier/201 File.
 
-SQLite remains enabled as a safety buffer. It is not the authoritative store once PostgreSQL is active.
+## Security / architecture notes
 
-If you later attach a Railway Volume at `/data`, set:
+- Never commit `.env` or Discord tokens to GitHub.
+- The website has its own login identities in `site_users`.
+- Personnel records are separate from website accounts (`user_personnel_links`).
+- Staff access is role-based and can later be made more granular without changing URLs or page structure.
+- Battalion Clerk remains a collector only.
 
-```text
-LOCAL_DB_PATH=/data/battalion_clerk.db
-```
+## Phase II recommendation
 
-This is optional once PostgreSQL is working, but it gives you an additional on-service buffer.
-
-## Discord permissions/intents
-
-Keep **Server Members Intent** enabled in the Discord Developer Portal. Battalion Clerk also uses normal guild and voice-state intents. It does not need Administrator, Manage Roles, or Message Content permission.
-
-## Next website step
-
-When the website is created, it can use the same PostgreSQL database and calculate things such as:
-
-- qualifying event attendance
-- total unit activity
-- operation attendance
-- training attendance
-- last activity
-- Discord account linkage
-
-Those calculated results belong to the website, not Battalion Clerk.
+Build the actual S-1 personnel system and account/Discord linking first, then company/platoon/squad assignment and NCO dashboards. Once people exist as real personnel records, the readiness, DEROS, equipment and operations systems have something stable to attach to.

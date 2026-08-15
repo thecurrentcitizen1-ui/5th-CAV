@@ -1,0 +1,25 @@
+{% extends 'base.html' %}{% block content %}
+<section class="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-content">
+    <div class="kicker">HEADQUARTERS • 1ST BATTALION</div>
+    <h1>FIRST TEAM.<br><em>IN COUNTRY.</em></h1>
+    <p>Persistent personnel, operations, readiness and unit history built around Hell Let Loose: Vietnam.</p>
+    <div class="hero-actions"><a class="btn primary" href="{{url_for('recruiting')}}">REPORT FOR DUTY</a><a class="btn" href="{{url_for('operations')}}">OPERATIONS BOARD</a></div>
+  </div>
+  <div class="situation-card">
+    <div class="stamp">SITREP</div><small>CURRENT BATTALION POSTURE</small>
+    <h3>{{ operation.title if operation else 'INITIAL READINESS' }}</h3>
+    <dl><dt>Status</dt><dd>{{operation.status if operation else 'FORMING'}}</dd><dt>Area</dt><dd>{{operation.location or 'Republic of Vietnam' if operation else 'Republic of Vietnam'}}</dd><dt>Classification</dt><dd>{{operation.classification if operation else 'FOR OFFICIAL USE'}}</dd></dl>
+  </div>
+</section>
+<section class="dashboard-strip">
+  <div><small>FORMATION</small><b>1/5 CAV</b></div><div><small>ERA</small><b>1965</b></div><div><small>MISSION</small><b>AIRMOBILE INFANTRY</b></div><div><small>SYSTEM</small><b>LIVE HEADQUARTERS</b></div>
+</section>
+<section class="content-grid">
+  <article class="paper-card wide"><span class="tab">BATTALION NOTICE</span><h2>A headquarters that remembers your service.</h2><p>This site is being built as the permanent administrative and operational layer around the community. Your assignment, tour, qualifications, equipment, operations, readiness and history will live here—not in a collection of Discord channels.</p><div class="rule"></div><p class="typewriter">BATTALION CLERK STATUS: DATA COLLECTION LINK ESTABLISHED</p></article>
+  <aside class="map-card"><div class="map-lines"></div><div class="map-label">CENTRAL HIGHLANDS</div><div class="map-pin p1">LZ</div><div class="map-pin p2">CP</div><div class="map-pin p3">OBJ</div></aside>
+</section>
+<section class="section-title"><span>ORGANIZATION</span><h2>1st Battalion, 5th Cavalry Regiment</h2><p>The Phase I framework is in place. Exact 1965 billets and playable company activation will be refined as the community grows.</p></section>
+<div class="unit-cards">{% for unit in org %}<a href="{{url_for('organization')}}" class="unit-card"><small>{{unit.unit_type}}</small><b>{{unit.display_name}}</b><span>{{unit.unit_code}}</span></a>{% endfor %}</div>
+{% endblock %}
