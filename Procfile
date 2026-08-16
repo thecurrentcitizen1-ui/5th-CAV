@@ -1,1 +1,1 @@
-worker: python battalion_clerk.py
+worker: python bot.py
