@@ -34,6 +34,31 @@ class DataCollector:
                     PRIMARY KEY (guild_id, discord_user_id)
                 )
             """)
+
+            # Existing Railway databases may already have discord_members from an
+            # earlier Battalion Clerk build. CREATE TABLE IF NOT EXISTS does not
+            # add newly introduced columns, so migrate the live table safely.
+            await self.db.execute("""
+                ALTER TABLE discord_members
+                ADD COLUMN IF NOT EXISTS username TEXT
+            """)
+            await self.db.execute("""
+                ALTER TABLE discord_members
+                ADD COLUMN IF NOT EXISTS display_name TEXT
+            """)
+            await self.db.execute("""
+                ALTER TABLE discord_members
+                ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+            await self.db.execute("""
+                ALTER TABLE discord_members
+                ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE
+            """)
+            await self.db.execute("""
+                ALTER TABLE discord_members
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            """)
+            log.info("[SCHEMA READY] discord_members columns verified")
         self.started = True
         log.info("[COLLECTOR READY] postgres-configured=%s", bool(self.db.pool))
 
