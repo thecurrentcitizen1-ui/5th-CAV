@@ -85,7 +85,7 @@ class DataCollector:
                               is_bot=EXCLUDED.is_bot,
                               active=TRUE,
                               updated_at=NOW()
-            """, str(member.guild.id), str(member.id), member.name,
+            """, member.guild.id, member.id, member.name,
                  member.display_name, member.bot)
 
     async def mark_member_left(self, member, when=None):
@@ -96,4 +96,4 @@ class DataCollector:
                 UPDATE discord_members
                 SET active=FALSE, updated_at=NOW()
                 WHERE guild_id=$1 AND discord_user_id=$2
-            """, str(member.guild.id), str(member.id))
+            """, member.guild.id, member.id)
