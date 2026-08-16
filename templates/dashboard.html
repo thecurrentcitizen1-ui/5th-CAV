@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+{% block title %}Soldier's Field Desk • {{site_name}}{% endblock %}
+{% block body_class %}page-dashboard{% endblock %}
+{% block content %}
+<section class="soldier-desk-hero">
+  <div class="soldier-desk-photo"></div><div class="soldier-desk-shade"></div>
+  <div class="soldier-status-card">
+    <span>TODAY'S DUTY STATUS</span>
+    <h1>{% if personnel %}{% if personnel.rank_code %}{{personnel.rank_code}} {% endif %}{{personnel.first_name}} {{personnel.last_name}}{% else %}PERSONNEL RECORD PENDING{% endif %}</h1>
+    <p>{% if personnel %}{{personnel.unit_code}} • {{personnel.duty_position or personnel.mos_code}}{% else %}REPORT TO S-1 PERSONNEL{% endif %}</p>
+    {% if personnel %}<dl><dt>TOUR PHASE</dt><dd>{{personnel.tour_phase}}</dd><dt>TIME IN COUNTRY</dt><dd>{% if personnel.days_in_country is not none %}{{personnel.days_in_country}} DAYS{% else %}NO ARRIVAL DATE{% endif %}</dd><dt>DEROS</dt><dd>{{personnel.deros_date or 'NO ENTRY'}}</dd><dt>DUTY STATUS</dt><dd>{{personnel.duty_status}}</dd></dl>{% endif %}
+  </div>
+</section>
+<section class="personal-worktable phase3-field-desk">
+  <a class="personal-folder" href="{{url_for('my_201_file')}}"><small>S-1 PERSONNEL</small><b>OPEN 201 FILE</b><span>PERSONNEL / SERVICE RECORD</span></a>
+
+  {% if roster_card %}
+  <article class="battle-roster-mini">
+    <header><small>HEADQUARTERS • 1/5 CAV</small><b>BATTLE ROSTER CARD</b></header>
+    <div class="roster-mini-name">{% if personnel.rank_code %}{{personnel.rank_code}} {% endif %}{{personnel.last_name|upper}}, {{personnel.first_name[:1]|upper}}.</div>
+    <dl><dt>ROSTER NO.</dt><dd>{{roster_card.roster_number}}</dd><dt>UNIT</dt><dd>{{personnel.unit_code}}</dd><dt>STATUS</dt><dd>{{personnel.duty_status}}</dd></dl>
+    <a href="{{url_for('battle_roster_card')}}">VIEW ISSUED CARD →</a>
+  </article>
+  {% endif %}
+
+  {% if weapon %}
+  <article class="weapon-desk-record weapon-state-{{weapon.dirt_stage}}">
+    <header><small>S-4 INDIVIDUAL ARMS</small><b>ISSUED M16</b><span class="weapon-status status-stage-{{weapon.dirt_stage}}">{{weapon.display_state}}</span></header>
+    <div class="weapon-visual compact"><img src="{{url_for('static', filename='art/m16-rifle-master.png')}}" alt="Issued M16 rifle"><i class="weapon-dirt-layer" aria-hidden="true"></i></div>
+    <dl><dt>SERIAL NO.</dt><dd>{{weapon.serial_number}}</dd><dt>RACK NO.</dt><dd>{{weapon.rack_number}}</dd><dt>ROUNDS FIRED</dt><dd>{{weapon.total_rounds}}</dd><dt>SINCE CLEANING</dt><dd>{{weapon.rounds_since_cleaning}}</dd></dl>
+    <a href="{{url_for('supply')}}">OPEN INDIVIDUAL WEAPON RECORD →</a>
+  </article>
+  {% endif %}
+
+  <article class="today-order"><header><small>CURRENT OPERATIONS</small><b>NEXT TASKING</b></header>{% for op in upcoming[:2] %}<div class="typed-row"><span>{{op.operation_code}}</span><strong>{{op.title}}</strong><small>{{op.operation_date or 'DATE PENDING'}} • {{op.status}}</small></div>{% else %}<p>NO CURRENT OPERATIONS ON FILE.</p>{% endfor %}<a href="{{url_for('operations')}}">OPEN OPERATIONS →</a></article>
+  <article class="training-slip"><header><small>TRAINING OFFICE</small><b>QUALIFICATIONS</b></header>{% for q in qualifications[:4] %}<div class="typed-row"><strong>{{q.qualification_name}}</strong><span>{{q.status}}</span><small>{{q.expires_at or 'NO EXPIRATION'}}</small></div>{% else %}<p>NO QUALIFICATIONS ON FILE.</p>{% endfor %}<a href="{{url_for('training')}}">OPEN TRAINING RECORD →</a></article>
+  <article class="service-slip"><header><small>SERVICE RECORD</small><b>RECENT ENTRIES</b></header>{% for a in service_history %}<div class="typed-row"><strong>{{a.title}}</strong><span>{{a.entry_date}}</span><small>{{a.entry_type}}</small></div>{% else %}<p>NO RECENT SERVICE ENTRIES.</p>{% endfor %}</article>
+</section>
+{% endblock %}

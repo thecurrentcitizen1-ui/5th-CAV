@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block title %}S-1 Personnel • {{site_name}}{% endblock %}
+{% block body_class %}page-personnel{% endblock %}
+{% block content %}
+<section class="office-environment personnel-environment">
+  <div class="office-photo"></div><div class="office-shade"></div>
+  <div class="office-sign"><span>HEADQUARTERS STAFF</span><h1>S-1 PERSONNEL</h1><p>Assignments, strength, records, tour administration and personnel actions.</p></div>
+</section>
+<section class="records-office">
+  <article class="file-drawer">
+    <div class="drawer-label">ACTIVE PERSONNEL FILES</div>
+    {% if personnel %}<a class="drawer-folder" href="{{url_for('my_201_file')}}"><span>{{personnel.last_name|upper}}, {{personnel.first_name[:1]|upper}}.</span><small>{% if personnel.rank_code %}{{personnel.rank_code}} • {% endif %}{{personnel.unit_code}}</small><b>OPEN 201 FILE</b></a>{% else %}<div class="drawer-folder empty"><span>NO FILE ISSUED</span><small>REPORT FOR DUTY TO OPEN YOUR RECORD</small></div>{% endif %}
+  </article>
+  <article class="personnel-roster document-sheet">
+    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>1ST BATTALION, 5TH CAVALRY</strong><span>BATTALION PERSONNEL ROSTER</span></header>
+    <div class="roster-table header"><span>NAME</span><span>RANK</span><span>UNIT</span><span>DUTY</span><span>STATUS</span></div>
+    {% for row in roster %}<div class="roster-table"><span>{{row.last_name|upper}}, {{row.first_name[:1]|upper}}.</span><span>{{row.rank_code or '—'}}</span><span>{{row.unit_code}}</span><span>{{row.duty_position or row.platoon or '—'}}</span><span>{{row.field_status}}</span></div>{% else %}<p class="typed-empty">NO PERSONNEL ARE CURRENTLY ENTERED ON THE BATTALION ROSTER.</p>{% endfor %}
+  </article>
+</section>
+{% endblock %}
