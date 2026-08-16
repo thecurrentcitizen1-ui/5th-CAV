@@ -469,6 +469,65 @@ async def orders_channel_status(interaction: discord.Interaction):
     )
 
 
+
+@bot.tree.command(name='reset-roster', description='Clear the current personnel roster and rebuild only current rank-role holders.')
+@app_commands.describe(confirmation='Type RESET ROSTER exactly')
+async def reset_roster(interaction: discord.Interaction, confirmation: str):
+    if not await require_manage_guild(interaction):
+        return
+    if confirmation.strip().upper() != 'RESET ROSTER':
+        await interaction.response.send_message(
+            'RESET ABORTED. Type `RESET ROSTER` exactly in the confirmation field.',
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        result = await web.request(
+            'POST',
+            '/internal/clerk/personnel/reset',
+            json={'confirmation': 'RESET ROSTER', 'guild_id': interaction.guild_id},
+        )
+    except Exception as exc:
+        await interaction.followup.send(
+            f'ROSTER RESET FAILED: `{exc}`',
+            ephemeral=True,
+        )
+        return
+
+    rebuilt = 0
+    failed = 0
+
+    # The website itself decides whether each member has a recognized rank role.
+    # Members without a rank role remain off the roster.
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        try:
+            sync = await sync_personnel_identity(
+                member,
+                create_if_missing=False,
+                reason='post_reset_rank_roster_rebuild',
+                deliver_credentials=True,
+            )
+            if sync and sync.get('created'):
+                rebuilt += 1
+        except Exception:
+            failed += 1
+            log.exception('[POST RESET SYNC FAILED] member=%s (%s)', member.display_name, member.id)
+
+    await interaction.followup.send(
+        '**HEADQUARTERS — BATTALION ROSTER RESET COMPLETE**\n'
+        f"Prior personnel records cleared: **{result.get('cleared_personnel', 0)}**\n"
+        f'Rank-role holders entered on roster: **{rebuilt}**\n'
+        f'Sync failures: **{failed}**\n\n'
+        'Only personnel presently holding a recognized rank role receive a 201 File.',
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name='duty-channel', description='Assign the permanent voice channel for Training, Operation, or Meeting duty.')
 @app_commands.describe(duty_type='Duty category', channel='Voice channel to monitor')
 @app_commands.choices(duty_type=DUTY_CHOICES)
@@ -914,7 +973,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 log.warning('[DUTY INTERVAL FAILED] member=%s error=%s', member.id, exc)
 
     if after_id and duty_type_for_channel(gid, after_id):
-        await sync_personnel_identity(member,create_if_missing=True,reason="official_duty_presence")
+        await sync_personnel_identity(member,create_if_missing=False,reason="official_duty_presence")
         duty_voice_presence[(gid, member.id, after_id)] = now
 
 
