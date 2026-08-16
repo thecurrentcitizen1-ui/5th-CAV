@@ -333,6 +333,41 @@ def duty_type_for_channel(guild_id: int, channel_id: int) -> Optional[str]:
     return None
 
 
+
+def member_role_names(member: discord.Member):
+    return [role.name for role in member.roles if role.name != "@everyone"]
+
+async def sync_personnel_identity(member: discord.Member, *, create_if_missing=False,
+                                  reason="identity_sync", deliver_credentials=True):
+    if member.bot:
+        return None
+    payload={"guild_id":member.guild.id,"discord_user_id":member.id,
+             "username":member.name,"display_name":member.display_name,
+             "roles":member_role_names(member),"create_if_missing":create_if_missing,
+             "reason":reason}
+    try:
+        result=await web.request("POST","/internal/clerk/personnel/sync",json=payload)
+    except Exception as exc:
+        log.warning("[PERSONNEL SYNC FAILED] member=%s (%s) error=%s",member.display_name,member.id,exc)
+        return None
+    if result.get("created"):
+        log.info("[201 FILE OPENED] %s (%s) roster=%s rank=%s",
+                 member.display_name,member.id,result.get("roster_number"),result.get("rank_code"))
+        if deliver_credentials and result.get("roster_number") and result.get("field_code"):
+            weapon_line=f"\nM16 Serial No.: **{result.get('weapon_serial')}**" if result.get("weapon_serial") else ""
+            try:
+                await member.send(
+                    "**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
+                    "**BATTLE ROSTER CARD ISSUED**\n\n"
+                    f"Soldier: **{member.display_name}**\n"
+                    f"Battle Roster No.: **{result.get('roster_number')}**\n"
+                    f"Field Code: **{result.get('field_code')}**"
+                    f"{weapon_line}\n\n"
+                    "Retain this information. It is used to report for duty and open your 201 File.")
+            except discord.Forbidden:
+                log.warning("[ROSTER CARD DM BLOCKED] %s (%s)",member.display_name,member.id)
+    return result
+
 async def send_duty_presence_chunk(
     guild_id: int,
     member_id: int,
@@ -343,9 +378,15 @@ async def send_duty_presence_chunk(
     event_type = duty_type_for_channel(guild_id, channel_id)
     if not event_type or ended <= started:
         return None
+    guild = bot.get_guild(guild_id)
+    member = guild.get_member(member_id) if guild else None
     payload = {
         'guild_id': guild_id,
         'member_id': member_id,
+        'discord_user_id': member_id,
+        'username': member.name if member else '',
+        'display_name': member.display_name if member else '',
+        'roles': member_role_names(member) if member else [],
         'channel_id': channel_id,
         'channel_name': event_type.title(),
         'joined_at': iso(started),
@@ -684,6 +725,9 @@ async def on_ready():
         synced_members = 0
         for member in guild.members:
             await collector.upsert_member(member)
+            if not member.bot:
+                await sync_personnel_identity(member,create_if_missing=False,
+                    reason="guild_sync",deliver_credentials=False)
             synced_members += 1
 
         recovered_count = 0
@@ -721,6 +765,8 @@ async def on_member_join(member: discord.Member):
     if GUILD_ID and member.guild.id != GUILD_ID:
         return
     await collector.upsert_member(member)
+    if not member.bot:
+        await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
     await collector.record_event('member_join', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
@@ -776,9 +822,13 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     if GUILD_ID and after.guild.id != GUILD_ID:
         return
-    if before.name == after.name and before.display_name == after.display_name:
+    before_roles={r.id for r in before.roles}
+    after_roles={r.id for r in after.roles}
+    if before.name == after.name and before.display_name == after.display_name and before_roles == after_roles:
         return
     await collector.upsert_member(after)
+    if not after.bot:
+        await sync_personnel_identity(after,create_if_missing=False,reason="member_or_role_update")
     await collector.record_event('member_identity_update', {
         'guild_id': str(after.guild.id),
         'discord_user_id': str(after.id),
@@ -864,6 +914,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 log.warning('[DUTY INTERVAL FAILED] member=%s error=%s', member.id, exc)
 
     if after_id and duty_type_for_channel(gid, after_id):
+        await sync_personnel_identity(member,create_if_missing=True,reason="official_duty_presence")
         duty_voice_presence[(gid, member.id, after_id)] = now
 
 

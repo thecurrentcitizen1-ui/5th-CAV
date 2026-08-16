@@ -1,29 +1,15 @@
-# 5th Cavalry Battalion Clerk — Phase 9 Event Orders Automation
+# 5th Cavalry Battalion Clerk — Phase 9 Auto Personnel / Unranked Roster — FINAL
 
-## Commands
-- `/duty-channel` — assign permanent Training, Operation, Meeting voice channels
-- `/duty-channel-status` — review duty voice-channel assignments
-- `/orders-channel` — assign the text channel for official battalion event notices
-- `/orders-channel-status` — review the orders channel
-- `/schedule` — file an official duty period
-- `/duty-status` — inspect current attendance progress
-- `/close-duty` — close a duty period and file final credit
+UPLOAD TO: 5th-CAV Discord bot GitHub repository
 
-## Event notice lifecycle
-When `/schedule` is used:
-1. Initial Operations Notice / Training Circular / Battalion Notice is posted.
-2. 15 minutes before step-off, Battalion Clerk posts a warning.
-3. At start time, Battalion Clerk posts a commencement notice.
-4. When `/close-duty` is used, Battalion Clerk posts a conclusion notice with tracked/credited totals.
+Behavior:
+- Discord numeric ID is used internally to resolve a Soldier's 201 File.
+- Members do not manually link Discord to the website.
+- A Soldier may have a 201 File / Battle Roster Card with NO rank.
+- Battalion Clerk does not create a default PVT rank.
+- Rank is assigned only when the Soldier receives a recognized Discord rank role.
+- Later role changes synchronize rank changes to the website.
+- Duty-channel attendance automation remains enabled.
+- Existing PostgreSQL schema/type compatibility fixes remain included.
 
-## Railway variables
-- DISCORD_TOKEN
-- GUILD_ID
-- TEST_GUILD_ID
-- DATABASE_URL
-- WEBSITE_BASE_URL
-- CLERK_SYNC_KEY
-- BATTALION_TIMEZONE
-- VOICE_FLUSH_SECONDS
-
-No additional Railway variable is required for the orders channel; the channel assignment is stored in PostgreSQL.
+Railway variables are unchanged.
