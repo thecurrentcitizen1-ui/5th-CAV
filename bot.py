@@ -726,8 +726,9 @@ async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
         log.info('[PERSONNEL VALIDATED] member=%s (%s) rank=%s mos=%s',member.display_name,member.id,validation.get('rank'),validation.get('mos'))
         result = await sync_personnel_identity(member, create_if_missing=True,
                                                reason=reason, deliver_credentials=True)
-        log.info('[PERSONNEL ROLE SETTLED] member=%s (%s) result=%s',
-                 member.display_name, member.id, (result or {}).get('reason') or ('created' if (result or {}).get('created') else 'synced'))
+        log.info('[PERSONNEL ROLE SETTLED] member=%s (%s) result=%s assignment=%s / %s / %s',
+                 member.display_name, member.id, (result or {}).get('reason') or ('created' if (result or {}).get('created') else 'synced'),
+                 (result or {}).get('unit_code') or 'UNASSIGNED', (result or {}).get('platoon') or '—', (result or {}).get('squad') or '—')
     except asyncio.CancelledError:
         return
     except Exception as exc:

@@ -1,8 +1,23 @@
-# Battalion Clerk — Direct Entry Rank / Strict Assignment Intake
+# 5th CAV Battalion Clerk — Strict Company / Platoon / Squad Access
 
-- Keeps the 30-second Discord role settle window.
-- Reads the full settled rank, MOS, company, platoon, and squad role set before personnel creation.
-- Fixes strict company/platoon/squad validation so holding the correct parent + child roles is not falsely treated as duplicate assignments.
-- Entry rank is treated as the Soldier's actual starting grade. The website personnel record remains authoritative after creation.
-- Existing 201 Files are never silently re-ranked from Discord role drift.
-- New-member DM explicitly states that the promotion track starts from the entry grade and lower-rank history is not invented.
+This build extends strict Discord assignment visibility through all three organizational levels.
+
+## Access model
+- A Company cannot see B/C Company internal areas.
+- A Company • 1st Platoon cannot see A Company • 2nd/3rd/4th Platoon areas.
+- A Company • 1st Platoon • 1st Squad can see only its own squad text/voice channels inside the platoon area.
+- Platoon-wide channels remain visible to every Soldier assigned to that exact platoon.
+- Command, S-1, S-3, and appropriate leadership retain oversight access.
+- Rank, MOS, and qualification roles remain permission-neutral.
+
+## Migration
+After deployment run:
+`/strict-access-rebuild confirm:True`
+
+The command removes legacy generic platoon/squad assignment roles where possible, creates the company/platoon/squad-specific roles, and reapplies managed channel permissions.
+
+Then run:
+`/structure-status`
+
+Optionally run:
+`/permissions-repair confirm:True`
