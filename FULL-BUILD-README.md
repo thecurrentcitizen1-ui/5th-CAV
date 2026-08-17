@@ -1,85 +1,23 @@
-# Battalion Clerk — FULL LATEST BUILD
+# 5th CAV Battalion Clerk — Strict Company / Platoon / Squad Access
 
-This is the complete Discord bot package, not a patch.
+This build extends strict Discord assignment visibility through all three organizational levels.
 
-Included cumulative edits:
-- Discord/Railway bot startup configuration
-- PostgreSQL collector
-- database schema compatibility fixes
-- Discord ID BIGINT compatibility fix
-- voice-state tracking and recovery
-- permanent duty-channel mappings
-- /duty-channel
-- /duty-channel-status
-- /schedule
-- /duty-status
-- /close-duty
-- /orders-channel
-- /orders-channel-status
-- event notification lifecycle
-- Training / Operation / Meeting duty tracking
-- 45-minute service-credit framework
-- automatic internal Discord identity synchronization
-- rank-role-driven 201 File creation
-- no automatic PVT creation from voice presence
-- /reset-roster clean rebuild command
+## Access model
+- A Company cannot see B/C Company internal areas.
+- A Company • 1st Platoon cannot see A Company • 2nd/3rd/4th Platoon areas.
+- A Company • 1st Platoon • 1st Squad can see only its own squad text/voice channels inside the platoon area.
+- Platoon-wide channels remain visible to every Soldier assigned to that exact platoon.
+- Command, S-1, S-3, and appropriate leadership retain oversight access.
+- Rank, MOS, and qualification roles remain permission-neutral.
 
-Repository:
-Upload this project to the 5th-CAV Discord bot GitHub repository.
+## Migration
+After deployment run:
+`/strict-access-rebuild confirm:True`
 
-Railway variables remain:
-DISCORD_TOKEN
-GUILD_ID
-TEST_GUILD_ID
-DATABASE_URL
-WEBSITE_BASE_URL
-CLERK_SYNC_KEY
-BATTALION_TIMEZONE
-VOICE_FLUSH_SECONDS
+The command removes legacy generic platoon/squad assignment roles where possible, creates the company/platoon/squad-specific roles, and reapplies managed channel permissions.
 
-## Personnel Orders Discord Routing
-Commands requiring Manage Server:
-- `/personnel-orders-channel order_type channel` — route one order type to a channel.
-- `/personnel-orders-status` — display current routes.
-- `/personnel-orders-clear order_type` — disable one route.
-Supported: ALL, REPLACEMENT, ASSIGNMENT, PROMOTION, AWARD, APPOINTMENT, LEAVE, RETURN.
-The existing `/orders-channel` remains for scheduled Operations/Training/Meeting notices.
+Then run:
+`/structure-status`
 
-FULL FLOW / PERSONNEL PROCESSING PASS
-- 30-second Discord role settle remains authoritative and restarts whenever roles change.
-- Added validation holds for duplicate rank, MOS, company, platoon, or squad roles before a new 201 File can be created.
-- Added /personnel-status, /personnel-reprocess, /personnel-health, and /reissue-login.
-- Added secure website-backed Field Code rotation and private DM delivery for reissued Soldier Record access.
-- Member departure from Discord now creates an S-1 disposition action instead of silently deleting history.
-- Personnel order routing expanded to Separation, Tour Extension, Training, and Qualification documents.
-
-## Deep Battalion Flow Commands
-- `/operation-duty-channel` — assign the Discord channel for S-3 pre-operation duty rosters.
-- `/operation-duty-status` — show the assigned duty-roster channel.
-- `/publish-operation-duty` — immediately publish pending S-3 duty rosters.
-
-Battalion Clerk mirrors the authoritative website personnel record after intake. The website personnel row owns active rank/MOS/assignment state; Discord roles are synchronized to it rather than becoming a second source of truth.
-
-## Discord structure automation pass
-Added owner/manage-server setup commands:
-- `/setup-roles confirm:True` — creates/repairs divider roles, ranks, appointments, battlefield MOS roles, unit assignment roles, qualifications, and staff access roles.
-- `/setup-channels confirm:True` — creates/repairs categories, text channels, voice channels, and category access scopes. Ensures roles first.
-- `/battalion-setup confirm:True` — one-command complete server construction.
-- `/structure-status` — read-only report of missing expected roles/categories/channels.
-- `/structure-repair confirm:True` — idempotent repair; does not intentionally duplicate existing named items.
-
-Blueprint includes Replacement Detachment, Battalion HQ, S-1, S-3, S-4, Battalion Command, and A/B/C Company areas. Divider roles are visual-only and personnel sync ignores them.
-
-The bot must have Manage Roles + Manage Channels and its bot role must be above every role it needs to manage.
-
-## Permission model / managed-role reset update
-- Rank, MOS, qualification, divider, and assignment roles carry no guild-wide administrative permissions.
-- Company assignment roles provide company-area visibility.
-- Staff roles and staff appointments control S-1/S-3/S-4 access.
-- Battalion Commander, Battalion Executive Officer, and Command Staff can access all managed internal areas.
-- Company leadership appointments add functional moderation/voice authority only after the member already has company visibility; they do not unlock every company.
-- Public `welcome-to-the-1-5` and `standing-orders` are read-only; recruiting/help areas remain interactive.
-- Battalion Headquarters publication channels are read-only to ordinary Soldiers and publishable by staff/command.
-- Existing managed categories/channels have their approved overwrites reapplied whenever setup/repair runs.
-- `/permissions-repair confirm:True` reapplies the approved permission model without deleting structure.
-- `/reset-battalion-roles confirmation:RESET ROLES` deletes ONLY Battalion Clerk-managed blueprint roles/dividers. It leaves categories/channels and unrelated Discord roles untouched. This removes those roles from members; run `/battalion-setup confirm:True` immediately afterward to rebuild and reapply access.
+Optionally run:
+`/permissions-repair confirm:True`

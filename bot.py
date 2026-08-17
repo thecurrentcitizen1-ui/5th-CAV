@@ -133,11 +133,22 @@ COMPANY_ROLE_BLUEPRINT = [
     "HHC", "A Company", "B Company", "C Company",
 ]
 PLATOON_ROLE_BLUEPRINT = [
-    "1st Platoon", "2nd Platoon", "3rd Platoon", "4th Platoon",
+    f"{company} Company • {platoon} Platoon"
+    for company in ("A", "B", "C")
+    for platoon in ("1st", "2nd", "3rd", "4th")
 ]
+# Squad access is also company-and-platoon specific. Generic squad roles are unsafe
+# because Discord permission overwrites are additive across every role a member holds.
 SQUAD_ROLE_BLUEPRINT = [
-    "1st Squad", "2nd Squad", "3rd Squad", "4th Squad",
+    f"{company} Company • {platoon} Platoon • {squad} Squad"
+    for company in ("A", "B", "C")
+    for platoon in ("1st", "2nd", "3rd", "4th")
+    for squad in ("1st", "2nd", "3rd", "4th")
 ]
+LEGACY_ASSIGNMENT_ROLE_NAMES = {
+    "1st Platoon", "2nd Platoon", "3rd Platoon", "4th Platoon",
+    "1st Squad", "2nd Squad", "3rd Squad", "4th Squad",
+}
 QUALIFICATION_ROLE_BLUEPRINT = [
     "Battalion Instructor", "M16 Qualified", "Mortar Qualified", "Recon Qualified",
     "Aviation Qualified", "Armor Qualified", "Medic Qualified",
@@ -237,15 +248,29 @@ for _company in ("A", "B", "C"):
         "scope": f"COMPANY:{_company}",
         "channels": [
             ("company-headquarters", "text"),
-            ("1st-platoon", "text"),
-            ("2nd-platoon", "text"),
-            ("3rd-platoon", "text"),
+            ("company-notices", "text"),
             ("company-formation", "voice"),
-            ("1st-platoon", "voice"),
-            ("2nd-platoon", "voice"),
-            ("3rd-platoon", "voice"),
         ],
     })
+    for _platoon in ("1st", "2nd", "3rd", "4th"):
+        CHANNEL_BLUEPRINT.append({
+            "category": f"{_company} COMPANY • {_platoon.upper()} PLATOON",
+            "scope": f"PLATOON:{_company}:{_platoon}",
+            "channels": [
+                ("platoon-headquarters", "text"),
+                ("platoon-orders", "text"),
+                ("1st-squad", "text"),
+                ("2nd-squad", "text"),
+                ("3rd-squad", "text"),
+                ("4th-squad", "text"),
+                ("platoon-rally", "voice"),
+                ("1st-squad", "voice"),
+                ("2nd-squad", "voice"),
+                ("3rd-squad", "voice"),
+                ("4th-squad", "voice"),
+            ],
+        })
+
 
 
 def _role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]:
@@ -367,8 +392,14 @@ def _scope_overwrites(guild: discord.Guild, scope: str):
         _add_roles(overwrites, guild, {f"{letter} Company"}, _overwrite_member())
         # S-1 and S-3 can enter company areas to administer personnel/operations.
         _add_roles(overwrites, guild, {"S-1 Personnel", "S-3 Operations", *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
-        # Generic leadership appointments add authority but DO NOT grant visibility
-        # to other companies by themselves. The matching Company role is still required.
+        _add_roles(overwrites, guild, COMPANY_LEADERSHIP_APPOINTMENTS, _overwrite_functional_appointment())
+    elif scope.startswith("PLATOON:"):
+        _, letter, platoon = scope.split(":", 2)
+        platoon_role = f"{letter} Company • {platoon} Platoon"
+        # Exact company+platoon role is the visibility key. This avoids Discord's
+        # additive overwrite behavior accidentally letting B/1st see A/1st.
+        _add_roles(overwrites, guild, {platoon_role}, _overwrite_member())
+        _add_roles(overwrites, guild, {"S-1 Personnel", "S-3 Operations", *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
         _add_roles(overwrites, guild, COMPANY_LEADERSHIP_APPOINTMENTS, _overwrite_functional_appointment())
 
     return overwrites
@@ -394,6 +425,29 @@ def _channel_overwrites(guild: discord.Guild, spec: dict, channel_name: str, cha
         # Staff shops may publish the records relevant to them; Command may publish all.
         _add_roles(overwrites, guild, STAFF_ACCESS_ROLE_BLUEPRINT, _overwrite_staff())
         _add_roles(overwrites, guild, {*COMMAND_APPOINTMENTS, *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"], *STAFF_APPOINTMENTS["S4"]}, _overwrite_staff())
+
+    # Squad text/voice channels inside a platoon are visible only to the exact
+    # company+platoon+squad assignment role. The parent platoon role is explicitly
+    # denied on that channel, while the exact squad role is allowed. A member with
+    # both roles therefore sees only their squad channel plus platoon-wide channels.
+    if spec["scope"].startswith("PLATOON:") and channel_name in {
+        "1st-squad", "2nd-squad", "3rd-squad", "4th-squad"
+    }:
+        _, letter, platoon = spec["scope"].split(":", 2)
+        squad = channel_name.replace("-", " ").title()
+        platoon_role = _role_by_name(guild, f"{letter} Company • {platoon} Platoon")
+        squad_role = _role_by_name(guild, f"{letter} Company • {platoon} Platoon • {squad}")
+        if platoon_role:
+            overwrites[platoon_role] = discord.PermissionOverwrite(
+                view_channel=False, read_messages=False, send_messages=False,
+                connect=False, speak=False,
+            )
+        if squad_role:
+            overwrites[squad_role] = _overwrite_member(view=True, send=True, voice=True)
+        # Oversight and leadership retain access to all squads in the platoon.
+        _add_roles(overwrites, guild, {"Command Staff", *COMMAND_APPOINTMENTS}, _overwrite_staff())
+        _add_roles(overwrites, guild, {"S-1 Personnel", "S-3 Operations", *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
+        _add_roles(overwrites, guild, COMPANY_LEADERSHIP_APPOINTMENTS, _overwrite_functional_appointment())
 
     return overwrites
 
@@ -519,7 +573,9 @@ def _managed_role_names():
     for divider,roles in ROLE_SECTIONS:
         names.append(divider)
         names.extend(roles)
-    # Preserve order while removing the occasional shared label.
+    # Include legacy generic platoon/squad roles so a clean reset can remove the old
+    # pre-strict-access structure before rebuilding assignment-specific roles.
+    names.extend(sorted(LEGACY_ASSIGNMENT_ROLE_NAMES))
     return list(dict.fromkeys(names))
 
 
@@ -542,6 +598,36 @@ async def reset_battalion_roles(guild: discord.Guild):
         except Exception as exc:
             failed.append(f"{role.name}: {exc}")
     return {"deleted":deleted,"failed":failed,"skipped":skipped}
+
+async def cleanup_legacy_platoon_structure(guild: discord.Guild):
+    """Remove only old Battalion Clerk platoon channels/roles superseded by strict access."""
+    deleted=[]; failed=[]
+    me=guild.me
+    # Old setup put 1st/2nd/3rd platoon text+voice channels directly in company categories.
+    for letter in ("A", "B", "C"):
+        category=discord.utils.get(guild.categories, name=f"{letter} COMPANY")
+        if not category:
+            continue
+        for old_name in ("1st-platoon", "2nd-platoon", "3rd-platoon", "4th-platoon"):
+            for channel in list(category.channels):
+                if channel.name == old_name:
+                    try:
+                        await channel.delete(reason="Battalion Clerk — replace legacy platoon channel with strict-access platoon category")
+                        deleted.append(f"CHANNEL:{letter} COMPANY/{old_name}")
+                    except Exception as exc:
+                        failed.append(f"{letter} COMPANY/{old_name}: {exc}")
+    # Old generic platoon/squad roles cannot safely gate assignment-specific channels
+    # because Discord permission overwrites are additive across roles. Remove them.
+    if me and me.guild_permissions.manage_roles:
+        for role in list(guild.roles):
+            if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES and role < me.top_role:
+                try:
+                    await role.delete(reason="Battalion Clerk — migrate to assignment-specific access role")
+                    deleted.append(f"ROLE:{role.name}")
+                except Exception as exc:
+                    failed.append(f"ROLE {role.name}: {exc}")
+    return {"deleted":deleted,"failed":failed}
+
 
 def structure_inventory(guild: discord.Guild):
     expected_roles=[]
@@ -591,7 +677,10 @@ def validate_personnel_roles(member: discord.Member):
         if name in {"A COMPANY","ALPHA COMPANY","A/1-5 CAV","B COMPANY","BRAVO COMPANY","B/1-5 CAV","C COMPANY","CHARLIE COMPANY","C/1-5 CAV","HHC","HHC/1-5 CAV","HEADQUARTERS & HEADQUARTERS COMPANY"}:
             companies.append(name)
         if any(x in name for x in ("1ST PLATOON","2ND PLATOON","3RD PLATOON","4TH PLATOON")):
-            platoons.append(name)
+            for label in ("1ST PLATOON","2ND PLATOON","3RD PLATOON","4TH PLATOON"):
+                if label in name:
+                    platoons.append(label.title())
+                    break
         if any(x in name for x in ("1ST SQUAD","2ND SQUAD","3RD SQUAD","4TH SQUAD")):
             squads.append(name)
     if len(ranks)==0: problems.append("recognized rank role required")
@@ -1030,14 +1119,18 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     }
     all_company_names=set().union(*company_aliases.values())
     desired_company=company_aliases.get(unit,set())
+    company_letter = unit[:1] if unit[:1] in {"A","B","C"} else None
+    desired_platoon_role = f"{company_letter} COMPANY • {platoon}" if company_letter and platoon else None
+    desired_squad_role = f"{company_letter} COMPANY • {platoon} • {squad}" if company_letter and platoon and squad else None
     for role in member.roles:
         n=" ".join(role.name.upper().strip().split())
         if n in all_company_names and n not in desired_company: remove.append(role)
-        if any(x in n for x in ('1ST PLATOON','2ND PLATOON','3RD PLATOON','4TH PLATOON')) and platoon and n!=platoon: remove.append(role)
-        if any(x in n for x in ('1ST SQUAD','2ND SQUAD','3RD SQUAD','4TH SQUAD')) and squad and n!=squad: remove.append(role)
+        if role.name in PLATOON_ROLE_BLUEPRINT and desired_platoon_role and n != desired_platoon_role: remove.append(role)
+        if role.name in SQUAD_ROLE_BLUEPRINT and desired_squad_role and n != desired_squad_role: remove.append(role)
+        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES: remove.append(role)
     for role in member.guild.roles:
         n=" ".join(role.name.upper().strip().split())
-        if n in desired_company or (platoon and n==platoon) or (squad and n==squad):
+        if n in desired_company or (desired_platoon_role and n==desired_platoon_role) or (desired_squad_role and n==desired_squad_role):
             desired.append(role)
     try:
         remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))
@@ -1271,6 +1364,30 @@ async def permissions_repair(interaction: discord.Interaction, confirm: bool):
         ephemeral=True)
 
 
+@bot.tree.command(name='strict-access-rebuild', description='Migrate company, platoon, and squad areas to strict assignment visibility.')
+@app_commands.describe(confirm='Set True to replace legacy access with strict company/platoon/squad access')
+async def strict_access_rebuild(interaction: discord.Interaction, confirm: bool):
+    if not await require_manage_guild(interaction): return
+    if not confirm:
+        await interaction.response.send_message(
+            'No changes made. Run `/strict-access-rebuild confirm:True` when ready.', ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    cleanup=await cleanup_legacy_platoon_structure(interaction.guild)
+    roles=await build_battalion_roles(interaction.guild)
+    channels=await build_battalion_channels(interaction.guild)
+    inv=structure_inventory(interaction.guild)
+    failures=cleanup['failed']+roles['failed']+channels['failed']
+    await interaction.followup.send(
+        f"**STRICT ASSIGNMENT ACCESS REBUILT**\n"
+        f"Legacy items removed: **{len(cleanup['deleted'])}**\n"
+        f"New/repaired role items: **{len(roles['created']) + len(roles.get('repaired', []))}**\n"
+        f"New/repaired category/channel items: **{len(channels['created']) + len(channels.get('repaired', []))}**\n"
+        f"Missing roles/categories/channels: **{len(inv['missing_roles'])}/{len(inv['missing_categories'])}/{len(inv['missing_channels'])}**\n"
+        f"Failures: **{len(failures)}**\n\n"
+        "Strict access is now enforced at all three levels: company, platoon, and squad. A Company cannot unlock B/C Company; A Company • 1st Platoon cannot unlock another platoon; and A Company • 1st Platoon • 1st Squad cannot see another squad's channels.",
+        ephemeral=True)
+
+
 @bot.tree.command(name='reset-battalion-roles', description='Delete only Battalion Clerk managed roles so they can be rebuilt cleanly.')
 @app_commands.describe(confirmation='Type RESET ROLES exactly. This removes managed roles from members.')
 async def reset_battalion_roles_command(interaction: discord.Interaction, confirmation: str):
@@ -1284,7 +1401,7 @@ async def reset_battalion_roles_command(interaction: discord.Interaction, confir
     msg=(f"**MANAGED ROLE RESET COMPLETE**\nDeleted: **{len(result['deleted'])}**\n"
          f"Skipped above Clerk: **{len(result['skipped'])}**\nFailures: **{len(result['failed'])}**\n\n"
          "Only Battalion Clerk blueprint roles/dividers were targeted. Categories and channels were left in place. "
-         "Run `/battalion-setup confirm:True` next to recreate the roles and reapply all access permissions.")
+         "Run `/battalion-setup confirm:True` next to recreate the roles and reapply all strict access permissions.")
     if result['failed']:
         msg += "\n\n**Review:**\n" + "\n".join(f"• {x}" for x in result['failed'][:10])
     await interaction.followup.send(msg, ephemeral=True)

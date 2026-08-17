@@ -1,22 +1,23 @@
-# 5th Cavalry Battalion Clerk — Rank-Role Roster Reset
+# 5th CAV Battalion Clerk — Strict Company / Platoon / Squad Access
 
-UPLOAD TO:
-5th-CAV Discord bot GitHub repository
+This build extends strict Discord assignment visibility through all three organizational levels.
 
-NEW BEHAVIOR
-- New 201 Files are driven by recognized Discord RANK roles.
-- Voice-channel presence does not create personnel.
-- On startup/member-role update, Battalion Clerk sends the member's role list to the website.
-- The website creates a Soldier only when it recognizes a rank role.
+## Access model
+- A Company cannot see B/C Company internal areas.
+- A Company • 1st Platoon cannot see A Company • 2nd/3rd/4th Platoon areas.
+- A Company • 1st Platoon • 1st Squad can see only its own squad text/voice channels inside the platoon area.
+- Platoon-wide channels remain visible to every Soldier assigned to that exact platoon.
+- Command, S-1, S-3, and appropriate leadership retain oversight access.
+- Rank, MOS, and qualification roles remain permission-neutral.
 
-ONE-TIME COMMAND
-/reset-roster confirmation:RESET ROSTER
+## Migration
+After deployment run:
+`/strict-access-rebuild confirm:True`
 
-The command:
-1. Clears the current website personnel roster.
-2. Preserves staff/admin accounts, unit structure, catalogs, events, channel assignments, and M16 serial-number inventory.
-3. Immediately scans the Discord server.
-4. Recreates 201 Files only for current rank-role holders.
-5. Issues Battle Roster credentials and M16s to those newly created records.
+The command removes legacy generic platoon/squad assignment roles where possible, creates the company/platoon/squad-specific roles, and reapplies managed channel permissions.
 
-This is a destructive personnel reset. Use it once for the clean restart.
+Then run:
+`/structure-status`
+
+Optionally run:
+`/permissions-repair confirm:True`
