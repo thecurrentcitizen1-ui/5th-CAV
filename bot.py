@@ -672,25 +672,44 @@ def validate_personnel_roles(member: discord.Member):
     ranks,mos=_role_code_hits(member)
     problems=[]
     role_names=[" ".join(r.name.upper().strip().split()) for r in member.roles if r.name!="@everyone"]
-    companies=[]; platoons=[]; squads=[]
+    companies=set(); platoons=set(); squads=set(); strict_assignments=[]
+    company_alias={
+        "A COMPANY":"A", "ALPHA COMPANY":"A", "A/1-5 CAV":"A",
+        "B COMPANY":"B", "BRAVO COMPANY":"B", "B/1-5 CAV":"B",
+        "C COMPANY":"C", "CHARLIE COMPANY":"C", "C/1-5 CAV":"C",
+        "HHC":"HHC", "HHC/1-5 CAV":"HHC", "HEADQUARTERS & HEADQUARTERS COMPANY":"HHC",
+    }
     for name in role_names:
-        if name in {"A COMPANY","ALPHA COMPANY","A/1-5 CAV","B COMPANY","BRAVO COMPANY","B/1-5 CAV","C COMPANY","CHARLIE COMPANY","C/1-5 CAV","HHC","HHC/1-5 CAV","HEADQUARTERS & HEADQUARTERS COMPANY"}:
-            companies.append(name)
-        if any(x in name for x in ("1ST PLATOON","2ND PLATOON","3RD PLATOON","4TH PLATOON")):
-            for label in ("1ST PLATOON","2ND PLATOON","3RD PLATOON","4TH PLATOON"):
-                if label in name:
-                    platoons.append(label.title())
-                    break
-        if any(x in name for x in ("1ST SQUAD","2ND SQUAD","3RD SQUAD","4TH SQUAD")):
-            squads.append(name)
+        if name in company_alias:
+            companies.add(company_alias[name])
+        # Strict assignment roles carry their parent organization in the role name.
+        # Read those parents without counting the same platoon twice when a member
+        # correctly holds Company + Platoon + Squad roles simultaneously.
+        m=re.fullmatch(r"([ABC]) COMPANY • (1ST|2ND|3RD|4TH) PLATOON(?: • (1ST|2ND|3RD|4TH) SQUAD)?", name)
+        if m:
+            co,pl,sq=m.group(1),f"{m.group(2).title()} Platoon",m.group(3)
+            companies.add(co); platoons.add((co,pl))
+            if sq:
+                squads.add((co,pl,f"{sq.title()} Squad"))
+                strict_assignments.append((co,pl,f"{sq.title()} Squad"))
+            continue
+        # Legacy generic assignment roles are still understood for diagnostics.
+        m=re.fullmatch(r"(1ST|2ND|3RD|4TH) PLATOON", name)
+        if m: platoons.add((None,f"{m.group(1).title()} Platoon"))
+        m=re.fullmatch(r"(1ST|2ND|3RD|4TH) SQUAD", name)
+        if m: squads.add((None,None,f"{m.group(1).title()} Squad"))
     if len(ranks)==0: problems.append("recognized rank role required")
     elif len(ranks)>1: problems.append("multiple rank roles: "+", ".join(code for code,_ in ranks))
     if len(mos)==0: problems.append("recognized battlefield MOS role required")
     elif len(mos)>1: problems.append("multiple primary MOS roles: "+", ".join(code for code,_ in mos))
-    if len(companies)>1: problems.append("multiple company roles: "+", ".join(companies))
-    if len(platoons)>1: problems.append("multiple platoon roles: "+", ".join(platoons))
-    if len(squads)>1: problems.append("multiple squad roles: "+", ".join(squads))
-    return {"valid":not problems,"rank":ranks[0][0] if len(ranks)==1 else None,"mos":mos[0][0] if len(mos)==1 else None,"problems":problems,"ranks":ranks,"mos_roles":mos,"company":companies[0] if len(companies)==1 else None,"platoon":platoons[0] if len(platoons)==1 else None,"squad":squads[0] if len(squads)==1 else None}
+    if len(companies)>1: problems.append("multiple company assignments: "+", ".join(sorted(companies)))
+    # Multiple unique platoon/squad assignments are conflicts; duplicate parent references are not.
+    if len(platoons)>1: problems.append("multiple platoon assignments: "+", ".join(sorted(f"{c or '?'} {p}" for c,p in platoons)))
+    if len(squads)>1: problems.append("multiple squad assignments: "+", ".join(sorted(f"{c or '?'} {p or '?'} {q}" for c,p,q in squads)))
+    company=next(iter(companies),None)
+    platoon=next(iter(platoons), (None,None))[1] if platoons else None
+    squad=next(iter(squads), (None,None,None))[2] if squads else None
+    return {"valid":not problems,"rank":ranks[0][0] if len(ranks)==1 else None,"mos":mos[0][0] if len(mos)==1 else None,"problems":problems,"ranks":ranks,"mos_roles":mos,"company":company,"platoon":platoon,"squad":squad}
 
 async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
     try:
@@ -1166,7 +1185,8 @@ async def sync_personnel_identity(member: discord.Member, *, create_if_missing=F
                 "**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
                 "**YOUR SOLDIER RECORD HAS BEEN OPENED**\n\n"
                 f"Soldier: **{member.display_name}**\n"
-                f"Rank: **{result.get('rank_code') or 'FILED'}**\n"
+                f"Entry Grade / Current Rank: **{result.get('rank_code') or 'FILED'}**\n"
+                "Your promotion track begins from the rank entered on your 201 File; no lower-rank history is invented.\n"
                 f"Battle Roster No.: **{result.get('roster_number')}**\n"
                 f"Field Code: **{result.get('field_code')}**"
                 f"{weapon_line}\n\n"
