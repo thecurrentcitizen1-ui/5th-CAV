@@ -1032,7 +1032,7 @@ async def setup_channels(interaction: discord.Interaction, confirm: bool):
         await interaction.followup.send(f'Channel setup failed: `{exc}`',ephemeral=True)
 
 
-@bot.tree.command(name='battalion-setup', description='One-command build of 1/5 CAV roles, dividers, categories, text channels, voice channels, and access scopes.')
+@bot.tree.command(name='battalion-setup', description='Build all 1/5 CAV roles, categories, channels, dividers, and access scopes.')
 @app_commands.describe(confirm='Set to True to build the complete server structure')
 async def battalion_setup(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
@@ -1072,7 +1072,7 @@ async def structure_status(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines),ephemeral=True)
 
 
-@bot.tree.command(name='structure-repair', description='Repair missing 1/5 CAV roles, categories, channels, and category access without duplicating existing items.')
+@bot.tree.command(name='structure-repair', description='Repair missing 1/5 CAV roles, categories, channels, and access without duplicates.')
 @app_commands.describe(confirm='Set to True to repair the battalion structure')
 async def structure_repair(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
