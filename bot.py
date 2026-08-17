@@ -105,7 +105,6 @@ APPOINTMENT_ROLE_BLUEPRINT = [
     "S-1 OIC", "S-1 NCOIC", "S-3 OIC", "S-3 NCOIC", "S-4 OIC", "S-4 NCOIC",
     "Company Commander", "Company Executive Officer", "First Sergeant",
     "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader",
-    "Battalion Instructor",
 ]
 
 MOS_ROLE_BLUEPRINT = [
@@ -254,51 +253,172 @@ def _role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]:
 
 
 def _member_access_roles(guild: discord.Guild):
+    # A recognized rank is the basic battalion-member access token. Staff roles
+    # are also included so staff can reach shared headquarters spaces even when
+    # troubleshooting a personnel-role mismatch.
     names = set(RANK_ROLE_BLUEPRINT + STAFF_ACCESS_ROLE_BLUEPRINT)
     return [r for r in guild.roles if r.name in names]
 
 
+def _overwrite_member(*, view=True, send=True, voice=True):
+    return discord.PermissionOverwrite(
+        view_channel=view,
+        read_messages=view,
+        send_messages=send if view else None,
+        connect=voice if view else None,
+        speak=voice if view else None,
+        add_reactions=send if view else None,
+        create_public_threads=False if view else None,
+        create_private_threads=False if view else None,
+        send_messages_in_threads=send if view else None,
+    )
+
+
+def _overwrite_staff(*, view=True):
+    return discord.PermissionOverwrite(
+        view_channel=view,
+        read_messages=view,
+        send_messages=True if view else None,
+        connect=True if view else None,
+        speak=True if view else None,
+        add_reactions=True if view else None,
+        manage_messages=True if view else None,
+        manage_threads=True if view else None,
+        move_members=True if view else None,
+        mute_members=True if view else None,
+        deafen_members=True if view else None,
+    )
+
+
+def _overwrite_functional_appointment():
+    # Deliberately does NOT grant view_channel. The Soldier's company/staff
+    # assignment controls visibility; the appointment only adds authority once
+    # that member already has access to the space.
+    return discord.PermissionOverwrite(
+        send_messages=True,
+        add_reactions=True,
+        manage_messages=True,
+        manage_threads=True,
+        move_members=True,
+        mute_members=True,
+        deafen_members=True,
+    )
+
+
+COMMAND_APPOINTMENTS = {"Battalion Commander", "Battalion Executive Officer"}
+STAFF_APPOINTMENTS = {
+    "S1": {"S-1 OIC", "S-1 NCOIC"},
+    "S3": {"S-3 OIC", "S-3 NCOIC"},
+    "S4": {"S-4 OIC", "S-4 NCOIC"},
+}
+COMPANY_LEADERSHIP_APPOINTMENTS = {
+    "Company Commander", "Company Executive Officer", "First Sergeant",
+    "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader",
+}
+
+
+def _add_roles(overwrites, guild, names, overwrite):
+    for name in names:
+        role = _role_by_name(guild, name)
+        if role:
+            overwrites[role] = overwrite
+
+
 def _scope_overwrites(guild: discord.Guild, scope: str):
+    """Authoritative category permission model.
+
+    Rank/MOS/qualification roles carry no guild permissions. Assignment roles
+    control visibility. Appointment and staff roles control functional authority.
+    """
     everyone = guild.default_role
-    overwrites = {everyone: discord.PermissionOverwrite(view_channel=False)}
+    overwrites = {
+        everyone: discord.PermissionOverwrite(
+            view_channel=False, read_messages=False, send_messages=False,
+            connect=False, speak=False,
+        )
+    }
 
     if scope == "PUBLIC":
-        overwrites[everyone] = discord.PermissionOverwrite(view_channel=True, read_messages=True)
+        overwrites[everyone] = _overwrite_member(view=True, send=True, voice=True)
         return overwrites
+
+    # Battalion Commander/XO and Command Staff can reach every managed internal area.
+    _add_roles(overwrites, guild, {"Command Staff", *COMMAND_APPOINTMENTS}, _overwrite_staff())
 
     if scope == "MEMBER":
         for role in _member_access_roles(guild):
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, connect=True)
+            # Command Staff already has the stronger overwrite above.
+            if role.name != "Command Staff":
+                overwrites[role] = _overwrite_member()
         return overwrites
 
-    allowed_names = {"Command Staff"}
-    if scope == "S1": allowed_names.add("S-1 Personnel")
-    elif scope == "S3": allowed_names.add("S-3 Operations")
-    elif scope == "S4": allowed_names.add("S-4 Supply")
-    elif scope == "COMMAND": pass
+    if scope == "S1":
+        _add_roles(overwrites, guild, {"S-1 Personnel", *STAFF_APPOINTMENTS["S1"]}, _overwrite_staff())
+    elif scope == "S3":
+        _add_roles(overwrites, guild, {"S-3 Operations", *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
+    elif scope == "S4":
+        _add_roles(overwrites, guild, {"S-4 Supply", *STAFF_APPOINTMENTS["S4"]}, _overwrite_staff())
+    elif scope == "COMMAND":
+        # Only Command Staff / Battalion Commander / Battalion XO were added above.
+        pass
     elif scope.startswith("COMPANY:"):
         letter = scope.split(":", 1)[1]
-        allowed_names.update({f"{letter} Company", "S-1 Personnel", "S-3 Operations"})
+        # Company assignment controls basic visibility.
+        _add_roles(overwrites, guild, {f"{letter} Company"}, _overwrite_member())
+        # S-1 and S-3 can enter company areas to administer personnel/operations.
+        _add_roles(overwrites, guild, {"S-1 Personnel", "S-3 Operations", *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
+        # Generic leadership appointments add authority but DO NOT grant visibility
+        # to other companies by themselves. The matching Company role is still required.
+        _add_roles(overwrites, guild, COMPANY_LEADERSHIP_APPOINTMENTS, _overwrite_functional_appointment())
 
-    for name in allowed_names:
-        role = _role_by_name(guild, name)
-        if role:
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, connect=True)
+    return overwrites
+
+
+def _channel_overwrites(guild: discord.Guild, spec: dict, channel_name: str, channel_type: str):
+    """Start from category policy, then tighten individual managed channels."""
+    overwrites = _scope_overwrites(guild, spec["scope"])
+    everyone = guild.default_role
+
+    # Public information sheets are read-only; recruiting/help remain conversational.
+    if spec["scope"] == "PUBLIC" and channel_type == "text" and channel_name in {"welcome-to-the-1-5", "standing-orders"}:
+        overwrites[everyone] = _overwrite_member(view=True, send=False, voice=False)
+
+    # Headquarters publication channels are read-only to ordinary Soldiers.
+    if spec["scope"] == "MEMBER" and channel_type == "text" and channel_name in {
+        "battalion-orders", "headquarters-notices", "personnel-orders", "promotions-and-awards"
+    }:
+        for role in _member_access_roles(guild):
+            if role.name in STAFF_ACCESS_ROLE_BLUEPRINT:
+                continue
+            overwrites[role] = _overwrite_member(view=True, send=False, voice=False)
+        # Staff shops may publish the records relevant to them; Command may publish all.
+        _add_roles(overwrites, guild, STAFF_ACCESS_ROLE_BLUEPRINT, _overwrite_staff())
+        _add_roles(overwrites, guild, {*COMMAND_APPOINTMENTS, *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"], *STAFF_APPOINTMENTS["S4"]}, _overwrite_staff())
+
     return overwrites
 
 
 async def build_battalion_roles(guild: discord.Guild):
-    created=[]; existing=[]; failed=[]
+    created=[]; existing=[]; repaired=[]; failed=[]
     me = guild.me
     if not me or not me.guild_permissions.manage_roles:
         raise RuntimeError("Battalion Clerk needs Manage Roles permission.")
 
-    # Create bottom-up so the hierarchy is easy to read even before a position pass.
+    # Rank, MOS, assignment, qualification, divider and staff labels carry no
+    # dangerous guild-wide permissions. Access is controlled by channel/category
+    # overwrites so rank never equals Discord administrative authority.
     for divider, roles in reversed(ROLE_SECTIONS):
         for name in reversed(roles):
             role = _role_by_name(guild, name)
             if role:
                 existing.append(name)
+                if role < me.top_role:
+                    try:
+                        await role.edit(permissions=discord.Permissions.none(), hoist=False, mentionable=False,
+                                        reason="Battalion Clerk — enforce managed role safety")
+                        repaired.append(name)
+                    except Exception as exc:
+                        failed.append(f"ROLE PERMISSIONS {name}: {exc}")
             else:
                 try:
                     await guild.create_role(name=name, permissions=discord.Permissions.none(), hoist=False, mentionable=False,
@@ -309,6 +429,13 @@ async def build_battalion_roles(guild: discord.Guild):
         role = _role_by_name(guild, divider)
         if role:
             existing.append(divider)
+            if role < me.top_role:
+                try:
+                    await role.edit(permissions=discord.Permissions.none(), hoist=False, mentionable=False,
+                                    reason="Battalion Clerk — enforce visual divider safety")
+                    repaired.append(divider)
+                except Exception as exc:
+                    failed.append(f"DIVIDER PERMISSIONS {divider}: {exc}")
         else:
             try:
                 await guild.create_role(name=divider, permissions=discord.Permissions.none(), hoist=False, mentionable=False,
@@ -317,8 +444,7 @@ async def build_battalion_roles(guild: discord.Guild):
             except Exception as exc:
                 failed.append(f"{divider}: {exc}")
 
-    # Position the whole managed block immediately below the bot's highest role.
-    # Discord does not allow a bot to move roles above its own top role.
+    # Position the managed block immediately below the bot's highest role.
     try:
         ordered_names=[]
         for divider, roles in ROLE_SECTIONS:
@@ -332,11 +458,11 @@ async def build_battalion_roles(guild: discord.Guild):
             await guild.edit_role_positions(positions=positions, reason="Battalion Clerk — organize 1/5 CAV role hierarchy")
     except Exception as exc:
         failed.append(f"Role hierarchy arrangement: {exc}")
-    return {"created":created,"existing":existing,"failed":failed}
+    return {"created":created,"existing":existing,"repaired":repaired,"failed":failed}
 
 
 async def build_battalion_channels(guild: discord.Guild):
-    created=[]; existing=[]; failed=[]
+    created=[]; existing=[]; repaired=[]; failed=[]
     me=guild.me
     if not me or not me.guild_permissions.manage_channels:
         raise RuntimeError("Battalion Clerk needs Manage Channels permission.")
@@ -355,7 +481,8 @@ async def build_battalion_channels(guild: discord.Guild):
             existing.append(f"CATEGORY:{spec['category']}")
             try:
                 await category.edit(overwrites=_scope_overwrites(guild,spec["scope"]),
-                                    reason="Battalion Clerk — repair category permissions")
+                                    reason="Battalion Clerk — enforce category permissions")
+                repaired.append(f"PERMISSIONS:{spec['category']}")
             except Exception as exc:
                 failed.append(f"PERMISSIONS {spec['category']}: {exc}")
 
@@ -364,19 +491,57 @@ async def build_battalion_channels(guild: discord.Guild):
                 found=discord.utils.get(category.text_channels,name=channel_name)
             else:
                 found=discord.utils.get(category.voice_channels,name=channel_name)
+            channel_overwrites=_channel_overwrites(guild,spec,channel_name,channel_type)
             if found:
                 existing.append(f"{channel_type.upper()}:{spec['category']}/{channel_name}")
+                try:
+                    await found.edit(overwrites=channel_overwrites, reason="Battalion Clerk — enforce channel permissions")
+                    repaired.append(f"{channel_type.upper()}:{spec['category']}/{channel_name}")
+                except Exception as exc:
+                    failed.append(f"CHANNEL PERMISSIONS {spec['category']}/{channel_name}: {exc}")
                 continue
             try:
                 if channel_type == "text":
-                    await guild.create_text_channel(channel_name, category=category, reason="Battalion Clerk — 1/5 CAV channel structure")
+                    await guild.create_text_channel(channel_name, category=category, overwrites=channel_overwrites,
+                                                    reason="Battalion Clerk — 1/5 CAV channel structure")
                 else:
-                    await guild.create_voice_channel(channel_name, category=category, reason="Battalion Clerk — 1/5 CAV channel structure")
+                    await guild.create_voice_channel(channel_name, category=category, overwrites=channel_overwrites,
+                                                     reason="Battalion Clerk — 1/5 CAV channel structure")
                 created.append(f"{channel_type.upper()}:{spec['category']}/{channel_name}")
             except Exception as exc:
                 failed.append(f"{channel_type.upper()} {spec['category']}/{channel_name}: {exc}")
-    return {"created":created,"existing":existing,"failed":failed}
+    return {"created":created,"existing":existing,"repaired":repaired,"failed":failed}
 
+
+
+def _managed_role_names():
+    names=[]
+    for divider,roles in ROLE_SECTIONS:
+        names.append(divider)
+        names.extend(roles)
+    # Preserve order while removing the occasional shared label.
+    return list(dict.fromkeys(names))
+
+
+async def reset_battalion_roles(guild: discord.Guild):
+    """Delete only Battalion Clerk managed roles/dividers; never touch unrelated roles."""
+    me=guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        raise RuntimeError("Battalion Clerk needs Manage Roles permission.")
+    deleted=[]; failed=[]; skipped=[]
+    # Delete low-to-high to reduce hierarchy churn.
+    managed=[r for r in guild.roles if r.name in set(_managed_role_names())]
+    managed.sort(key=lambda r:r.position)
+    for role in managed:
+        if role >= me.top_role:
+            skipped.append(role.name)
+            continue
+        try:
+            await role.delete(reason="Battalion Clerk — authorized managed-role reset")
+            deleted.append(role.name)
+        except Exception as exc:
+            failed.append(f"{role.name}: {exc}")
+    return {"deleted":deleted,"failed":failed,"skipped":skipped}
 
 def structure_inventory(guild: discord.Guild):
     expected_roles=[]
@@ -1085,6 +1250,44 @@ async def structure_repair(interaction: discord.Interaction, confirm: bool):
     await interaction.followup.send(
         f"**STRUCTURE REPAIR COMPLETE**\nCreated/repaired role items: **{len(roles['created'])}**\nCreated/repaired category/channel items: **{len(channels['created'])}**\nRemaining missing roles/categories/channels: **{len(inv['missing_roles'])}/{len(inv['missing_categories'])}/{len(inv['missing_channels'])}**",
         ephemeral=True)
+
+
+@bot.tree.command(name='permissions-repair', description='Reapply the approved 1/5 CAV channel and role permission model.')
+@app_commands.describe(confirm='Set True to enforce the approved permission model')
+async def permissions_repair(interaction: discord.Interaction, confirm: bool):
+    if not await require_manage_guild(interaction): return
+    if not confirm:
+        await interaction.response.send_message('No changes made. Run `/permissions-repair confirm:True` when ready.', ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    roles=await build_battalion_roles(interaction.guild)
+    channels=await build_battalion_channels(interaction.guild)
+    failures=roles['failed']+channels['failed']
+    await interaction.followup.send(
+        f"**BATTALION PERMISSION MODEL ENFORCED**\n"
+        f"Roles checked/repaired: **{len(roles.get('repaired', []))}**\n"
+        f"Categories/channels checked/repaired: **{len(channels.get('repaired', []))}**\n"
+        f"Failures: **{len(failures)}**\n\n"
+        "Rank/MOS/qualification roles remain permission-neutral. Assignment roles control visibility; staff and appointments control functional authority.",
+        ephemeral=True)
+
+
+@bot.tree.command(name='reset-battalion-roles', description='Delete only Battalion Clerk managed roles so they can be rebuilt cleanly.')
+@app_commands.describe(confirmation='Type RESET ROLES exactly. This removes managed roles from members.')
+async def reset_battalion_roles_command(interaction: discord.Interaction, confirmation: str):
+    if not await require_manage_guild(interaction): return
+    if confirmation.strip().upper() != 'RESET ROLES':
+        await interaction.response.send_message(
+            'No changes made. To confirm the destructive reset, run `/reset-battalion-roles confirmation:RESET ROLES`.',
+            ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    result=await reset_battalion_roles(interaction.guild)
+    msg=(f"**MANAGED ROLE RESET COMPLETE**\nDeleted: **{len(result['deleted'])}**\n"
+         f"Skipped above Clerk: **{len(result['skipped'])}**\nFailures: **{len(result['failed'])}**\n\n"
+         "Only Battalion Clerk blueprint roles/dividers were targeted. Categories and channels were left in place. "
+         "Run `/battalion-setup confirm:True` next to recreate the roles and reapply all access permissions.")
+    if result['failed']:
+        msg += "\n\n**Review:**\n" + "\n".join(f"• {x}" for x in result['failed'][:10])
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name='personnel-status', description="Check a member's rank/MOS processing state before a 201 File is created.")

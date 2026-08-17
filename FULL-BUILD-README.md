@@ -71,3 +71,15 @@ Added owner/manage-server setup commands:
 Blueprint includes Replacement Detachment, Battalion HQ, S-1, S-3, S-4, Battalion Command, and A/B/C Company areas. Divider roles are visual-only and personnel sync ignores them.
 
 The bot must have Manage Roles + Manage Channels and its bot role must be above every role it needs to manage.
+
+## Permission model / managed-role reset update
+- Rank, MOS, qualification, divider, and assignment roles carry no guild-wide administrative permissions.
+- Company assignment roles provide company-area visibility.
+- Staff roles and staff appointments control S-1/S-3/S-4 access.
+- Battalion Commander, Battalion Executive Officer, and Command Staff can access all managed internal areas.
+- Company leadership appointments add functional moderation/voice authority only after the member already has company visibility; they do not unlock every company.
+- Public `welcome-to-the-1-5` and `standing-orders` are read-only; recruiting/help areas remain interactive.
+- Battalion Headquarters publication channels are read-only to ordinary Soldiers and publishable by staff/command.
+- Existing managed categories/channels have their approved overwrites reapplied whenever setup/repair runs.
+- `/permissions-repair confirm:True` reapplies the approved permission model without deleting structure.
+- `/reset-battalion-roles confirmation:RESET ROLES` deletes ONLY Battalion Clerk-managed blueprint roles/dividers. It leaves categories/channels and unrelated Discord roles untouched. This removes those roles from members; run `/battalion-setup confirm:True` immediately afterward to rebuild and reapply access.
