@@ -86,6 +86,7 @@ RANK_ROLE_ALIASES = {
 # and appointments.
 DIVIDER_ROLE_NAMES = [
     "──────── BATTALION COMMAND ────────",
+    "──────── RECRUITING STATUS ────────",
     "──────── RANK ────────",
     "──────── APPOINTMENTS ────────",
     "──────── BATTLEFIELD MOS ────────",
@@ -99,6 +100,10 @@ DIVIDER_ROLE_NAMES = [
 RANK_ROLE_BLUEPRINT = [
     "LTC", "MAJ", "CPT", "1LT", "2LT", "SGM", "1SG", "MSG", "SFC",
     "SSG", "SGT", "SP7", "SP6", "SP5", "SP4", "CPL", "PFC", "PVT",
+]
+
+RECRUITING_STATUS_ROLE_BLUEPRINT = [
+    "Prospective Replacement", "Approved Replacement",
 ]
 
 APPOINTMENT_ROLE_BLUEPRINT = [
@@ -160,6 +165,7 @@ STAFF_ACCESS_ROLE_BLUEPRINT = [
 
 ROLE_SECTIONS = [
     ("──────── BATTALION COMMAND ────────", ["Command Staff"]),
+    ("──────── RECRUITING STATUS ────────", RECRUITING_STATUS_ROLE_BLUEPRINT),
     ("──────── RANK ────────", RANK_ROLE_BLUEPRINT),
     ("──────── APPOINTMENTS ────────", APPOINTMENT_ROLE_BLUEPRINT),
     ("──────── BATTLEFIELD MOS ────────", MOS_ROLE_BLUEPRINT),
@@ -669,6 +675,23 @@ def _role_code_hits(member: discord.Member):
     mos=list({code:name for code,name in mos}.items())
     return ranks,mos
 
+async def recruiting_status_for(member: discord.Member):
+    try:
+        return await web.request('GET','/internal/clerk/recruiting/status',params={'guild_id':member.guild.id,'discord_user_id':member.id})
+    except Exception as exc:
+        log.warning('[RECRUITING STATUS FAILED] member=%s error=%s',member.id,exc)
+        return {'ok':False,'exists':False}
+
+async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
+    desired_name='Approved Replacement' if approved else 'Prospective Replacement'
+    desired=discord.utils.get(member.guild.roles,name=desired_name)
+    other=discord.utils.get(member.guild.roles,name=('Prospective Replacement' if approved else 'Approved Replacement'))
+    try:
+        if other and other in member.roles: await member.remove_roles(other,reason='Recruiting case status synchronization')
+        if desired and desired not in member.roles: await member.add_roles(desired,reason='Recruiting case status synchronization')
+    except discord.Forbidden:
+        log.warning('[RECRUIT ROLE SYNC BLOCKED] member=%s',member.id)
+
 def validate_personnel_roles(member: discord.Member):
     ranks,mos=_role_code_hits(member)
     problems=[]
@@ -720,16 +743,35 @@ async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
         if not member or member.bot:
             return
         await collector.upsert_member(member)
+        # Existing personnel records remain authoritative and may always synchronize.
+        existing = await sync_personnel_identity(member, create_if_missing=False, reason=reason, deliver_credentials=False)
+        if existing and existing.get('linked'):
+            log.info('[PERSONNEL EXISTING SYNC] member=%s (%s)',member.display_name,member.id)
+            return
+        # New personnel creation is gated by an approved, Discord-verified Recruiting Case.
+        recruit = await recruiting_status_for(member)
+        case = recruit.get('case') if recruit and recruit.get('exists') else None
+        if not case or case.get('status') != 'APPROVED_AWAITING_PROCESSING':
+            await ensure_recruit_status_role(member,approved=False)
+            log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): approved recruiting case required',member.display_name,member.id)
+            return
         validation=validate_personnel_roles(member)
         if not validation["valid"]:
             log.warning('[PERSONNEL VALIDATION HOLD] member=%s (%s): %s',member.display_name,member.id,'; '.join(validation['problems']))
             return
         log.info('[PERSONNEL VALIDATED] member=%s (%s) rank=%s mos=%s',member.display_name,member.id,validation.get('rank'),validation.get('mos'))
-        result = await sync_personnel_identity(member, create_if_missing=True,
-                                               reason=reason, deliver_credentials=True)
-        log.info('[PERSONNEL ROLE SETTLED] member=%s (%s) result=%s assignment=%s / %s / %s',
-                 member.display_name, member.id, (result or {}).get('reason') or ('created' if (result or {}).get('created') else 'synced'),
-                 (result or {}).get('unit_code') or 'UNASSIGNED', (result or {}).get('platoon') or '—', (result or {}).get('squad') or '—')
+        result = await sync_personnel_identity(member, create_if_missing=True, reason=reason, deliver_credentials=True)
+        if result and (result.get('created') or result.get('linked')):
+            try:
+                await web.request('POST','/internal/clerk/recruiting/converted',json={'discord_user_id':member.id,'personnel_id':result.get('personnel_id')})
+            except Exception as exc:
+                log.warning('[RECRUITING CONVERSION FILE FAILED] member=%s error=%s',member.id,exc)
+            for role_name in RECRUITING_STATUS_ROLE_BLUEPRINT:
+                role=discord.utils.get(member.guild.roles,name=role_name)
+                if role and role in member.roles:
+                    try: await member.remove_roles(role,reason='Recruit converted to battalion personnel')
+                    except discord.Forbidden: pass
+        log.info('[PERSONNEL ROLE SETTLED] member=%s (%s) result=%s assignment=%s / %s / %s',member.display_name, member.id, (result or {}).get('reason') or ('created' if (result or {}).get('created') else 'synced'),(result or {}).get('unit_code') or 'UNASSIGNED', (result or {}).get('platoon') or '—', (result or {}).get('squad') or '—')
     except asyncio.CancelledError:
         return
     except Exception as exc:
@@ -1890,6 +1932,8 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
 
 @bot.event
 async def on_ready():
+    if not approved_recruit_watch.is_running():
+        approved_recruit_watch.start()
     global collector_started, commands_synced
 
     if not collector_started:
@@ -1978,13 +2022,69 @@ async def on_ready():
         )
 
 
+@bot.tree.command(name="verify-application", description="Link your Discord account to a 1/5 Cav website application using its one-time code.")
+@app_commands.describe(code="Verification code shown on your website application receipt")
+async def verify_application(interaction: discord.Interaction, code: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Run this command inside the 1/5 Cav Discord server.",ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result=await web.request('POST','/internal/clerk/recruiting/verify',json={'code':code,'guild_id':interaction.guild.id,'discord_user_id':interaction.user.id,'username':interaction.user.name})
+    except Exception as exc:
+        await interaction.followup.send(f"Application verification failed: {exc}",ephemeral=True); return
+    approved=result.get('status')=='APPROVED_AWAITING_PROCESSING'
+    await ensure_recruit_status_role(interaction.user,approved=approved)
+    await interaction.followup.send(f"**APPLICATION VERIFIED**\nRecruiting Case: **{result.get('case_number')}**\nStatus: **{str(result.get('status')).replace('_',' ')}**\nBattalion Headquarters can now match your application to this Discord account.",ephemeral=True)
+
+@bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
+async def application_status(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Run this command inside the 1/5 Cav Discord server.",ephemeral=True); return
+    data=await recruiting_status_for(interaction.user)
+    if not data.get('exists'):
+        app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website"
+        await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Apply at {app_url}",ephemeral=True); return
+    case=data.get('case') or {}
+    await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{str(case.get('status')).replace('_',' ')}**",ephemeral=True)
+
+@tasks.loop(minutes=1)
+async def approved_recruit_watch():
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':guild.id})
+            for case in data.get('cases',[]):
+                member=guild.get_member(int(case.get('discord_user_id') or 0))
+                if not member: continue
+                await ensure_recruit_status_role(member,approved=True)
+                if not case.get('discord_notified_at'):
+                    try:
+                        await member.send(f"**APPLICATION APPROVED — 1/5 CAV**\nRecruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Report to the Replacement Detachment and await rank, MOS, company, platoon, and squad assignment.")
+                    except discord.Forbidden: pass
+                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/notified",json={})
+        except Exception as exc:
+            log.warning('[APPROVED RECRUIT WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if GUILD_ID and member.guild.id != GUILD_ID:
         return
     await collector.upsert_member(member)
     if not member.bot:
-        await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
+        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
+        if not (existing and existing.get('linked')):
+            recruit=await recruiting_status_for(member)
+            case=recruit.get('case') if recruit and recruit.get('exists') else None
+            approved=bool(case and case.get('status')=='APPROVED_AWAITING_PROCESSING')
+            await ensure_recruit_status_role(member,approved=approved)
+            try:
+                if approved:
+                    await member.send("**1/5 CAV — REPLACEMENT DETACHMENT**\nYour application is approved. You are now awaiting battalion rank, MOS, company, platoon, and squad assignment before your Soldier record is opened.")
+                else:
+                    app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
+                    await member.send("**1/5 CAV — REPLACEMENT DETACHMENT**\nNo approved enlistment application is linked to this Discord account. Complete your application at: "+app_url+"\nAfter submitting, use `/verify-application` with the one-time code on your application receipt.")
+            except discord.Forbidden:
+                log.warning('[RECRUIT DM BLOCKED] member=%s',member.id)
     await collector.record_event('member_join', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),

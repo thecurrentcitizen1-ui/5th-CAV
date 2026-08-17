@@ -21,3 +21,10 @@ Then run:
 
 Optionally run:
 `/permissions-repair confirm:True`
+
+RECRUITING PIPELINE
+- /verify-application code:<CAV-XXXX>
+- /application-status
+- New walk-ins receive Prospective Replacement when the role exists.
+- Approved cases receive Approved Replacement and are still not personnel until rank+MOS+assignment roles settle.
+- Run /structure-repair after deploy to add the new Recruiting Status roles to an existing server.
