@@ -112,7 +112,7 @@ APPOINTMENT_ROLE_BLUEPRINT = [
     "Battalion Commander", "Battalion Executive Officer",
     "S-1 OIC", "S-1 NCOIC", "S-3 OIC", "S-3 NCOIC", "S-4 OIC", "S-4 NCOIC",
     "Company Commander", "Company Executive Officer", "First Sergeant",
-    "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader",
+    "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader",
 ]
 
 MOS_ROLE_BLUEPRINT = [
@@ -347,7 +347,7 @@ STAFF_APPOINTMENTS = {
 }
 COMPANY_LEADERSHIP_APPOINTMENTS = {
     "Company Commander", "Company Executive Officer", "First Sergeant",
-    "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader",
+    "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader",
 }
 
 
@@ -1295,6 +1295,19 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     for role in member.guild.roles:
         n=" ".join(role.name.upper().strip().split())
         if n in desired_company or (desired_platoon_role and n==desired_platoon_role) or (desired_squad_role and n==desired_squad_role):
+            desired.append(role)
+
+    # Field-leadership appointments are billets, not ranks. The website 201 File
+    # is authoritative; Battalion Clerk mirrors only this managed appointment set.
+    managed_appointment_names = {
+        "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader"
+    }
+    desired_appointment_names = set(result.get("appointment_roles") or []) & managed_appointment_names
+    for role in member.roles:
+        if role.name in managed_appointment_names and role.name not in desired_appointment_names:
+            remove.append(role)
+    for role in member.guild.roles:
+        if role.name in desired_appointment_names:
             desired.append(role)
     try:
         remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))

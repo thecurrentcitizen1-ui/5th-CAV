@@ -12,3 +12,9 @@
 - Closing a ticket marks the linked personnel action CLOSED, exports up to 500 messages as a transcript, archives it to the configured archive channel, then removes the private ticket channel.
 - Added `/helpdesk-panel`, `/helpdesk-archive`, `/helpdesk-status`, and `/ticket` commands.
 - Existing `/request-channel` routes are also notified when a private Help Desk ticket opens.
+
+
+## Leadership Appointment Sync — 2026-08-17
+- Added Team Leader to the Battalion Clerk appointment-role blueprint.
+- Platoon Sergeant, Squad Leader, Assistant Squad Leader, and Team Leader are managed as appointments, not ranks.
+- Battalion Clerk now mirrors these four leadership appointment roles from the authoritative website personnel record during canonical personnel synchronization.
