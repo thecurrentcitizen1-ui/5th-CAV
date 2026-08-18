@@ -3,6 +3,8 @@ import logging
 import re
 import uuid
 import asyncio
+import io
+import json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Tuple, Optional
@@ -2093,6 +2095,12 @@ async def on_ready():
         recruit_status_watch.start()
     global collector_started, commands_synced
 
+    # Persistent Help Desk buttons survive bot restarts.
+    if not getattr(bot, '_helpdesk_views_registered', False):
+        bot.add_view(HelpDeskPanelView())
+        bot.add_view(HelpDeskTicketView())
+        bot._helpdesk_views_registered = True
+
     if not collector_started:
         await collector.start()
         collector_started = True
@@ -2547,6 +2555,253 @@ async def request_channel_status(interaction:discord.Interaction):
         ch=await get_report_channel(interaction.guild,f'REQUEST_{cat}')
         lines.append(f'**{cat.title()}** — {ch.mention if ch else "NOT ASSIGNED"}')
     await interaction.response.send_message('\n'.join(lines),ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# BATTALION HELP DESK — private Discord tickets + website personnel actions
+# ---------------------------------------------------------------------------
+HELPDESK_STAFF_ROLES = {
+    'PERSONNEL': ('S-1 Personnel', 'Command Staff'),
+    'TRAINING': ('S-3 Operations', 'Command Staff'),
+    'SUPPLY': ('S-4 Supply', 'Command Staff'),
+    'LEADERSHIP': ('Command Staff',),
+    'TECHNICAL': ('Command Staff',),
+}
+HELPDESK_CATEGORY_NAME = 'BATTALION HELP DESK'
+
+async def ensure_helpdesk_table():
+    await collector.start(); db=collector.db
+    if not db or not getattr(db,'pool',None):
+        raise RuntimeError('PostgreSQL is not available.')
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_helpdesk_tickets (
+        ticket_id BIGSERIAL PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT UNIQUE,
+        discord_user_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        personnel_action_id TEXT,
+        claimed_by TEXT,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        closed_at TIMESTAMPTZ,
+        closed_by TEXT
+    )""")
+
+
+def _ticket_slug(member: discord.Member, ticket_id: int) -> str:
+    base = re.sub(r'[^a-z0-9]+', '-', member.display_name.lower()).strip('-') or 'soldier'
+    return f'ticket-{ticket_id:04d}-{base}'[:95]
+
+
+def _member_has_helpdesk_staff_role(member: discord.Member, category: str | None = None) -> bool:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild or member.guild_permissions.manage_channels:
+        return True
+    allowed = set(HELPDESK_STAFF_ROLES.get(category or '', ('Command Staff',)))
+    allowed.add('Command Staff')
+    return any(role.name in allowed for role in member.roles)
+
+
+async def _helpdesk_category(guild: discord.Guild) -> discord.CategoryChannel:
+    existing = discord.utils.get(guild.categories, name=HELPDESK_CATEGORY_NAME)
+    if existing:
+        return existing
+    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+    me = guild.me
+    if me:
+        overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+    return await guild.create_category(HELPDESK_CATEGORY_NAME, overwrites=overwrites, reason='Battalion Clerk help desk setup')
+
+
+async def create_helpdesk_ticket(interaction: discord.Interaction, category: str, subject: str, details: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send('Help Desk tickets can only be opened inside the battalion server.', ephemeral=True)
+        return
+    await ensure_helpdesk_table(); db=collector.db
+    guild=interaction.guild; member=interaction.user
+
+    existing=await db.fetchrow("""SELECT ticket_id,channel_id FROM clerk_helpdesk_tickets
+        WHERE guild_id=$1 AND discord_user_id=$2 AND category=$3 AND status='OPEN'
+        ORDER BY created_at DESC LIMIT 1""", str(guild.id), str(member.id), category)
+    if existing:
+        ch=guild.get_channel(int(existing['channel_id'])) if existing.get('channel_id') else None
+        if ch:
+            await interaction.followup.send(f'You already have an open **{category.title()}** Help Desk ticket: {ch.mention}', ephemeral=True)
+            return
+
+    person=await linked_personnel_for_discord(guild.id,member.id)
+    action_id=None
+    section=REQUEST_CATEGORY_SECTION[category]
+    if person:
+        action=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json)
+            VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,$6::jsonb) RETURNING id""",
+            str(person['id']),category,subject.strip(),section,
+            f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip(),
+            json.dumps({'details':details.strip(),'source':'DISCORD HELPDESK','discord_user_id':str(member.id)}))
+        action_id=str(action['id']) if action else None
+
+    row=await db.fetchrow("""INSERT INTO clerk_helpdesk_tickets(guild_id,discord_user_id,category,subject,personnel_action_id)
+        VALUES($1,$2,$3,$4,$5) RETURNING ticket_id""",str(guild.id),str(member.id),category,subject.strip(),action_id)
+    ticket_id=int(row['ticket_id'])
+    parent=await _helpdesk_category(guild)
+    overwrites={
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+    }
+    if guild.me:
+        overwrites[guild.me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,manage_channels=True,attach_files=True)
+    for role_name in HELPDESK_STAFF_ROLES[category]:
+        role=discord.utils.get(guild.roles,name=role_name)
+        if role:
+            overwrites[role]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True)
+
+    channel=await guild.create_text_channel(
+        _ticket_slug(member,ticket_id), category=parent, overwrites=overwrites,
+        topic=f'1/5 CAV Help Desk | Ticket #{ticket_id} | {category} | Owner {member.id}',
+        reason=f'Help Desk ticket #{ticket_id} opened by {member}'
+    )
+    await db.execute('UPDATE clerk_helpdesk_tickets SET channel_id=$1 WHERE ticket_id=$2',str(channel.id),ticket_id)
+
+    action_line=f'Website Personnel Action: `{action_id}`' if action_id else 'Website Personnel Action: **Not created — no active Soldier Record is linked yet.**'
+    embed=discord.Embed(title=f'1/5 CAV HELP DESK — TICKET #{ticket_id}',description=details[:3500])
+    embed.add_field(name='Office',value=f'{category.title()} / {section}',inline=True)
+    embed.add_field(name='Opened By',value=member.mention,inline=True)
+    embed.add_field(name='Subject',value=subject[:1024],inline=False)
+    embed.add_field(name='Battalion Record',value=action_line,inline=False)
+    embed.set_footer(text='Use Claim to take staff ownership. Use Close Ticket when the matter is resolved.')
+    mentions=' '.join(r.mention for r in guild.roles if r.name in HELPDESK_STAFF_ROLES[category])
+    await channel.send(content=f'{member.mention} {mentions}'.strip(), embed=embed, view=HelpDeskTicketView())
+
+    route=await get_report_channel(guild,f'REQUEST_{category}')
+    if route and route.id != channel.id:
+        await route.send(f'**HELP DESK TICKET #{ticket_id} — {category} / {section}**\n{member.mention} • **{subject[:180]}**\nPrivate ticket: {channel.mention}' + (f'\nPersonnel Action: `{action_id}`' if action_id else ''))
+    await interaction.followup.send(f'Your private Help Desk ticket has been opened: {channel.mention}',ephemeral=True)
+
+
+async def close_helpdesk_ticket(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.channel,discord.TextChannel): return
+    await ensure_helpdesk_table(); db=collector.db
+    row=await db.fetchrow("SELECT * FROM clerk_helpdesk_tickets WHERE channel_id=$1 AND status='OPEN'",str(interaction.channel.id))
+    if not row:
+        await interaction.response.send_message('This channel is not an open Battalion Help Desk ticket.',ephemeral=True); return
+    member=interaction.user if isinstance(interaction.user,discord.Member) else None
+    is_owner=str(interaction.user.id)==str(row['discord_user_id'])
+    if not (is_owner or (member and _member_has_helpdesk_staff_role(member,row['category']))):
+        await interaction.response.send_message('Only the ticket owner or authorized battalion staff can close this ticket.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+
+    lines=[]
+    async for msg in interaction.channel.history(limit=500,oldest_first=True):
+        stamp=msg.created_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        body=msg.clean_content or ''
+        if msg.attachments:
+            body += ('\n' if body else '') + 'Attachments: ' + ', '.join(a.url for a in msg.attachments)
+        lines.append(f'[{stamp}] {msg.author} ({msg.author.id}): {body}')
+    transcript=('\n'.join(lines) or 'No messages were recorded.').encode('utf-8',errors='replace')
+
+    await db.execute("UPDATE clerk_helpdesk_tickets SET status='CLOSED',closed_at=NOW(),closed_by=$1 WHERE ticket_id=$2",str(interaction.user.id),row['ticket_id'])
+    if row.get('personnel_action_id'):
+        try:
+            await db.execute("UPDATE personnel_actions SET status='CLOSED' WHERE id::text=$1",str(row['personnel_action_id']))
+        except Exception as exc:
+            log.warning('[HELPDESK ACTION CLOSE FAILED] ticket=%s action=%s error=%s',row['ticket_id'],row['personnel_action_id'],exc)
+
+    archive=await get_report_channel(interaction.guild,'HELPDESK_ARCHIVE')
+    if archive:
+        f=discord.File(io.BytesIO(transcript),filename=f'helpdesk-ticket-{row["ticket_id"]}.txt')
+        await archive.send(f'**CLOSED HELP DESK TICKET #{row["ticket_id"]}**\nCategory: **{str(row["category"]).title()}**\nSubject: **{row["subject"]}**\nClosed by: {interaction.user.mention}' + (f'\nPersonnel Action: `{row["personnel_action_id"]}`' if row.get('personnel_action_id') else ''),file=f)
+    await interaction.followup.send('Ticket closed. The transcript has been archived when an archive channel is configured. This channel will be removed in 5 seconds.',ephemeral=True)
+    await asyncio.sleep(5)
+    try: await interaction.channel.delete(reason=f'Help Desk ticket #{row["ticket_id"]} closed')
+    except Exception as exc: log.warning('[HELPDESK CHANNEL DELETE FAILED] ticket=%s error=%s',row['ticket_id'],exc)
+
+
+class HelpDeskOpenModal(discord.ui.Modal):
+    def __init__(self, category:str):
+        super().__init__(title=f'{category.title()} Help Desk Request')
+        self.category=category
+        self.subject=discord.ui.TextInput(label='Subject',max_length=100,placeholder='Briefly describe what you need')
+        self.details=discord.ui.TextInput(label='Details',style=discord.TextStyle.paragraph,max_length=1500,placeholder='Give battalion staff the information needed to help you.')
+        self.add_item(self.subject); self.add_item(self.details)
+    async def on_submit(self,interaction:discord.Interaction):
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        await create_helpdesk_ticket(interaction,self.category,str(self.subject),str(self.details))
+
+
+class HelpDeskCategoryButton(discord.ui.Button):
+    def __init__(self, category:str, label:str, emoji:str):
+        super().__init__(label=label,emoji=emoji,style=discord.ButtonStyle.secondary,custom_id=f'helpdesk:open:{category.lower()}')
+        self.category=category
+    async def callback(self,interaction:discord.Interaction):
+        await interaction.response.send_modal(HelpDeskOpenModal(self.category))
+
+
+class HelpDeskPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for cat,label,emoji in [
+            ('PERSONNEL','Personnel','📁'),('TRAINING','Training','🎯'),('SUPPLY','Supply','📦'),
+            ('LEADERSHIP','Leadership','⭐'),('TECHNICAL','Technical','🛠️')]:
+            self.add_item(HelpDeskCategoryButton(cat,label,emoji))
+
+
+class HelpDeskTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label='Claim',style=discord.ButtonStyle.primary,emoji='📌',custom_id='helpdesk:claim')
+    async def claim(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.channel,discord.TextChannel): return
+        await ensure_helpdesk_table(); db=collector.db
+        row=await db.fetchrow("SELECT * FROM clerk_helpdesk_tickets WHERE channel_id=$1 AND status='OPEN'",str(interaction.channel.id))
+        if not row:
+            await interaction.response.send_message('This is not an open Help Desk ticket.',ephemeral=True); return
+        if not isinstance(interaction.user,discord.Member) or not _member_has_helpdesk_staff_role(interaction.user,row['category']):
+            await interaction.response.send_message('Only authorized battalion staff can claim this ticket.',ephemeral=True); return
+        await db.execute('UPDATE clerk_helpdesk_tickets SET claimed_by=$1 WHERE ticket_id=$2',str(interaction.user.id),row['ticket_id'])
+        await interaction.response.send_message(f'📌 Ticket claimed by {interaction.user.mention}.')
+    @discord.ui.button(label='Close Ticket',style=discord.ButtonStyle.danger,emoji='🔒',custom_id='helpdesk:close')
+    async def close(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await close_helpdesk_ticket(interaction)
+
+
+@bot.tree.command(name='helpdesk-panel',description='Post the Battalion Help Desk panel members use to open private tickets.')
+@app_commands.describe(channel='Public/member text channel where the Help Desk panel should be posted')
+async def helpdesk_panel(interaction:discord.Interaction,channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    embed=discord.Embed(title='1ST BATTALION, 5TH CAVALRY — HELP DESK',description='Select the battalion office that best matches your request. Battalion Clerk will open a private channel visible only to you and the appropriate staff section.')
+    embed.add_field(name='Personnel — S-1',value='Records, names, assignments, promotions, awards, access.',inline=False)
+    embed.add_field(name='Training — S-3',value='Schools, qualifications, training records, operation questions.',inline=False)
+    embed.add_field(name='Supply — S-4',value='Weapons, equipment, issue/turn-in, supply discrepancies.',inline=False)
+    embed.add_field(name='Leadership / Technical',value='Chain-of-command concerns or website/Discord technical support.',inline=False)
+    embed.set_footer(text='Each request creates a private ticket. Linked Soldiers also receive a website Personnel Action automatically.')
+    await channel.send(embed=embed,view=HelpDeskPanelView())
+    await set_report_channel(interaction.guild_id,'HELPDESK_PANEL',channel.id)
+    await interaction.response.send_message(f'Battalion Help Desk panel posted in {channel.mention}.',ephemeral=True)
+
+
+@bot.tree.command(name='helpdesk-archive',description='Assign the staff channel that receives closed Help Desk transcripts.')
+async def helpdesk_archive(interaction:discord.Interaction,channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'HELPDESK_ARCHIVE',channel.id)
+    await interaction.response.send_message(f'Closed Help Desk transcripts will be archived in {channel.mention}.',ephemeral=True)
+
+
+@bot.tree.command(name='helpdesk-status',description='Show Battalion Help Desk panel, archive, and open-ticket status.')
+async def helpdesk_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await ensure_helpdesk_table(); db=collector.db
+    panel=await get_report_channel(interaction.guild,'HELPDESK_PANEL')
+    archive=await get_report_channel(interaction.guild,'HELPDESK_ARCHIVE')
+    open_count=await db.fetchrow("SELECT COUNT(*) AS n FROM clerk_helpdesk_tickets WHERE guild_id=$1 AND status='OPEN'",str(interaction.guild_id))
+    await interaction.response.send_message(f'**Help Desk Panel:** {panel.mention if panel else "NOT ASSIGNED"}\n**Transcript Archive:** {archive.mention if archive else "NOT ASSIGNED"}\n**Open Tickets:** {int(open_count["n"] if open_count else 0)}',ephemeral=True)
+
+
+@bot.tree.command(name='ticket',description='Open a private Battalion Help Desk ticket without using the panel.')
+@app_commands.describe(category='Office that should receive the ticket',subject='Short description',details='What you need help with')
+@app_commands.choices(category=REQUEST_CHOICES)
+async def ticket_command(interaction:discord.Interaction,category:app_commands.Choice[str],subject:str,details:str):
+    if not interaction.guild: return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    await create_helpdesk_ticket(interaction,category.value,subject,details)
 
 INACTIVITY_LEVEL_CHOICES=[app_commands.Choice(name='S-1',value='INACTIVITY_S1'),app_commands.Choice(name='Command',value='INACTIVITY_COMMAND')]
 @bot.tree.command(name='inactivity-report-channel', description='Assign where inactivity escalation reports are posted.')
