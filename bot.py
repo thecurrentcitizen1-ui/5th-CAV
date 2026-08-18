@@ -692,6 +692,16 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
     except discord.Forbidden:
         log.warning('[RECRUIT ROLE SYNC BLOCKED] member=%s',member.id)
 
+
+async def clear_recruit_status_roles(member: discord.Member):
+    roles=[discord.utils.get(member.guild.roles,name=name) for name in RECRUITING_STATUS_ROLE_BLUEPRINT]
+    roles=[role for role in roles if role and role in member.roles]
+    if not roles: return
+    try:
+        await member.remove_roles(*roles,reason='Recruiting case closed or converted')
+    except discord.Forbidden:
+        log.warning('[RECRUIT ROLE CLEAR BLOCKED] member=%s',member.id)
+
 def validate_personnel_roles(member: discord.Member):
     ranks,mos=_role_code_hits(member)
     problems=[]
@@ -751,10 +761,18 @@ async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
         # New personnel creation is gated by an approved, Discord-verified Recruiting Case.
         recruit = await recruiting_status_for(member)
         case = recruit.get('case') if recruit and recruit.get('exists') else None
-        if not case or case.get('status') != 'APPROVED_AWAITING_PROCESSING':
+        status = str((case or {}).get('status') or '').upper()
+        if status in {'DENIED','CLOSED','ENLISTED'}:
+            await clear_recruit_status_roles(member)
+            log.info('[PERSONNEL CREATION CLOSED] member=%s (%s): recruiting case status=%s',member.display_name,member.id,status or 'NONE')
+            return
+        if not case or status != 'APPROVED_AWAITING_PROCESSING':
             await ensure_recruit_status_role(member,approved=False)
             log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): approved recruiting case required',member.display_name,member.id)
             return
+        # Approval is its own stage. Keep the approved holding role in place until
+        # staff finishes rank/MOS/company/platoon/squad assignment and conversion succeeds.
+        await ensure_recruit_status_role(member,approved=True)
         validation=validate_personnel_roles(member)
         if not validation["valid"]:
             log.warning('[PERSONNEL VALIDATION HOLD] member=%s (%s): %s',member.display_name,member.id,'; '.join(validation['problems']))
@@ -798,10 +816,18 @@ async def ensure_clerk_settings_table():
             guild_id TEXT PRIMARY KEY,
             orders_channel_id TEXT,
             operation_duty_channel_id TEXT,
+            welcome_channel_id TEXT,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_duty_channel_id TEXT")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS welcome_channel_id TEXT")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_warning_days INTEGER DEFAULT 14")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_s1_days INTEGER DEFAULT 21")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_command_days INTEGER DEFAULT 30")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_rounds_default INTEGER DEFAULT 180")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_report_channels (guild_id TEXT NOT NULL, report_type TEXT NOT NULL, channel_id TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,report_type))""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_automation_notices (guild_id TEXT NOT NULL, personnel_id TEXT NOT NULL, notice_type TEXT NOT NULL, notice_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,personnel_id,notice_type,notice_key))""")
     await db.execute("""
         CREATE TABLE IF NOT EXISTS clerk_order_routes (
             guild_id TEXT NOT NULL,
@@ -854,6 +880,79 @@ async def get_operation_duty_channel_id(guild_id: int) -> Optional[int]:
     async with db.pool.acquire() as conn:
         value=await conn.fetchval("SELECT operation_duty_channel_id FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
     return int(value) if value else None
+
+WELCOME_MESSAGE = """**HEADQUARTERS**
+**1ST BATTALION, 5TH CAVALRY REGIMENT**
+**1ST CAVALRY DIVISION (AIRMOBILE)**
+
+**REPLACEMENT PERSONNEL — REPORTING NOTICE**
+
+{member_mention}, you have reported to the **1st Battalion, 5th Cavalry Regiment**.
+
+All newly arrived personnel will remain with the **Replacement Detachment** pending completion of battalion in-processing and assignment.
+
+Personnel who have already submitted an enlistment application will have their recruiting case reviewed by Battalion Headquarters. Upon approval, you will receive further instructions concerning your initial rank, MOS, company, platoon, and squad assignment.
+
+Until processing is complete, review the battalion information, standing orders, and reporting instructions available within the server.
+
+**DO NOT DEPART THE REPLACEMENT DETACHMENT UNTIL RELEASED OR ASSIGNED.**
+
+Further instructions will be issued by Battalion Headquarters.
+
+**BY ORDER OF THE BATTALION COMMANDER**
+**BATTALION CLERK**
+**1/5 CAV**"""
+
+async def set_welcome_channel(guild_id: int, channel_id: int):
+    await ensure_clerk_settings_table()
+    db = getattr(collector, 'db', None)
+    if not db or not getattr(db, 'pool', None):
+        raise RuntimeError('PostgreSQL is not available for Battalion Clerk settings.')
+    await db.execute(
+        """INSERT INTO clerk_guild_settings(guild_id,welcome_channel_id,updated_at) VALUES($1,$2,NOW())
+           ON CONFLICT(guild_id) DO UPDATE SET welcome_channel_id=EXCLUDED.welcome_channel_id, updated_at=NOW()""",
+        str(guild_id), str(channel_id)
+    )
+
+async def clear_welcome_channel(guild_id: int):
+    await ensure_clerk_settings_table()
+    db = getattr(collector, 'db', None)
+    if db and getattr(db, 'pool', None):
+        await db.execute("UPDATE clerk_guild_settings SET welcome_channel_id=NULL, updated_at=NOW() WHERE guild_id=$1", str(guild_id))
+
+async def get_welcome_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    await ensure_clerk_settings_table()
+    db = getattr(collector, 'db', None)
+    channel_id = None
+    if db and getattr(db, 'pool', None):
+        async with db.pool.acquire() as conn:
+            value = await conn.fetchval("SELECT welcome_channel_id FROM clerk_guild_settings WHERE guild_id=$1", str(guild.id))
+        channel_id = int(value) if value else None
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    # The standard battalion structure already creates this public reception channel.
+    fallback = discord.utils.get(guild.text_channels, name='welcome-to-the-1-5')
+    return fallback if isinstance(fallback, discord.TextChannel) else None
+
+async def post_public_welcome(member: discord.Member):
+    if member.bot:
+        return False
+    channel = await get_welcome_channel(member.guild)
+    if not channel:
+        log.warning('[WELCOME] no welcome channel configured or named welcome-to-the-1-5 guild=%s', member.guild.id)
+        return False
+    try:
+        await channel.send(
+            WELCOME_MESSAGE.format(member_mention=member.mention),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        return True
+    except discord.Forbidden:
+        log.warning('[WELCOME] bot cannot send to channel=%s guild=%s', channel.id, member.guild.id)
+    except Exception as exc:
+        log.warning('[WELCOME] post failed member=%s error=%s', member.id, exc)
+    return False
 
 async def set_order_route(guild_id: int, order_type: str, channel_id: int):
     await ensure_clerk_settings_table()
@@ -1223,20 +1322,28 @@ async def sync_personnel_identity(member: discord.Member, *, create_if_missing=F
                  member.display_name,member.id,result.get("roster_number"),result.get("rank_code"))
     if deliver_credentials and result.get("roster_number") and result.get("field_code"):
         weapon_line=f"\nIssued M16 Serial No.: **{result.get('weapon_serial')}**" if result.get("weapon_serial") else ""
-        login_url=f"{WEBSITE_BASE_URL}/my-soldier-record" if WEBSITE_BASE_URL else "the battalion website — My Soldier Record"
         try:
             await member.send(
-                "**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
-                "**YOUR SOLDIER RECORD HAS BEEN OPENED**\n\n"
-                f"Soldier: **{member.display_name}**\n"
-                f"Entry Grade / Current Rank: **{result.get('rank_code') or 'FILED'}**\n"
-                "Your promotion track begins from the rank entered on your 201 File; no lower-rank history is invented.\n"
-                f"Battle Roster No.: **{result.get('roster_number')}**\n"
+                "**1/5 CAV — MEMBER ACCESS ISSUED**\n\n"
+                "Your Battalion personnel record has been created and your member access is now active.\n\n"
+                "**Website:** [www.5thcavgaming.com](https://www.5thcavgaming.com)\n\n"
+                "**TO LOG IN**\n"
+                "1. Open the website above.\n"
+                "2. Select **MY SOLDIER RECORD** from the main navigation.\n"
+                "3. Enter your **Battle Roster Number**.\n"
+                "4. Enter your **Field Code**.\n"
+                "5. Select **LOGIN** to open your Soldier Record.\n\n"
+                "**YOUR CREDENTIALS**\n"
+                f"Battle Roster Number: **{result.get('roster_number')}**\n"
                 f"Field Code: **{result.get('field_code')}**"
                 f"{weapon_line}\n\n"
-                "Your 201 File, issued M16, service uniform, assignment, orders, awards, qualifications, and service history are now tied to your battalion record.\n\n"
-                f"**MY SOLDIER RECORD:** {login_url}\n\n"
-                "Retain your Battle Roster Number and Field Code. Keep your Field Code private.")
+                "Keep this information private. Your Battle Roster Number and Field Code provide access to your personal battalion record.\n\n"
+                "From your Soldier Record you can review your assignment, MOS, rank, training, qualifications, orders, issued M16, uniform, awards, service history, and other battalion records as they are added throughout your tour.\n\n"
+                "If you lose your login information or cannot access your record, contact Battalion Headquarters or S-1 for assistance.\n\n"
+                "**BY ORDER OF THE BATTALION COMMANDER**\n"
+                "**BATTALION CLERK**\n"
+                "**1/5 CAV**"
+            )
         except discord.Forbidden:
             log.warning("[SOLDIER RECORD DM BLOCKED] %s (%s)",member.display_name,member.id)
     return result
@@ -1520,14 +1627,24 @@ async def reissue_login(interaction: discord.Interaction, member: discord.Member
     if not result.get('ok'):
         await interaction.followup.send(f"Reissue failed: {result.get('error', 'unknown error')}", ephemeral=True)
         return
-    login_url = f"{WEBSITE_BASE_URL}/my-soldier-record" if WEBSITE_BASE_URL else 'the battalion website — My Soldier Record'
     message = (
-        "**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
-        "**SOLDIER RECORD ACCESS REISSUED**\n\n"
-        f"Battle Roster No.: **{result.get('roster_number')}**\n"
+        "**1/5 CAV — MEMBER ACCESS REISSUED**\n\n"
+        "Your Battalion member access has been reissued. Use the credentials below to access your Soldier Record.\n\n"
+        "**Website:** [www.5thcavgaming.com](https://www.5thcavgaming.com)\n\n"
+        "**TO LOG IN**\n"
+        "1. Open the website above.\n"
+        "2. Select **MY SOLDIER RECORD** from the main navigation.\n"
+        "3. Enter your **Battle Roster Number**.\n"
+        "4. Enter your **Field Code**.\n"
+        "5. Select **LOGIN** to open your Soldier Record.\n\n"
+        "**YOUR CREDENTIALS**\n"
+        f"Battle Roster Number: **{result.get('roster_number')}**\n"
         f"Field Code: **{result.get('field_code')}**\n\n"
-        f"**MY SOLDIER RECORD:** {login_url}\n\n"
-        "Retain your Battle Roster Number and keep your Field Code private."
+        "Keep this information private. Your Battle Roster Number and Field Code provide access to your personal battalion record.\n\n"
+        "If you cannot access your record, contact Battalion Headquarters or S-1 for assistance.\n\n"
+        "**BY ORDER OF THE BATTALION COMMANDER**\n"
+        "**BATTALION CLERK**\n"
+        "**1/5 CAV**"
     )
     try:
         await member.send(message)
@@ -1585,6 +1702,34 @@ async def operation_duty_watch():
 @operation_duty_watch.before_loop
 async def before_operation_duty_watch():
     await bot.wait_until_ready()
+
+@bot.tree.command(name='welcome-channel', description='Set the channel where Battalion Clerk welcomes newly arrived personnel.')
+@app_commands.describe(channel='Public text channel that receives new-member reporting notices')
+async def welcome_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_welcome_channel(interaction.guild_id, channel.id)
+    await interaction.response.send_message(
+        f'**Welcome channel assigned:** {channel.mention}\nNew arrivals will receive the 1/5 CAV Replacement Personnel reporting notice there.',
+        ephemeral=True,
+    )
+
+@bot.tree.command(name='welcome-channel-status', description='Show the channel receiving new-member welcome notices.')
+async def welcome_channel_status(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    channel = await get_welcome_channel(interaction.guild)
+    await interaction.response.send_message(
+        f'**Welcome Channel:** {channel.mention if channel else "NOT ASSIGNED"}',
+        ephemeral=True,
+    )
+
+@bot.tree.command(name='welcome-channel-clear', description='Clear the configured new-member welcome channel.')
+async def welcome_channel_clear(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await clear_welcome_channel(interaction.guild_id)
+    await interaction.response.send_message(
+        'Configured welcome channel cleared. Battalion Clerk will fall back to `#welcome-to-the-1-5` if that standard channel exists.',
+        ephemeral=True,
+    )
 
 @bot.tree.command(name='operation-duty-channel', description='Assign the Discord channel that receives S-3 pre-operation duty rosters.')
 @app_commands.describe(channel='Text channel for operation-specific Soldier duty assignments')
@@ -1775,6 +1920,7 @@ async def duty_channel_status(interaction: discord.Interaction):
     time='Local start time: HH:MM (24-hour)',
     duration_minutes='Scheduled duration in minutes',
     operation_id='Optional website Operation UUID for combat-operation filing',
+    rounds_per_soldier='Optional OPERATION round expenditure; blank uses the battalion default',
 )
 @app_commands.choices(duty_type=DUTY_CHOICES)
 async def schedule_duty(
@@ -1785,6 +1931,7 @@ async def schedule_duty(
     time: str,
     duration_minutes: app_commands.Range[int, 45, 720],
     operation_id: Optional[str] = None,
+    rounds_per_soldier: Optional[app_commands.Range[int,0,1000]] = None,
 ):
     if not await require_manage_guild(interaction):
         return
@@ -1809,6 +1956,7 @@ async def schedule_duty(
         return
 
     local_end = local_start + timedelta(minutes=int(duration_minutes))
+    effective_rounds = int(rounds_per_soldier) if rounds_per_soldier is not None else (await operation_rounds_for_guild(interaction.guild_id) if event_type == 'OPERATION' else 0)
     channel = interaction.guild.get_channel(channel_id)
     external_id = f'discord:{interaction.guild_id}:{event_type}:{int(local_start.timestamp())}'
     result = await web.request('POST', '/internal/clerk/events', json={
@@ -1820,6 +1968,7 @@ async def schedule_duty(
         'channel_name': event_type.title(),
         'channel_id': channel_id,
         'operation_id': operation_id or None,
+        'rounds_per_soldier': effective_rounds,
     })
     await interaction.response.send_message(
         '**HEADQUARTERS — DUTY PERIOD FILED**\n'
@@ -1915,6 +2064,14 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
 
     result = await web.request('POST', f"/internal/clerk/events/{selected['id']}/close", json={})
     summary = result.get('summary') or {}
+    if str(selected.get('event_type') or '').upper() == 'OPERATION':
+        ch=await get_report_channel(interaction.guild,'POST_OPERATION')
+        if ch:
+            await ch.send(
+                f"**POST-OPERATION PROCESSING COMPLETE**\n**{selected.get('title')}**\n"
+                f"Tracked: **{summary.get('tracked',0)}** • Participation filed: **{summary.get('participated',summary.get('credited',0))}** • Full credit: **{summary.get('credited',0)}**\n"
+                f"Weapon rounds applied: **{summary.get('weapon_rounds_applied',0)}** • AAR task: **{'OPEN' if summary.get('aar_task_opened') else 'ON FILE / NOT REQUIRED'}**"
+            )
 
     try:
         await post_battalion_order(interaction.guild, selected, 'end', close_summary=summary)
@@ -1932,8 +2089,8 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
 
 @bot.event
 async def on_ready():
-    if not approved_recruit_watch.is_running():
-        approved_recruit_watch.start()
+    if not recruit_status_watch.is_running():
+        recruit_status_watch.start()
     global collector_started, commands_synced
 
     if not collector_started:
@@ -1967,6 +2124,10 @@ async def on_ready():
         personnel_orders_watch.start()
     if not operation_duty_watch.is_running():
         operation_duty_watch.start()
+    if not inactivity_watch.is_running():
+        inactivity_watch.start()
+    if not promotion_eligibility_watch.is_running():
+        promotion_eligibility_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -2022,19 +2183,29 @@ async def on_ready():
         )
 
 
-@bot.tree.command(name="verify-application", description="Link your Discord account to a 1/5 Cav website application using its one-time code.")
-@app_commands.describe(code="Verification code shown on your website application receipt")
-async def verify_application(interaction: discord.Interaction, code: str):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Run this command inside the 1/5 Cav Discord server.",ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        result=await web.request('POST','/internal/clerk/recruiting/verify',json={'code':code,'guild_id':interaction.guild.id,'discord_user_id':interaction.user.id,'username':interaction.user.name})
-    except Exception as exc:
-        await interaction.followup.send(f"Application verification failed: {exc}",ephemeral=True); return
-    approved=result.get('status')=='APPROVED_AWAITING_PROCESSING'
-    await ensure_recruit_status_role(interaction.user,approved=approved)
-    await interaction.followup.send(f"**APPLICATION VERIFIED**\nRecruiting Case: **{result.get('case_number')}**\nStatus: **{str(result.get('status')).replace('_',' ')}**\nBattalion Headquarters can now match your application to this Discord account.",ephemeral=True)
+
+
+@bot.tree.command(name='activity-channel-add', description='Allow a voice channel to count toward Soldier activity.')
+@app_commands.describe(channel='Voice channel to count as activity')
+async def activity_channel_add(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    if not await require_manage_guild(interaction): return
+    await collector.start()
+    await collector.db.execute("INSERT INTO activity_voice_channels(guild_id,channel_id,channel_name,added_by) VALUES($1,$2,$3,$4) ON CONFLICT(guild_id,channel_id) DO UPDATE SET channel_name=EXCLUDED.channel_name,added_by=EXCLUDED.added_by",interaction.guild.id,channel.id,channel.name,interaction.user.id)
+    await interaction.response.send_message(f'Activity tracking enabled for {channel.mention}. Ten or more minutes will count as community activity only.',ephemeral=True)
+
+@bot.tree.command(name='activity-channel-remove', description='Stop a voice channel from counting toward Soldier activity.')
+@app_commands.describe(channel='Voice channel to stop counting')
+async def activity_channel_remove(interaction: discord.Interaction, channel: discord.VoiceChannel):
+    if not await require_manage_guild(interaction): return
+    await collector.start(); await collector.db.execute("DELETE FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2",interaction.guild.id,channel.id)
+    await interaction.response.send_message(f'Activity tracking disabled for {channel.mention}.',ephemeral=True)
+
+@bot.tree.command(name='activity-channel-status', description='List voice channels that count toward Soldier activity.')
+async def activity_channel_status(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await collector.start(); rows=await collector.db.fetch("SELECT channel_id,channel_name FROM activity_voice_channels WHERE guild_id=$1 ORDER BY channel_name",interaction.guild.id)
+    text='\n'.join(f'• <#{r["channel_id"]}> — {r["channel_name"]}' for r in rows) or 'No activity voice channels are configured.'
+    await interaction.response.send_message('**QUALIFYING ACTIVITY VOICE CHANNELS**\n'+text+'\n\n10+ minutes resets activity/neglect only; it does not award operation or training credit.',ephemeral=True)
 
 @bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
 async def application_status(interaction: discord.Interaction):
@@ -2046,6 +2217,48 @@ async def application_status(interaction: discord.Interaction):
         await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Apply at {app_url}",ephemeral=True); return
     case=data.get('case') or {}
     await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{str(case.get('status')).replace('_',' ')}**",ephemeral=True)
+
+@tasks.loop(minutes=1)
+async def recruit_status_watch():
+    """Deliver Recruiting Case status changes to verified Discord identities."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/recruiting/notifications',params={'guild_id':guild.id})
+            for case in data.get('cases',[]):
+                member=guild.get_member(int(case.get('discord_user_id') or 0))
+                if not member:
+                    # Do not mark it delivered. The notification will be waiting when the user joins.
+                    continue
+                status=str(case.get('status') or '').upper()
+                if status == 'APPROVED_AWAITING_PROCESSING':
+                    await ensure_recruit_status_role(member,approved=True)
+                    message=(f"**APPLICATION APPROVED — 1/5 CAV**\n"
+                             f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters.\n\n"
+                             "Report to the Replacement Detachment and await your initial rank, MOS, company, platoon, and squad assignment.")
+                elif status == 'MORE_INFO_REQUIRED':
+                    await ensure_recruit_status_role(member,approved=False)
+                    status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}"
+                    message=(f"**BATTALION HEADQUARTERS — MORE INFORMATION REQUIRED**\n"
+                             f"Recruiting Case **{case.get('case_number')}** requires additional information before review can continue.\n\n"
+                             f"Respond here: {status_url}")
+                elif status == 'DENIED':
+                    await clear_recruit_status_roles(member)
+                    message=(f"**1/5 CAV RECRUITING CASE CLOSED**\n"
+                             f"Recruiting Case **{case.get('case_number')}** was not approved at this time.")
+                else:
+                    await ensure_recruit_status_role(member,approved=False)
+                    message=(f"**APPLICATION RECEIVED — 1/5 CAV**\n"
+                             f"Recruiting Case **{case.get('case_number')}** is linked to this Discord account and is awaiting Battalion Headquarters review.\n\n"
+                             "No verification code is required. Battalion Clerk will notify you here when your case changes.")
+                try:
+                    await member.send(message)
+                except discord.Forbidden:
+                    log.warning('[RECRUIT STATUS DM BLOCKED] member=%s status=%s',member.id,status)
+                await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':status,'guild_id':guild.id})
+        except Exception as exc:
+            log.warning('[RECRUIT STATUS WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
 
 @tasks.loop(minutes=1)
 async def approved_recruit_watch():
@@ -2071,20 +2284,46 @@ async def on_member_join(member: discord.Member):
         return
     await collector.upsert_member(member)
     if not member.bot:
+        # Public reception notice is independent of recruiting status and is posted once on guild join.
+        await post_public_welcome(member)
         existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
         if not (existing and existing.get('linked')):
             recruit=await recruiting_status_for(member)
             case=recruit.get('case') if recruit and recruit.get('exists') else None
-            approved=bool(case and case.get('status')=='APPROVED_AWAITING_PROCESSING')
-            await ensure_recruit_status_role(member,approved=approved)
+            status=str((case or {}).get('status') or '').upper()
+            approved=bool(case and status=='APPROVED_AWAITING_PROCESSING')
+            if status in {'DENIED','CLOSED','ENLISTED'}:
+                await clear_recruit_status_roles(member)
+            else:
+                # Normal recruiting intake: no operational/unit access yet.
+                # Pending applicants receive Prospective Replacement; approval swaps it to Approved Replacement.
+                await ensure_recruit_status_role(member,approved=approved)
             try:
-                if approved:
-                    await member.send("**1/5 CAV — REPLACEMENT DETACHMENT**\nYour application is approved. You are now awaiting battalion rank, MOS, company, platoon, and squad assignment before your Soldier record is opened.")
+                if case:
+                    if approved:
+                        msg=("**1/5 CAV — REPLACEMENT DETACHMENT**\nYour verified enlistment application is approved. "
+                             "You now hold **Approved Replacement** and are awaiting battalion rank, MOS, company, platoon, and squad assignment before your Soldier record is opened.")
+                    elif status=='MORE_INFO_REQUIRED':
+                        status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL else "your Recruiting Case status page"
+                        msg=f"**1/5 CAV — BATTALION HEADQUARTERS**\nYour verified application requires more information. Respond at: {status_url}"
+                    elif status in {'DENIED','CLOSED'}:
+                        msg=f"**1/5 CAV — RECRUITING CASE CLOSED**\nRecruiting Case **{case.get('case_number')}** is closed. No battalion recruiting role has been assigned."
+                    elif status=='ENLISTED':
+                        msg=f"**1/5 CAV — PERSONNEL FILE LOCATED**\nRecruiting Case **{case.get('case_number')}** has already been converted to battalion personnel."
+                    else:
+                        msg=(f"**1/5 CAV — APPLICATION LOCATED**\nRecruiting Case **{case.get('case_number')}** is linked to this Discord account. "
+                             "You now hold **Prospective Replacement** while Battalion Headquarters reviews your application. No verification code is required.")
                 else:
                     app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
-                    await member.send("**1/5 CAV — REPLACEMENT DETACHMENT**\nNo approved enlistment application is linked to this Discord account. Complete your application at: "+app_url+"\nAfter submitting, use `/verify-application` with the one-time code on your application receipt.")
+                    msg=("**1/5 CAV — REPLACEMENT DETACHMENT**\nNo enlistment application is linked to this Discord account yet. "
+                         f"Complete your application at: {app_url}\n\nOn the website, use **Verify with Discord**. It requests basic identity only; no verification code is required.")
+                await member.send(msg)
+                if case and status not in {'ENLISTED'}:
+                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':status,'guild_id':member.guild.id})
             except discord.Forbidden:
                 log.warning('[RECRUIT DM BLOCKED] member=%s',member.id)
+            except Exception as exc:
+                log.warning('[RECRUIT JOIN STATUS FILE FAILED] member=%s error=%s',member.id,exc)
     await collector.record_event('member_join', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
@@ -2245,6 +2484,166 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await sync_personnel_identity(member,create_if_missing=False,reason="official_duty_presence")
         duty_voice_presence[(gid, member.id, after_id)] = now
 
+
+
+# ---------------------------------------------------------------------------
+# AUTOMATION EXPANSION — routed requests, inactivity, promotions, post-op
+# ---------------------------------------------------------------------------
+REQUEST_CATEGORY_SECTION = {
+    'PERSONNEL':'S-1','TRAINING':'S-3','SUPPLY':'S-4','LEADERSHIP':'HQ','TECHNICAL':'HQ'
+}
+NCO_RANK_PRIORITY = {'CPL':1,'SGT':2,'SSG':3,'SFC':4,'MSG':5,'1SG':6,'SGM':7}
+
+async def set_report_channel(guild_id:int, report_type:str, channel_id:int):
+    await ensure_clerk_settings_table(); db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): raise RuntimeError('PostgreSQL is not available.')
+    await db.execute("""INSERT INTO clerk_report_channels(guild_id,report_type,channel_id,updated_at) VALUES($1,$2,$3,NOW())
+        ON CONFLICT(guild_id,report_type) DO UPDATE SET channel_id=EXCLUDED.channel_id,updated_at=NOW()""",str(guild_id),report_type.upper(),str(channel_id))
+
+async def get_report_channel(guild:discord.Guild, report_type:str):
+    await ensure_clerk_settings_table(); db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return None
+    async with db.pool.acquire() as conn:
+        v=await conn.fetchval("SELECT channel_id FROM clerk_report_channels WHERE guild_id=$1 AND report_type=$2",str(guild.id),report_type.upper())
+    ch=guild.get_channel(int(v)) if v else None
+    return ch if isinstance(ch,discord.TextChannel) else None
+
+async def linked_personnel_for_discord(guild_id:int,user_id:int):
+    await collector.start(); db=collector.db
+    return await db.fetchrow("""SELECT p.*,w.discord_user_id FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text
+        WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2""",str(guild_id),str(user_id))
+
+REQUEST_CHOICES=[app_commands.Choice(name=x.title(),value=x) for x in REQUEST_CATEGORY_SECTION]
+
+@bot.tree.command(name='request', description='Submit a routed battalion help or support request.')
+@app_commands.describe(category='Office that should receive the request',subject='Short description',details='What you need help with')
+@app_commands.choices(category=REQUEST_CHOICES)
+async def member_request(interaction:discord.Interaction, category:app_commands.Choice[str], subject:str, details:str):
+    if not interaction.guild: return
+    await interaction.response.defer(ephemeral=True)
+    person=await linked_personnel_for_discord(interaction.guild_id,interaction.user.id)
+    if not person:
+        await interaction.followup.send('No active Soldier Record is linked to your Discord account. Contact S-1.',ephemeral=True); return
+    section=REQUEST_CATEGORY_SECTION[category.value]; db=collector.db
+    row=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json)
+        VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,$6::jsonb) RETURNING id""",str(person['id']),category.value,subject.strip(),section,f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip(),__import__('json').dumps({'details':details.strip(),'source':'DISCORD /request','discord_user_id':str(interaction.user.id)}))
+    ch=await get_report_channel(interaction.guild,f'REQUEST_{category.value}')
+    if ch:
+        await ch.send(f"**NEW {category.value} REQUEST — {section}**\n**{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}**\n**Subject:** {subject[:180]}\n{details[:1200]}\nAction: `{row['id']}`")
+    await interaction.followup.send(f'Your request has been filed with **{section}**. Action number: `{row["id"]}`',ephemeral=True)
+
+@bot.tree.command(name='request-channel', description='Assign a staff channel for routed member requests.')
+@app_commands.choices(category=REQUEST_CHOICES)
+async def request_channel(interaction:discord.Interaction, category:app_commands.Choice[str], channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,f'REQUEST_{category.value}',channel.id)
+    await interaction.response.send_message(f'**{category.name} requests** will be posted to {channel.mention}.',ephemeral=True)
+
+@bot.tree.command(name='request-channel-status', description='Show configured request-routing channels.')
+async def request_channel_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    lines=[]
+    for cat in REQUEST_CATEGORY_SECTION:
+        ch=await get_report_channel(interaction.guild,f'REQUEST_{cat}')
+        lines.append(f'**{cat.title()}** — {ch.mention if ch else "NOT ASSIGNED"}')
+    await interaction.response.send_message('\n'.join(lines),ephemeral=True)
+
+INACTIVITY_LEVEL_CHOICES=[app_commands.Choice(name='S-1',value='INACTIVITY_S1'),app_commands.Choice(name='Command',value='INACTIVITY_COMMAND')]
+@bot.tree.command(name='inactivity-report-channel', description='Assign where inactivity escalation reports are posted.')
+@app_commands.choices(level=INACTIVITY_LEVEL_CHOICES)
+async def inactivity_report_channel(interaction:discord.Interaction, level:app_commands.Choice[str], channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,level.value,channel.id)
+    await interaction.response.send_message(f'**{level.name} inactivity reports** will be posted to {channel.mention}.',ephemeral=True)
+
+@bot.tree.command(name='inactivity-thresholds', description='Set Soldier inactivity warning and escalation thresholds.')
+async def inactivity_thresholds(interaction:discord.Interaction, warning_days:app_commands.Range[int,1,90], s1_days:app_commands.Range[int,2,120], command_days:app_commands.Range[int,3,180]):
+    if not await require_manage_guild(interaction): return
+    if not (warning_days < s1_days < command_days):
+        await interaction.response.send_message('Thresholds must increase: warning < S-1 < Command.',ephemeral=True); return
+    await ensure_clerk_settings_table(); db=collector.db
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,inactivity_warning_days,inactivity_s1_days,inactivity_command_days,updated_at) VALUES($1,$2,$3,$4,NOW())
+        ON CONFLICT(guild_id) DO UPDATE SET inactivity_warning_days=EXCLUDED.inactivity_warning_days,inactivity_s1_days=EXCLUDED.inactivity_s1_days,inactivity_command_days=EXCLUDED.inactivity_command_days,updated_at=NOW()""",str(interaction.guild_id),warning_days,s1_days,command_days)
+    await interaction.response.send_message(f'Inactivity thresholds: member DM **{warning_days}d**, S-1 **{s1_days}d**, Command **{command_days}d**.',ephemeral=True)
+
+async def _notice_once(guild_id,personnel_id,notice_type,notice_key):
+    db=collector.db
+    r=await db.fetchrow("""INSERT INTO clerk_automation_notices(guild_id,personnel_id,notice_type,notice_key) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING personnel_id""",str(guild_id),str(personnel_id),notice_type,notice_key)
+    return bool(r)
+
+@tasks.loop(minutes=60)
+async def inactivity_watch():
+    await collector.start(); db=collector.db
+    for guild in bot.guilds:
+        await ensure_clerk_settings_table()
+        async with db.pool.acquire() as conn:
+            cfg=await conn.fetchrow("SELECT COALESCE(inactivity_warning_days,14) w,COALESCE(inactivity_s1_days,21) s,COALESCE(inactivity_command_days,30) c FROM clerk_guild_settings WHERE guild_id=$1",str(guild.id))
+        w,s1,cmd=(int(cfg['w']),int(cfg['s']),int(cfg['c'])) if cfg else (14,21,30)
+        rows=await db.fetch("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.activity_last_seen_at,p.activity_last_duty_at,p.created_at,w.discord_user_id,
+            EXTRACT(DAY FROM NOW()-COALESCE(p.activity_last_seen_at,p.activity_last_duty_at,p.created_at))::int AS inactive_days
+            FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text AND w.guild_id::text=$1
+            WHERE COALESCE(p.lifecycle_state,'') NOT IN ('SEPARATED','ARCHIVED')""",str(guild.id))
+        for r in rows:
+            days=int(r['inactive_days'] or 0); pid=r['id']; member=guild.get_member(int(r['discord_user_id']))
+            name=f"{r['rank_code'] or ''} {r['first_name'] or ''} {r['last_name'] or ''}".strip()
+            if days>=cmd:
+                key=f'CMD:{days//7}'
+                if await _notice_once(guild.id,pid,'INACTIVITY_COMMAND',key):
+                    ch=await get_report_channel(guild,'INACTIVITY_COMMAND')
+                    if ch: await ch.send(f'**COMMAND INACTIVITY ESCALATION**\n{name} — **{days} days inactive**. S-1 disposition / leadership review required.')
+                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'HQ','OPEN','URGENT','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Command inactivity review — {name}',__import__('json').dumps({'inactive_days':days}),f'INACTIVE-CMD:{pid}')
+            elif days>=s1:
+                key=f'S1:{days//7}'
+                if await _notice_once(guild.id,pid,'INACTIVITY_S1',key):
+                    ch=await get_report_channel(guild,'INACTIVITY_S1')
+                    if ch: await ch.send(f'**S-1 INACTIVITY FLAG**\n{name} — **{days} days inactive**. Personnel review opened.')
+                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Inactivity review — {name}',__import__('json').dumps({'inactive_days':days}),f'INACTIVE-S1:{pid}')
+            elif days>=w and member:
+                if await _notice_once(guild.id,pid,'INACTIVITY_MEMBER',f'WARN:{days//7}'):
+                    try: await member.send(f'**1/5 CAV — ACTIVITY NOTICE**\nYour Soldier Record shows **{days} days** since qualifying battalion activity. Join an approved activity voice channel, participate in battalion duty, or use your Soldier Record to remain current. Continued inactivity will be referred to S-1.')
+                    except discord.Forbidden: pass
+
+@bot.tree.command(name='promotion-report-channel', description='Assign the channel for promotion-eligibility summaries.')
+async def promotion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'PROMOTION_ELIGIBILITY',channel.id)
+    await interaction.response.send_message(f'Promotion eligibility summaries will be posted to {channel.mention}.',ephemeral=True)
+
+@tasks.loop(minutes=15)
+async def promotion_eligibility_watch():
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/automation/promotion-eligibility',params={'guild_id':guild.id})
+            for item in data.get('eligible',[]):
+                pid=item.get('personnel_id'); target=item.get('target_rank'); key=f'{item.get("rank_code")}->{target}'
+                if not await _notice_once(guild.id,pid,'PROMOTION_ELIGIBLE',key): continue
+                leader_id=item.get('leader_discord_user_id'); leader=guild.get_member(int(leader_id)) if leader_id else None
+                text=(f"**PROMOTION ELIGIBILITY — NCO NOTICE**\n{item.get('rank_code','')} {item.get('first_name','')} {item.get('last_name','')} is now **ELIGIBLE FOR CONSIDERATION** for **{target}**.\nThis is not an automatic promotion. Review the Soldier and submit a recommendation if warranted.")
+                if leader:
+                    try: await leader.send(text)
+                    except discord.Forbidden: pass
+                ch=await get_report_channel(guild,'PROMOTION_ELIGIBILITY')
+                if ch: await ch.send(text)
+        except Exception as exc: log.warning('[PROMOTION ELIGIBILITY WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+@bot.tree.command(name='post-operation-report-channel', description='Assign where automatic post-operation processing summaries are posted.')
+async def post_operation_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'POST_OPERATION',channel.id)
+    await interaction.response.send_message(f'Post-operation processing reports will be posted to {channel.mention}.',ephemeral=True)
+
+@bot.tree.command(name='operation-rounds-default', description='Set the default M16 round expenditure used for automatic operation processing.')
+async def operation_rounds_default(interaction:discord.Interaction, rounds:app_commands.Range[int,0,1000]):
+    if not await require_manage_guild(interaction): return
+    await ensure_clerk_settings_table(); db=collector.db
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_rounds_default,updated_at) VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_rounds_default=EXCLUDED.operation_rounds_default,updated_at=NOW()""",str(interaction.guild_id),rounds)
+    await interaction.response.send_message(f'Default operation expenditure set to **{rounds} rounds per fully credited Soldier**. Partial attendance is prorated.',ephemeral=True)
+
+async def operation_rounds_for_guild(guild_id:int):
+    await ensure_clerk_settings_table(); db=collector.db
+    async with db.pool.acquire() as conn: v=await conn.fetchval("SELECT COALESCE(operation_rounds_default,180) FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
+    return int(v or 180)
 
 if not TOKEN:
     raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables.')

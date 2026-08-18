@@ -24,6 +24,16 @@ class Database:
             return None
         return await self.pool.execute(query, *args)
 
+    async def fetch(self, query, *args):
+        if not self.pool:
+            return []
+        return await self.pool.fetch(query, *args)
+
+    async def fetchrow(self, query, *args):
+        if not self.pool:
+            return None
+        return await self.pool.fetchrow(query, *args)
+
     async def close(self):
         if self.pool:
             await self.pool.close()
