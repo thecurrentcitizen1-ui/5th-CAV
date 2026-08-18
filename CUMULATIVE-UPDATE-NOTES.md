@@ -18,3 +18,9 @@
 - Added Team Leader to the Battalion Clerk appointment-role blueprint.
 - Platoon Sergeant, Squad Leader, Assistant Squad Leader, and Team Leader are managed as appointments, not ranks.
 - Battalion Clerk now mirrors these four leadership appointment roles from the authoritative website personnel record during canonical personnel synchronization.
+
+## Automatic Ribbon Progress + Instructor Credit — 18 AUG 2026
+- Added hourly automatic ribbon eligibility recheck against the website personnel system.
+- Existing /schedule command now accepts optional instructor and assistant_instructor members for TRAINING events.
+- Instructor selections are filed with the website and receive instructional-period credit when the training duty period is closed.
+- No member or staff command is required to start individual ribbon trackers.

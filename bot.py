@@ -1936,6 +1936,8 @@ async def duty_channel_status(interaction: discord.Interaction):
     duration_minutes='Scheduled duration in minutes',
     operation_id='Optional website Operation UUID for combat-operation filing',
     rounds_per_soldier='Optional OPERATION round expenditure; blank uses the battalion default',
+    instructor='Optional primary instructor; used for TRAINING ribbon credit',
+    assistant_instructor='Optional assistant instructor; used for TRAINING ribbon credit',
 )
 @app_commands.choices(duty_type=DUTY_CHOICES)
 async def schedule_duty(
@@ -1947,6 +1949,8 @@ async def schedule_duty(
     duration_minutes: app_commands.Range[int, 45, 720],
     operation_id: Optional[str] = None,
     rounds_per_soldier: Optional[app_commands.Range[int,0,1000]] = None,
+    instructor: Optional[discord.Member] = None,
+    assistant_instructor: Optional[discord.Member] = None,
 ):
     if not await require_manage_guild(interaction):
         return
@@ -1974,6 +1978,14 @@ async def schedule_duty(
     effective_rounds = int(rounds_per_soldier) if rounds_per_soldier is not None else (await operation_rounds_for_guild(interaction.guild_id) if event_type == 'OPERATION' else 0)
     channel = interaction.guild.get_channel(channel_id)
     external_id = f'discord:{interaction.guild_id}:{event_type}:{int(local_start.timestamp())}'
+    instructor_ids=[]
+    if event_type == 'TRAINING':
+        for member in (instructor, assistant_instructor):
+            if member and not member.bot and member.id not in instructor_ids:
+                instructor_ids.append(member.id)
+    elif instructor or assistant_instructor:
+        await interaction.response.send_message('Instructor fields are only used when Duty Type is **Training**.',ephemeral=True)
+        return
     result = await web.request('POST', '/internal/clerk/events', json={
         'external_event_id': external_id,
         'event_type': event_type,
@@ -1984,6 +1996,8 @@ async def schedule_duty(
         'channel_id': channel_id,
         'operation_id': operation_id or None,
         'rounds_per_soldier': effective_rounds,
+        'guild_id': interaction.guild_id,
+        'instructor_discord_user_ids': instructor_ids,
     })
     await interaction.response.send_message(
         '**HEADQUARTERS — DUTY PERIOD FILED**\n'
@@ -1992,7 +2006,8 @@ async def schedule_duty(
         f'Start: <t:{int(local_start.timestamp())}:F>\n'
         f'End: <t:{int(local_end.timestamp())}:t>\n'
         'Credit Requirement: **45 minutes present**\n'
-        f"Record No.: `{result.get('event_id')}`"
+        + ((f"Instructor Credit: **{', '.join(m.display_name for m in (instructor,assistant_instructor) if m)}**\n") if event_type == 'TRAINING' and (instructor or assistant_instructor) else '')
+        + f"Record No.: `{result.get('event_id')}`"
     )
 
     # Publish the official notice to the configured battalion orders channel.
@@ -2149,6 +2164,8 @@ async def on_ready():
         inactivity_watch.start()
     if not promotion_eligibility_watch.is_running():
         promotion_eligibility_watch.start()
+    if not ribbon_progress_watch.is_running():
+        ribbon_progress_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -2238,6 +2255,23 @@ async def application_status(interaction: discord.Interaction):
         await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Apply at {app_url}",ephemeral=True); return
     case=data.get('case') or {}
     await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{str(case.get('status')).replace('_',' ')}**",ephemeral=True)
+
+@tasks.loop(hours=1)
+async def ribbon_progress_watch():
+    """Keep time-based and record-based automatic ribbon eligibility current without commands."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        result=await web.request('POST','/internal/clerk/ribbons/recheck',json={})
+        log.info('[RIBBON RECHECK] personnel=%s',result.get('checked',0))
+    except Exception as exc:
+        log.warning('[RIBBON RECHECK FAILED] %s',exc)
+
+
+@ribbon_progress_watch.before_loop
+async def before_ribbon_progress_watch():
+    await bot.wait_until_ready()
+
 
 @tasks.loop(minutes=1)
 async def recruit_status_watch():
