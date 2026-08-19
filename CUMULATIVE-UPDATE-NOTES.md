@@ -59,3 +59,10 @@
 
 ## 2026-08-18 — Operation Round Reconciliation
 - Added `/operation-rounds-reconcile operation_id:<UUID>` to repair missing M16 weapon-ledger rounds from filed operation participation.
+
+
+## 2026-08-18 — Full System Stabilization Review
+- Revalidated all slash commands and background source after cumulative website changes.
+- Retained live Discord intake joined_at tracking and M16 operation-round reconciliation.
+- Added shared active-member index used by both website and Battalion Clerk.
+- No duplicate slash command names detected.

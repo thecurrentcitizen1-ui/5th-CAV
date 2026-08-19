@@ -1,0 +1,40 @@
+5TH CAVALRY — FULL SOURCE INTEGRITY REVIEW
+Date: 2026-08-18
+
+WEBSITE
+- Python compile: PASS
+- Undefined decorator audit: PASS
+- Jinja parse: PASS (51 templates)
+- url_for endpoint audit: PASS
+- Shared Discord schema contract: PASS
+- Invalid legacy Discord columns removed: PASS
+- Request-scoped PostgreSQL connection reuse: PASS
+- Member lookup request cache: PASS
+- Global diagnostic error boundary: PASS
+- Soldier Record hard-safe recovery: PASS
+- Recruiting adopt compatibility: PASS
+- M16 operation round-ledger reconciliation retained: PASS
+- Ribbon placement retained: PASS
+- ZIP CRC: pending packaging
+
+BOT
+- Python compile: PASS
+- Slash command duplicate audit: PASS (50 commands)
+- Discord member migration + joined_at: PASS
+- M16 reconciliation command retained: PASS
+- Shared schema index: PASS
+- ZIP CRC: pending packaging
+
+ROOT CAUSES FOUND
+1. Website queried discord_members.left_at, but Battalion Clerk uses active.
+2. Website queried discord_members.last_seen_at, but Battalion Clerk stores updated_at.
+3. Website depended on Battalion Clerk creating/migrating Discord tables first.
+4. Normal page rendering repeated the same linked-personnel lookup.
+5. Database layer opened a fresh PostgreSQL connection for every query before the performance patch.
+6. The first pooling patch added another runtime dependency and more moving pieces than necessary.
+7. Soldier Record normal GET performed multiple synchronization/writing jobs and duplicate heavy career calculations.
+8. Command-adopted cases did not populate legacy verification values, reducing compatibility with partially migrated databases.
+9. An undefined permission_required decorator existed on unit-identity and could prevent worker boot.
+
+NOTE
+Static/source validation cannot see live Railway environment values or the current live PostgreSQL schema/data. This build removes the source-level conflicts discovered in the cumulative packages and adds diagnostic references for any remaining live-data failure.

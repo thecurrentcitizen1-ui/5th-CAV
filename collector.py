@@ -66,6 +66,10 @@ class DataCollector:
                 ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ
             """)
             await self.db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_discord_members_active
+                ON discord_members(active,is_bot,updated_at DESC)
+            """)
+            await self.db.execute("""
                 CREATE TABLE IF NOT EXISTS voice_sessions (
                     id BIGSERIAL PRIMARY KEY,
                     guild_id BIGINT NOT NULL,
