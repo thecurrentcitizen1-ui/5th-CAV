@@ -1,6 +1,8 @@
 import logging
+import aiohttp
 from datetime import datetime, timezone
 from database import Database
+from config import WEBSITE_BASE_URL, CLERK_SYNC_KEY
 
 log = logging.getLogger("battalion-clerk.collector")
 
@@ -108,7 +110,27 @@ class DataCollector:
                     qualifying = await self.db.fetchrow("SELECT 1 FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2", int(payload.get("guild_id")), int(payload.get("channel_id")))
                     if qualifying:
                         await self.db.execute("""UPDATE personnel p SET activity_last_seen_at=NOW(),updated_at=NOW() FROM website_member_links w WHERE w.personnel_id=p.id::text AND w.guild_id::text=$1 AND w.discord_user_id::text=$2""", str(payload.get("guild_id")), str(payload.get("discord_user_id")))
-                        await self.db.execute("""INSERT INTO personnel_activity_credit(personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited) SELECT p.id,'DISCORD_VOICE',$3,'COMMUNITY ACTIVITY',CURRENT_DATE,$4,TRUE FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 ON CONFLICT DO NOTHING""", str(payload.get("guild_id")), str(payload.get("discord_user_id")), str(payload.get("channel_id")), int(payload.get("duration_seconds") or 0))
+                        existing = await self.db.fetchrow("""SELECT pac.id,pac.duration_seconds FROM personnel_activity_credit pac JOIN website_member_links w ON w.personnel_id=pac.personnel_id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 AND pac.source='DISCORD_VOICE' AND pac.source_reference=$3 AND pac.activity_date=CURRENT_DATE ORDER BY pac.created_at DESC LIMIT 1""", str(payload.get("guild_id")), str(payload.get("discord_user_id")), str(payload.get("channel_id")))
+                        if existing:
+                            await self.db.execute("UPDATE personnel_activity_credit SET duration_seconds=GREATEST(duration_seconds,$1),credited=TRUE WHERE id=$2", int(payload.get("duration_seconds") or 0), existing['id'])
+                        else:
+                            await self.db.execute("""INSERT INTO personnel_activity_credit(personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited) SELECT p.id,'DISCORD_VOICE',$3,'COMMUNITY ACTIVITY',CURRENT_DATE,$4,TRUE FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2""", str(payload.get("guild_id")), str(payload.get("discord_user_id")), str(payload.get("channel_id")), int(payload.get("duration_seconds") or 0))
+                        # Recalculate the full 100-point readiness model immediately so
+                        # the Soldier's 201 File and promotion boards reflect voice activity
+                        # without waiting for a manual website action.
+                        if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
+                            try:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.post(
+                                        WEBSITE_BASE_URL + '/internal/clerk/readiness/recheck',
+                                        json={'guild_id': str(payload.get('guild_id')), 'discord_user_id': str(payload.get('discord_user_id'))},
+                                        headers={'X-Battalion-Clerk-Key': CLERK_SYNC_KEY},
+                                        timeout=aiohttp.ClientTimeout(total=12),
+                                    ) as response:
+                                        if response.status >= 400:
+                                            log.warning('Readiness recheck returned HTTP %s after community activity', response.status)
+                            except Exception as exc:
+                                log.warning('Readiness recheck failed after community activity: %s', exc)
 
     async def upsert_member(self, member):
         if not self.started:

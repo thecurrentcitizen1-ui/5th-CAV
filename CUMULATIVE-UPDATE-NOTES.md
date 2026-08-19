@@ -19,8 +19,30 @@
 - Platoon Sergeant, Squad Leader, Assistant Squad Leader, and Team Leader are managed as appointments, not ranks.
 - Battalion Clerk now mirrors these four leadership appointment roles from the authoritative website personnel record during canonical personnel synchronization.
 
-## Automatic Ribbon Progress + Instructor Credit — 18 AUG 2026
-- Added hourly automatic ribbon eligibility recheck against the website personnel system.
-- Existing /schedule command now accepts optional instructor and assistant_instructor members for TRAINING events.
-- Instructor selections are filed with the website and receive instructional-period credit when the training duty period is closed.
-- No member or staff command is required to start individual ribbon trackers.
+## 2026-08-18 — Battalion Inactivity & Property Accountability
+- Default inactivity stages aligned to 7-day WATCH, 14-day S-1 deficiency, 21-day property accountability, 30-day command review.
+- Authorized leave pauses Discord inactivity escalation.
+- Battalion Clerk opens S-1/property actions and command actions at the appropriate stages.
+- Member reminders no longer tell Soldiers that merely opening their website record resets inactivity.
+
+## 2026-08-18 — Personnel / Training / Replacement Expansion
+- Added Replacement Depot Discord status role and synchronization for approved recruiting cases.
+- New personnel conversion now accepts REPLACEMENT_DEPOT cases and waits for valid rank, MOS, company, platoon, and squad roles before opening the Soldier record.
+- Recruiting DMs now explain Replacement Depot status and automatic Movement Orders.
+- Discord /request and Help Desk actions receive automatic suspense dates (3 days for S-1, 5 days for other staff offices).
+- Added /suspense-channel to choose the staff channel for action reminders.
+- Added hourly Personnel Action Suspense Watch for 2-day, 1-day, due-today, and overdue reminders.
+
+
+## 2026-08-18 — Verified Automation & Live Activity Credit
+- Approved community activity credits live after 10 minutes without leaving the channel.
+- Unified four-stage inactivity thresholds with website/M16 logic.
+- Operation schedules require a linked website Operation ID.
+
+## 2026-08-18 — Dedicated Operation Reminder System
+- Added `/operation-reminder-channel`.
+- Added `/operation-reminder-times`.
+- Added `/operation-reminder-status`.
+- Default reminders: 24 hours, 2 hours, and 30 minutes before OPERATION step-off.
+- Scheduling an OPERATION immediately posts an Operation Scheduled notice to the reminder channel.
+- Reminder sends are persisted in PostgreSQL to prevent duplicates after restart.

@@ -105,7 +105,7 @@ RANK_ROLE_BLUEPRINT = [
 ]
 
 RECRUITING_STATUS_ROLE_BLUEPRINT = [
-    "Prospective Replacement", "Approved Replacement",
+    "Prospective Replacement", "Approved Replacement", "Replacement Depot",
 ]
 
 APPOINTMENT_ROLE_BLUEPRINT = [
@@ -685,11 +685,14 @@ async def recruiting_status_for(member: discord.Member):
         return {'ok':False,'exists':False}
 
 async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
-    desired_name='Approved Replacement' if approved else 'Prospective Replacement'
+    # Approved applicants physically enter the Replacement Depot holding status until
+    # rank/MOS/company/platoon/squad assignment is complete.
+    desired_name='Replacement Depot' if approved else 'Prospective Replacement'
     desired=discord.utils.get(member.guild.roles,name=desired_name)
-    other=discord.utils.get(member.guild.roles,name=('Prospective Replacement' if approved else 'Approved Replacement'))
+    remove=[discord.utils.get(member.guild.roles,name=n) for n in RECRUITING_STATUS_ROLE_BLUEPRINT if n!=desired_name]
     try:
-        if other and other in member.roles: await member.remove_roles(other,reason='Recruiting case status synchronization')
+        remove=[r for r in remove if r and r in member.roles]
+        if remove: await member.remove_roles(*remove,reason='Recruiting case status synchronization')
         if desired and desired not in member.roles: await member.add_roles(desired,reason='Recruiting case status synchronization')
     except discord.Forbidden:
         log.warning('[RECRUIT ROLE SYNC BLOCKED] member=%s',member.id)
@@ -768,9 +771,9 @@ async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
             await clear_recruit_status_roles(member)
             log.info('[PERSONNEL CREATION CLOSED] member=%s (%s): recruiting case status=%s',member.display_name,member.id,status or 'NONE')
             return
-        if not case or status != 'APPROVED_AWAITING_PROCESSING':
+        if not case or status not in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
             await ensure_recruit_status_role(member,approved=False)
-            log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): approved recruiting case required',member.display_name,member.id)
+            log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): Replacement Depot / approved recruiting case required',member.display_name,member.id)
             return
         # Approval is its own stage. Keep the approved holding role in place until
         # staff finishes rank/MOS/company/platoon/squad assignment and conversion succeeds.
@@ -824,10 +827,20 @@ async def ensure_clerk_settings_table():
     """)
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_duty_channel_id TEXT")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS welcome_channel_id TEXT")
-    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_warning_days INTEGER DEFAULT 14")
-    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_s1_days INTEGER DEFAULT 21")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_warning_days INTEGER DEFAULT 7")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_s1_days INTEGER DEFAULT 14")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_property_days INTEGER DEFAULT 21")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS inactivity_command_days INTEGER DEFAULT 30")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_rounds_default INTEGER DEFAULT 180")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_channel_id TEXT")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_minutes TEXT DEFAULT '1440,120,30'")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_operation_reminder_notices (
+        guild_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        minutes_before INTEGER NOT NULL,
+        sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(guild_id,event_id,minutes_before)
+    )""")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_report_channels (guild_id TEXT NOT NULL, report_type TEXT NOT NULL, channel_id TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,report_type))""")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_automation_notices (guild_id TEXT NOT NULL, personnel_id TEXT NOT NULL, notice_type TEXT NOT NULL, notice_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,personnel_id,notice_type,notice_key))""")
     await db.execute("""
@@ -882,6 +895,106 @@ async def get_operation_duty_channel_id(guild_id: int) -> Optional[int]:
     async with db.pool.acquire() as conn:
         value=await conn.fetchval("SELECT operation_duty_channel_id FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
     return int(value) if value else None
+
+
+async def set_operation_reminder_channel(guild_id:int,channel_id:int):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_reminder_channel_id,updated_at)
+      VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_reminder_channel_id=EXCLUDED.operation_reminder_channel_id,updated_at=NOW()""",
+      str(guild_id),str(channel_id))
+
+async def get_operation_reminder_channel_id(guild_id:int)->Optional[int]:
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return None
+    async with db.pool.acquire() as conn:
+        value=await conn.fetchval("SELECT operation_reminder_channel_id FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
+    return int(value) if value else None
+
+async def set_operation_reminder_minutes(guild_id:int,values):
+    await ensure_clerk_settings_table()
+    cleaned=sorted({max(5,min(10080,int(v))) for v in values if v is not None},reverse=True) or [1440,120,30]
+    db=getattr(collector,'db',None)
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_reminder_minutes,updated_at)
+      VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_reminder_minutes=EXCLUDED.operation_reminder_minutes,updated_at=NOW()""",
+      str(guild_id),",".join(str(v) for v in cleaned))
+    return cleaned
+
+async def get_operation_reminder_minutes(guild_id:int):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return [1440,120,30]
+    async with db.pool.acquire() as conn:
+        raw=await conn.fetchval("SELECT COALESCE(operation_reminder_minutes,'1440,120,30') FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
+    try:
+        return sorted({int(x.strip()) for x in str(raw or '').split(',') if x.strip()},reverse=True) or [1440,120,30]
+    except Exception:
+        return [1440,120,30]
+
+def format_reminder_interval(minutes:int)->str:
+    if minutes%1440==0:
+        d=minutes//1440
+        return f"{d} DAY" if d==1 else f"{d} DAYS"
+    if minutes%60==0:
+        h=minutes//60
+        return f"{h} HOUR" if h==1 else f"{h} HOURS"
+    return f"{minutes} MINUTES"
+
+async def operation_reminder_was_sent(guild_id:int,event_id:str,minutes_before:int)->bool:
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    async with db.pool.acquire() as conn:
+        value=await conn.fetchval("""SELECT 1 FROM clerk_operation_reminder_notices
+          WHERE guild_id=$1 AND event_id=$2 AND minutes_before=$3""",
+          str(guild_id),str(event_id),int(minutes_before))
+    return bool(value)
+
+async def mark_operation_reminder_sent(guild_id:int,event_id:str,minutes_before:int):
+    db=getattr(collector,'db',None)
+    await db.execute("""INSERT INTO clerk_operation_reminder_notices(guild_id,event_id,minutes_before,sent_at)
+      VALUES($1,$2,$3,NOW()) ON CONFLICT DO NOTHING""",
+      str(guild_id),str(event_id),int(minutes_before))
+
+async def post_operation_reminder(guild:discord.Guild,event:dict,minutes_before:int):
+    cid=await get_operation_reminder_channel_id(guild.id)
+    if not cid: return False
+    channel=guild.get_channel(cid)
+    if not isinstance(channel,discord.TextChannel): return False
+    start=event_timestamp(event.get('starts_at'))
+    if not start: return False
+    title=event.get('title') or 'UNNAMED OPERATION'
+    duty_id=event.get('channel_id')
+    duty=f'<#{duty_id}>' if duty_id else 'AS DIRECTED'
+    body=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\\n"
+          f"**OPERATION REMINDER — {format_reminder_interval(minutes_before)} TO STEP-OFF**\\n\\n"
+          f"**{title.upper()}**\\n"
+          f"Step-Off: <t:{int(start.timestamp())}:F> • <t:{int(start.timestamp())}:R>\\n"
+          f"Duty Station: {duty}\\n"
+          "Official Credit Requirement: **45 qualifying minutes**\\n\\n"
+          "**ALL AVAILABLE PERSONNEL REPORT IN ACCORDANCE WITH ASSIGNMENT.**")
+    await channel.send(body[:2000])
+    return True
+
+async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
+    cid=await get_operation_reminder_channel_id(guild.id)
+    if not cid: return False
+    channel=guild.get_channel(cid)
+    if not isinstance(channel,discord.TextChannel): return False
+    start=event_timestamp(event.get('starts_at'))
+    title=event.get('title') or 'UNNAMED OPERATION'
+    duty_id=event.get('channel_id')
+    duty=f'<#{duty_id}>' if duty_id else 'AS DIRECTED'
+    when=f"<t:{int(start.timestamp())}:F>" if start else "TIME TO BE ANNOUNCED"
+    body=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\\n"
+          f"**OPERATION SCHEDULED**\\n\\n"
+          f"**{title.upper()}**\\n"
+          f"Step-Off: {when}\\n"
+          f"Duty Station: {duty}\\n"
+          "Official Credit Requirement: **45 qualifying minutes**\\n\\n"
+          "Automatic reminders will be posted in this channel before step-off.")
+    await channel.send(body[:2000])
+    return True
 
 WELCOME_MESSAGE = """**HEADQUARTERS**
 **1ST BATTALION, 5TH CAVALRY REGIMENT**
@@ -1093,6 +1206,46 @@ async def personnel_orders_watch():
                 await web.request('POST',f"/internal/clerk/orders/{order['id']}/posted",json={'guild_id':guild.id})
         except Exception as exc:
             log.warning('[PERSONNEL ORDERS] guild=%s error=%s',guild.id,exc)
+
+@tasks.loop(seconds=60)
+async def operation_reminder_watch():
+    now=utc_now()
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id!=GUILD_ID:
+            continue
+        try:
+            if not await get_operation_reminder_channel_id(guild.id):
+                continue
+            intervals=await get_operation_reminder_minutes(guild.id)
+            status=await web.request('GET','/internal/clerk/events/status',params={'guild_id':guild.id})
+        except Exception as exc:
+            log.warning('[OP REMINDER WATCH] guild=%s error=%s',guild.id,exc)
+            continue
+        for event in status.get('events',[]):
+            if str(event.get('event_type') or '').upper()!='OPERATION':
+                continue
+            event_id=str(event.get('id') or event.get('event_id') or '')
+            start=event_timestamp(event.get('starts_at'))
+            if not event_id or not start:
+                continue
+            seconds=(start-now).total_seconds()
+            if seconds<=0:
+                continue
+            for minutes_before in intervals:
+                target=minutes_before*60
+                if target-90<=seconds<=target+30:
+                    try:
+                        if await operation_reminder_was_sent(guild.id,event_id,minutes_before):
+                            continue
+                        if await post_operation_reminder(guild,event,minutes_before):
+                            await mark_operation_reminder_sent(guild.id,event_id,minutes_before)
+                    except Exception as exc:
+                        log.warning('[OP REMINDER POST FAILED] guild=%s event=%s error=%s',guild.id,event_id,exc)
+
+@operation_reminder_watch.before_loop
+async def before_operation_reminder_watch():
+    await bot.wait_until_ready()
+
 
 @tasks.loop(seconds=60)
 async def duty_announcement_watch():
@@ -1746,6 +1899,46 @@ async def welcome_channel_clear(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+@bot.tree.command(name='operation-reminder-channel', description='Assign the channel that receives automatic reminders for scheduled Operations.')
+@app_commands.describe(channel='Text channel for Operation reminders')
+async def operation_reminder_channel(interaction:discord.Interaction,channel:discord.TextChannel):
+    if not await require_manage_guild(interaction):
+        return
+    await set_operation_reminder_channel(interaction.guild_id,channel.id)
+    intervals=await get_operation_reminder_minutes(interaction.guild_id)
+    await interaction.response.send_message(
+        f'Operation reminders will be posted to {channel.mention}.\\n'
+        f'Reminders: **{", ".join(format_reminder_interval(x) for x in intervals)} before step-off**.',
+        ephemeral=True)
+
+@bot.tree.command(name='operation-reminder-times', description='Set up to three automatic Operation reminder times.')
+@app_commands.describe(first_minutes='First reminder in minutes',second_minutes='Optional second reminder',final_minutes='Optional final reminder')
+async def operation_reminder_times(interaction:discord.Interaction,
+    first_minutes:app_commands.Range[int,5,10080],
+    second_minutes:Optional[app_commands.Range[int,5,10080]]=None,
+    final_minutes:Optional[app_commands.Range[int,5,10080]]=None):
+    if not await require_manage_guild(interaction):
+        return
+    values=await set_operation_reminder_minutes(interaction.guild_id,[first_minutes,second_minutes,final_minutes])
+    await interaction.response.send_message(
+        f'Operation reminder schedule set to **{", ".join(format_reminder_interval(x) for x in values)} before step-off**.',
+        ephemeral=True)
+
+@bot.tree.command(name='operation-reminder-status', description='Show the Operation reminder channel and reminder schedule.')
+async def operation_reminder_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction):
+        return
+    cid=await get_operation_reminder_channel_id(interaction.guild_id)
+    ch=interaction.guild.get_channel(cid) if cid else None
+    values=await get_operation_reminder_minutes(interaction.guild_id)
+    await interaction.response.send_message(
+        f'**OPERATION REMINDER SYSTEM**\\n'
+        f'Channel: {ch.mention if ch else "NOT ASSIGNED"}\\n'
+        f'Reminders: **{", ".join(format_reminder_interval(x) for x in values)} before step-off**\\n'
+        'Only scheduled **OPERATION** duty periods trigger these reminders.',
+        ephemeral=True)
+
+
 @bot.tree.command(name='operation-duty-channel', description='Assign the Discord channel that receives S-3 pre-operation duty rosters.')
 @app_commands.describe(channel='Text channel for operation-specific Soldier duty assignments')
 async def operation_duty_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -1936,8 +2129,6 @@ async def duty_channel_status(interaction: discord.Interaction):
     duration_minutes='Scheduled duration in minutes',
     operation_id='Optional website Operation UUID for combat-operation filing',
     rounds_per_soldier='Optional OPERATION round expenditure; blank uses the battalion default',
-    instructor='Optional primary instructor; used for TRAINING ribbon credit',
-    assistant_instructor='Optional assistant instructor; used for TRAINING ribbon credit',
 )
 @app_commands.choices(duty_type=DUTY_CHOICES)
 async def schedule_duty(
@@ -1949,12 +2140,13 @@ async def schedule_duty(
     duration_minutes: app_commands.Range[int, 45, 720],
     operation_id: Optional[str] = None,
     rounds_per_soldier: Optional[app_commands.Range[int,0,1000]] = None,
-    instructor: Optional[discord.Member] = None,
-    assistant_instructor: Optional[discord.Member] = None,
 ):
     if not await require_manage_guild(interaction):
         return
     event_type = duty_type.value
+    if event_type == 'OPERATION' and not operation_id:
+        await interaction.response.send_message('Official Operation duty must be linked to a website Operation record. Create/publish it on the website first, then run `/schedule` with its `operation_id` so attendance, 201 File credit, M16 rounds, and career progression file automatically.',ephemeral=True)
+        return
     if interaction.guild_id not in duty_channel_bindings:
         await load_duty_bindings(interaction.guild_id)
     channel_id = duty_channel_bindings.get(interaction.guild_id, {}).get(event_type)
@@ -1978,14 +2170,6 @@ async def schedule_duty(
     effective_rounds = int(rounds_per_soldier) if rounds_per_soldier is not None else (await operation_rounds_for_guild(interaction.guild_id) if event_type == 'OPERATION' else 0)
     channel = interaction.guild.get_channel(channel_id)
     external_id = f'discord:{interaction.guild_id}:{event_type}:{int(local_start.timestamp())}'
-    instructor_ids=[]
-    if event_type == 'TRAINING':
-        for member in (instructor, assistant_instructor):
-            if member and not member.bot and member.id not in instructor_ids:
-                instructor_ids.append(member.id)
-    elif instructor or assistant_instructor:
-        await interaction.response.send_message('Instructor fields are only used when Duty Type is **Training**.',ephemeral=True)
-        return
     result = await web.request('POST', '/internal/clerk/events', json={
         'external_event_id': external_id,
         'event_type': event_type,
@@ -1996,8 +2180,6 @@ async def schedule_duty(
         'channel_id': channel_id,
         'operation_id': operation_id or None,
         'rounds_per_soldier': effective_rounds,
-        'guild_id': interaction.guild_id,
-        'instructor_discord_user_ids': instructor_ids,
     })
     await interaction.response.send_message(
         '**HEADQUARTERS — DUTY PERIOD FILED**\n'
@@ -2006,8 +2188,7 @@ async def schedule_duty(
         f'Start: <t:{int(local_start.timestamp())}:F>\n'
         f'End: <t:{int(local_end.timestamp())}:t>\n'
         'Credit Requirement: **45 minutes present**\n'
-        + ((f"Instructor Credit: **{', '.join(m.display_name for m in (instructor,assistant_instructor) if m)}**\n") if event_type == 'TRAINING' and (instructor or assistant_instructor) else '')
-        + f"Record No.: `{result.get('event_id')}`"
+        f"Record No.: `{result.get('event_id')}`"
     )
 
     # Publish the official notice to the configured battalion orders channel.
@@ -2024,6 +2205,12 @@ async def schedule_duty(
             announcement_notice_sent.add(str(result.get('event_id')))
     except Exception as exc:
         log.warning('[ORDER NOTICE FAILED] event=%s error=%s', result.get('event_id'), exc)
+
+    if event_type == 'OPERATION':
+        try:
+            await post_operation_scheduled_notice(interaction.guild,notice_event)
+        except Exception as exc:
+            log.warning('[OP REMINDER SCHEDULE NOTICE FAILED] event=%s error=%s',result.get('event_id'),exc)
 
 
 @bot.tree.command(name='duty-status', description="Show current scheduled duty and each Soldier's credited voice time.")
@@ -2099,7 +2286,7 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
         if ch:
             await ch.send(
                 f"**POST-OPERATION PROCESSING COMPLETE**\n**{selected.get('title')}**\n"
-                f"Tracked: **{summary.get('tracked',0)}** • Participation filed: **{summary.get('participated',summary.get('credited',0))}** • Full credit: **{summary.get('credited',0)}**\n"
+                f"Tracked: **{summary.get('tracked',0)}** • 20+ min attendance: **{summary.get('participated',0)}** • Official 45-min operation credit: **{summary.get('credited',0)}**\n"
                 f"Weapon rounds applied: **{summary.get('weapon_rounds_applied',0)}** • AAR task: **{'OPEN' if summary.get('aar_task_opened') else 'ON FILE / NOT REQUIRED'}**"
             )
 
@@ -2121,6 +2308,8 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
 async def on_ready():
     if not recruit_status_watch.is_running():
         recruit_status_watch.start()
+    if not approved_recruit_watch.is_running():
+        approved_recruit_watch.start()
     global collector_started, commands_synced
 
     # Persistent Help Desk buttons survive bot restarts.
@@ -2156,16 +2345,20 @@ async def on_ready():
 
     if not duty_announcement_watch.is_running():
         duty_announcement_watch.start()
+    if not operation_reminder_watch.is_running():
+        operation_reminder_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
     if not operation_duty_watch.is_running():
         operation_duty_watch.start()
+    if not live_activity_credit_watch.is_running():
+        live_activity_credit_watch.start()
     if not inactivity_watch.is_running():
         inactivity_watch.start()
     if not promotion_eligibility_watch.is_running():
         promotion_eligibility_watch.start()
-    if not ribbon_progress_watch.is_running():
-        ribbon_progress_watch.start()
+    if not personnel_suspense_watch.is_running():
+        personnel_suspense_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -2256,23 +2449,6 @@ async def application_status(interaction: discord.Interaction):
     case=data.get('case') or {}
     await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{str(case.get('status')).replace('_',' ')}**",ephemeral=True)
 
-@tasks.loop(hours=1)
-async def ribbon_progress_watch():
-    """Keep time-based and record-based automatic ribbon eligibility current without commands."""
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        return
-    try:
-        result=await web.request('POST','/internal/clerk/ribbons/recheck',json={})
-        log.info('[RIBBON RECHECK] personnel=%s',result.get('checked',0))
-    except Exception as exc:
-        log.warning('[RIBBON RECHECK FAILED] %s',exc)
-
-
-@ribbon_progress_watch.before_loop
-async def before_ribbon_progress_watch():
-    await bot.wait_until_ready()
-
-
 @tasks.loop(minutes=1)
 async def recruit_status_watch():
     """Deliver Recruiting Case status changes to verified Discord identities."""
@@ -2286,11 +2462,11 @@ async def recruit_status_watch():
                     # Do not mark it delivered. The notification will be waiting when the user joins.
                     continue
                 status=str(case.get('status') or '').upper()
-                if status == 'APPROVED_AWAITING_PROCESSING':
+                if status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
                     await ensure_recruit_status_role(member,approved=True)
-                    message=(f"**APPLICATION APPROVED — 1/5 CAV**\n"
+                    message=(f"**APPLICATION APPROVED — REPLACEMENT DEPOT**\n"
                              f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters.\n\n"
-                             "Report to the Replacement Detachment and await your initial rank, MOS, company, platoon, and squad assignment.")
+                             "You are now carried in the **1/5 CAV Replacement Depot**. Await initial rank, MOS, company, platoon, and squad assignment. Once those assignments are valid, Battalion Clerk will open your Soldier record and Headquarters will file movement orders releasing you to your unit.")
                 elif status == 'MORE_INFO_REQUIRED':
                     await ensure_recruit_status_role(member,approved=False)
                     status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}"
@@ -2327,7 +2503,7 @@ async def approved_recruit_watch():
                 await ensure_recruit_status_role(member,approved=True)
                 if not case.get('discord_notified_at'):
                     try:
-                        await member.send(f"**APPLICATION APPROVED — 1/5 CAV**\nRecruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Report to the Replacement Detachment and await rank, MOS, company, platoon, and squad assignment.")
+                        await member.send(f"**APPLICATION APPROVED — 1/5 CAV**\nRecruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. You are now carried in the 1/5 CAV Replacement Depot. Await rank, MOS, company, platoon, and squad assignment; movement orders will be filed when you are converted to battalion personnel.")
                     except discord.Forbidden: pass
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/notified",json={})
         except Exception as exc:
@@ -2346,7 +2522,7 @@ async def on_member_join(member: discord.Member):
             recruit=await recruiting_status_for(member)
             case=recruit.get('case') if recruit and recruit.get('exists') else None
             status=str((case or {}).get('status') or '').upper()
-            approved=bool(case and status=='APPROVED_AWAITING_PROCESSING')
+            approved=bool(case and status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'})
             if status in {'DENIED','CLOSED','ENLISTED'}:
                 await clear_recruit_status_roles(member)
             else:
@@ -2580,8 +2756,8 @@ async def member_request(interaction:discord.Interaction, category:app_commands.
     if not person:
         await interaction.followup.send('No active Soldier Record is linked to your Discord account. Contact S-1.',ephemeral=True); return
     section=REQUEST_CATEGORY_SECTION[category.value]; db=collector.db
-    row=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json)
-        VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,$6::jsonb) RETURNING id""",str(person['id']),category.value,subject.strip(),section,f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip(),__import__('json').dumps({'details':details.strip(),'source':'DISCORD /request','discord_user_id':str(interaction.user.id)}))
+    row=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,due_date,details_json)
+        VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,CURRENT_DATE + CASE WHEN $4='S-1' THEN 3 ELSE 5 END,$6::jsonb) RETURNING id""",str(person['id']),category.value,subject.strip(),section,f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip(),__import__('json').dumps({'details':details.strip(),'source':'DISCORD /request','discord_user_id':str(interaction.user.id)}))
     ch=await get_report_channel(interaction.guild,f'REQUEST_{category.value}')
     if ch:
         await ch.send(f"**NEW {category.value} REQUEST — {section}**\n**{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}**\n**Subject:** {subject[:180]}\n{details[:1200]}\nAction: `{row['id']}`")
@@ -2679,8 +2855,8 @@ async def create_helpdesk_ticket(interaction: discord.Interaction, category: str
     action_id=None
     section=REQUEST_CATEGORY_SECTION[category]
     if person:
-        action=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json)
-            VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,$6::jsonb) RETURNING id""",
+        action=await db.fetchrow("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,due_date,details_json)
+            VALUES($1::uuid,$2,$3,$4,'OPEN','ROUTINE',$5,CURRENT_DATE + CASE WHEN $4='S-1' THEN 3 ELSE 5 END,$6::jsonb) RETURNING id""",
             str(person['id']),category,subject.strip(),section,
             f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip(),
             json.dumps({'details':details.strip(),'source':'DISCORD HELPDESK','discord_user_id':str(member.id)}))
@@ -2858,20 +3034,48 @@ async def inactivity_report_channel(interaction:discord.Interaction, level:app_c
     await set_report_channel(interaction.guild_id,level.value,channel.id)
     await interaction.response.send_message(f'**{level.name} inactivity reports** will be posted to {channel.mention}.',ephemeral=True)
 
-@bot.tree.command(name='inactivity-thresholds', description='Set Soldier inactivity warning and escalation thresholds.')
-async def inactivity_thresholds(interaction:discord.Interaction, warning_days:app_commands.Range[int,1,90], s1_days:app_commands.Range[int,2,120], command_days:app_commands.Range[int,3,180]):
+@bot.tree.command(name='inactivity-thresholds', description='Set the shared Soldier/M16 inactivity escalation thresholds.')
+async def inactivity_thresholds(interaction:discord.Interaction, warning_days:app_commands.Range[int,1,90], s1_days:app_commands.Range[int,2,120], property_days:app_commands.Range[int,3,150], command_days:app_commands.Range[int,4,180]):
     if not await require_manage_guild(interaction): return
-    if not (warning_days < s1_days < command_days):
-        await interaction.response.send_message('Thresholds must increase: warning < S-1 < Command.',ephemeral=True); return
+    if not (warning_days < s1_days < property_days < command_days):
+        await interaction.response.send_message('Thresholds must be ascending: WATCH < S-1 < PROPERTY < COMMAND.',ephemeral=True); return
     await ensure_clerk_settings_table(); db=collector.db
-    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,inactivity_warning_days,inactivity_s1_days,inactivity_command_days,updated_at) VALUES($1,$2,$3,$4,NOW())
-        ON CONFLICT(guild_id) DO UPDATE SET inactivity_warning_days=EXCLUDED.inactivity_warning_days,inactivity_s1_days=EXCLUDED.inactivity_s1_days,inactivity_command_days=EXCLUDED.inactivity_command_days,updated_at=NOW()""",str(interaction.guild_id),warning_days,s1_days,command_days)
-    await interaction.response.send_message(f'Inactivity thresholds: member DM **{warning_days}d**, S-1 **{s1_days}d**, Command **{command_days}d**.',ephemeral=True)
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,inactivity_warning_days,inactivity_s1_days,inactivity_property_days,inactivity_command_days,updated_at) VALUES($1,$2,$3,$4,$5,NOW())
+        ON CONFLICT(guild_id) DO UPDATE SET inactivity_warning_days=EXCLUDED.inactivity_warning_days,inactivity_s1_days=EXCLUDED.inactivity_s1_days,inactivity_property_days=EXCLUDED.inactivity_property_days,inactivity_command_days=EXCLUDED.inactivity_command_days,updated_at=NOW()""",str(interaction.guild_id),warning_days,s1_days,property_days,command_days)
+    await interaction.response.send_message(f'Shared inactivity thresholds: WATCH **{warning_days}d**, S-1 **{s1_days}d**, property/M16 review **{property_days}d**, Command **{command_days}d**.',ephemeral=True)
 
 async def _notice_once(guild_id,personnel_id,notice_type,notice_key):
     db=collector.db
     r=await db.fetchrow("""INSERT INTO clerk_automation_notices(guild_id,personnel_id,notice_type,notice_key) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING personnel_id""",str(guild_id),str(personnel_id),notice_type,notice_key)
     return bool(r)
+
+
+@tasks.loop(minutes=5)
+async def live_activity_credit_watch():
+    """Credit approved community voice after 10 minutes without requiring a disconnect."""
+    await collector.start()
+    if not collector.db.pool: return
+    now=utc_now()
+    for (gid,uid),session in list(voice_sessions.items()):
+        try:
+            elapsed=max(0,int((now-session['started_at']).total_seconds()))
+            if elapsed<600: continue
+            channel_id=int(session.get('channel_id') or 0)
+            if not await collector.db.fetchrow('SELECT 1 FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2',gid,channel_id): continue
+            link=await collector.db.fetchrow("""SELECT p.id::text personnel_id FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1""",str(gid),str(uid))
+            if not link: continue
+            pid=link['personnel_id']; ref=str(channel_id)
+            await collector.db.execute('UPDATE personnel SET activity_last_seen_at=NOW(),updated_at=NOW() WHERE id::text=$1',pid)
+            existing=await collector.db.fetchrow("""SELECT id,duration_seconds FROM personnel_activity_credit WHERE personnel_id::text=$1 AND source='DISCORD_VOICE' AND source_reference=$2 AND activity_date=CURRENT_DATE ORDER BY created_at DESC LIMIT 1""",pid,ref)
+            if existing:
+                if elapsed>int(existing['duration_seconds'] or 0): await collector.db.execute('UPDATE personnel_activity_credit SET duration_seconds=$1,credited=TRUE WHERE id=$2',elapsed,existing['id'])
+            else:
+                await collector.db.execute("""INSERT INTO personnel_activity_credit(personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited) VALUES($1::uuid,'DISCORD_VOICE',$2,'COMMUNITY ACTIVITY',CURRENT_DATE,$3,TRUE)""",pid,ref,elapsed)
+            if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
+                try: await web.request('POST','/internal/clerk/readiness/recheck',json={'personnel_id':pid})
+                except Exception as exc: log.warning('[LIVE ACTIVITY READINESS FAILED] member=%s error=%s',uid,exc)
+        except Exception as exc:
+            log.warning('[LIVE ACTIVITY CREDIT FAILED] guild=%s member=%s error=%s',gid,uid,exc)
 
 @tasks.loop(minutes=60)
 async def inactivity_watch():
@@ -2879,13 +3083,18 @@ async def inactivity_watch():
     for guild in bot.guilds:
         await ensure_clerk_settings_table()
         async with db.pool.acquire() as conn:
-            cfg=await conn.fetchrow("SELECT COALESCE(inactivity_warning_days,14) w,COALESCE(inactivity_s1_days,21) s,COALESCE(inactivity_command_days,30) c FROM clerk_guild_settings WHERE guild_id=$1",str(guild.id))
-        w,s1,cmd=(int(cfg['w']),int(cfg['s']),int(cfg['c'])) if cfg else (14,21,30)
-        rows=await db.fetch("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.activity_last_seen_at,p.activity_last_duty_at,p.created_at,w.discord_user_id,
+            cfg=await conn.fetchrow("SELECT COALESCE(inactivity_warning_days,7) w,COALESCE(inactivity_s1_days,14) s,COALESCE(inactivity_property_days,21) p,COALESCE(inactivity_command_days,30) c FROM clerk_guild_settings WHERE guild_id=$1",str(guild.id))
+        w,s1,prop,cmd=(int(cfg['w']),int(cfg['s']),int(cfg['p']),int(cfg['c'])) if cfg else (7,14,21,30)
+        rows=await db.fetch("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.activity_last_seen_at,p.activity_last_duty_at,p.created_at,p.duty_status,p.loa_expected_return_date,w.discord_user_id,
             EXTRACT(DAY FROM NOW()-COALESCE(p.activity_last_seen_at,p.activity_last_duty_at,p.created_at))::int AS inactive_days
             FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text AND w.guild_id::text=$1
             WHERE COALESCE(p.lifecycle_state,'') NOT IN ('SEPARATED','ARCHIVED')""",str(guild.id))
         for r in rows:
+            # Authorized leave/absence pauses inactivity escalation until the expected return date.
+            if str(r.get('duty_status') or '').upper() == 'LEAVE':
+                expected=r.get('loa_expected_return_date')
+                if expected is None or expected >= __import__('datetime').date.today():
+                    continue
             days=int(r['inactive_days'] or 0); pid=r['id']; member=guild.get_member(int(r['discord_user_id']))
             name=f"{r['rank_code'] or ''} {r['first_name'] or ''} {r['last_name'] or ''}".strip()
             if days>=cmd:
@@ -2894,16 +3103,60 @@ async def inactivity_watch():
                     ch=await get_report_channel(guild,'INACTIVITY_COMMAND')
                     if ch: await ch.send(f'**COMMAND INACTIVITY ESCALATION**\n{name} — **{days} days inactive**. S-1 disposition / leadership review required.')
                     await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'HQ','OPEN','URGENT','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Command inactivity review — {name}',__import__('json').dumps({'inactive_days':days}),f'INACTIVE-CMD:{pid}')
+            elif days>=prop:
+                key='PROPERTY:21'
+                if await _notice_once(guild.id,pid,'INACTIVITY_PROPERTY',key):
+                    ch=await get_report_channel(guild,'INACTIVITY_S1')
+                    if ch: await ch.send(f'**PROPERTY ACCOUNTABILITY REVIEW**\n{name} — **{days} days inactive**. Assigned M16/property requires leadership contact and S-1/S-4 review.')
+                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Property accountability review — {name}',__import__('json').dumps({'inactive_days':days,'stage':'PROPERTY ACCOUNTABILITY REVIEW'}),f'INACTIVE-PROPERTY:{pid}')
             elif days>=s1:
-                key=f'S1:{days//7}'
+                key='S1:14'
                 if await _notice_once(guild.id,pid,'INACTIVITY_S1',key):
                     ch=await get_report_channel(guild,'INACTIVITY_S1')
-                    if ch: await ch.send(f'**S-1 INACTIVITY FLAG**\n{name} — **{days} days inactive**. Personnel review opened.')
-                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Inactivity review — {name}',__import__('json').dumps({'inactive_days':days}),f'INACTIVE-S1:{pid}')
+                    if ch: await ch.send(f'**S-1 READINESS DEFICIENCY**\n{name} — **{days} days inactive**. Contact the Soldier and determine disposition.')
+                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Inactivity review — {name}',__import__('json').dumps({'inactive_days':days,'stage':'DEFICIENT'}),f'INACTIVE-S1:{pid}')
             elif days>=w and member:
                 if await _notice_once(guild.id,pid,'INACTIVITY_MEMBER',f'WARN:{days//7}'):
-                    try: await member.send(f'**1/5 CAV — ACTIVITY NOTICE**\nYour Soldier Record shows **{days} days** since qualifying battalion activity. Join an approved activity voice channel, participate in battalion duty, or use your Soldier Record to remain current. Continued inactivity will be referred to S-1.')
+                    try: await member.send(f'**1/5 CAV — ACTIVITY NOTICE**\nYour Soldier Record shows **{days} days** since qualifying battalion activity. Join an approved activity voice channel or participate in official battalion duty to return to current status. Simply opening the website does not reset inactivity. Continued inactivity will be referred to S-1.')
                     except discord.Forbidden: pass
+
+
+@bot.tree.command(name='suspense-channel', description='Assign the staff channel for personnel-action due-date and overdue reminders.')
+async def suspense_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'PERSONNEL_SUSPENSE',channel.id)
+    await interaction.response.send_message(f'Personnel-action suspense reminders will be posted to {channel.mention}.',ephemeral=True)
+
+@tasks.loop(minutes=60)
+async def personnel_suspense_watch():
+    """Remind staff at 2 days, 1 day, due today, and each meaningful overdue stage."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/personnel-actions/suspense',params={'guild_id':guild.id})
+            ch=await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+            if not ch: continue
+            for a in data.get('actions',[]):
+                days=int(a.get('days_remaining') or 0)
+                aid=str(a.get('id') or '')
+                pid=str(a.get('personnel_id') or aid or 'UNASSIGNED')
+                if days==2: stage='DUE-2'
+                elif days==1: stage='DUE-1'
+                elif days==0: stage='DUE-TODAY'
+                elif days<0: stage=f'OVERDUE-{min(abs(days),30)}'
+                else: continue
+                key=f"{aid}:{stage}"
+                if not await _notice_once(guild.id,pid,'PERSONNEL_SUSPENSE',key): continue
+                soldier=(f"{a.get('rank_code') or ''} {a.get('first_name') or ''} {a.get('last_name') or ''}".strip() or 'UNASSIGNED ACTION')
+                if days<0:
+                    timing=f"**{abs(days)} day(s) overdue**"
+                elif days==0:
+                    timing='**DUE TODAY**'
+                else:
+                    timing=f"due in **{days} day(s)**"
+                await ch.send(f"**PERSONNEL ACTION SUSPENSE — {a.get('owning_section') or 'STAFF'}**\n{soldier}\n**{a.get('subject') or a.get('action_type') or 'Personnel Action'}** — {timing}\nPriority: **{a.get('priority') or 'ROUTINE'}** • Status: **{a.get('status') or 'OPEN'}**")
+        except Exception as exc:
+            log.warning('[PERSONNEL SUSPENSE WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 @bot.tree.command(name='promotion-report-channel', description='Assign the channel for promotion-eligibility summaries.')
 async def promotion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
@@ -2940,7 +3193,7 @@ async def operation_rounds_default(interaction:discord.Interaction, rounds:app_c
     if not await require_manage_guild(interaction): return
     await ensure_clerk_settings_table(); db=collector.db
     await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_rounds_default,updated_at) VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_rounds_default=EXCLUDED.operation_rounds_default,updated_at=NOW()""",str(interaction.guild_id),rounds)
-    await interaction.response.send_message(f'Default operation expenditure set to **{rounds} rounds per fully credited Soldier**. Partial attendance is prorated.',ephemeral=True)
+    await interaction.response.send_message(f'Default operation expenditure set to **{rounds} rounds per Soldier who earns full 45-minute operation credit**.',ephemeral=True)
 
 async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db
