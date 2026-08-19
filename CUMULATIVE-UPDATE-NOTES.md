@@ -73,3 +73,8 @@
 - Reloads website-selected OPERATION voice binding during announcement polling.
 - Detects website-published operation events and posts scheduled notices/reminders.
 - `/schedule` remains available as a backup and now accepts an optional custom credit-minutes threshold.
+
+
+## 2026-08-19 — Authoritative Role Mirror Queue / Member Reminders
+- Battalion Clerk now polls website personnel-state changes and mirrors rank, MOS, company, platoon, squad, and managed leadership roles in Discord.
+- Added low-noise deduplicated DMs for approaching M16 inspection and qualification suspense supplied by the website.

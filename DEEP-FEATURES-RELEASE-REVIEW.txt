@@ -1,0 +1,61 @@
+5TH CAVALRY WEBSITE — DEEP FEATURES RELEASE REVIEW
+Date: 2026-08-19
+
+Implemented/verified in this cumulative website build:
+- Battalion State Engine audit/event layer
+- Record of Active Service timeline in 201 Files
+- Current Situation snapshot
+- Field Reputation descriptors
+- Tour of Duty progression and completion summary
+- Persistent M16 weapon personality/history and prior-holder context
+- Individual operation ammunition override support
+- Award recommendation evidence
+- Promotion board packet
+- Most Served With analytics
+- Unit/company/squad history snapshots and cohesion
+- Leadership lineage / command history
+- Morning Report history/trend support
+- S-3 automated duty suggestions
+- Smart Personnel Search
+- Personnel Comparison
+- Command Watchlist
+- Shared suspense/member reminders
+- Member Personal Action Center and next recommended action
+- Soldier Journal
+- Structured document/reference numbering support
+- Personnel Action Engine with system-controlled dropdowns
+- Discord role sync queue integration
+- Operation credit cascade into state/timeline/readiness/weapon/career systems
+
+Preserved cumulative systems:
+- Recruiting / Discord-first intake
+- Staff UX overhaul
+- S-3 Operations Center and per-operation credit thresholds
+- M16 idempotent round reconciliation
+- 201 File staff actions
+- PVT dog-tag rank art
+- Home page side panels/mobile overhaul/slogan changes
+- Corrected full uniform ribbon rack and unchanged S-4/Personnel rack
+
+Final static/source validation:
+- Python compile: PASS
+- Jinja parse: PASS (61 templates)
+- Undefined decorators: PASS
+- Duplicate route/method combinations: PASS (147 route/method combinations)
+- Template endpoint audit: PASS (254 references)
+- Literal SQL placeholder audit: PASS
+- Battalion State schema tables: PASS
+- Website functions audited: 331
+- Bot slash commands audited: 50
+- Duplicate bot slash commands: 0
+- Canonical role-sync watcher: PASS
+- Member reminder watcher: PASS
+- Operation credit cascade: PASS
+- M16 reconciliation retained: PASS
+- Per-operation credit threshold retained: PASS
+- CSS brace balance: PASS
+
+Important limitation:
+Static/source validation cannot guarantee live Railway environment variables, Discord permissions, or current PostgreSQL data/schema state. Perform a live smoke test after deployment.
+
+Campaign participation is not represented as a fabricated counter. A true campaign registry/operation-to-campaign subsystem should be added before campaign history is treated as authoritative.

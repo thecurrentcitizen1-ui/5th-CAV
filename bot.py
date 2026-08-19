@@ -1470,6 +1470,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     """Website personnel row is authoritative after intake; Discord mirrors it."""
     if not result.get('linked'): return
     rank=result.get('rank_code'); mos=result.get('mos_code')
+    lifecycle=str(result.get('lifecycle_state') or '').upper()
     desired=[]
     rank_role=_guild_role_for_code(member.guild,rank,RANK_ROLE_CODES)
     mos_role=_guild_role_for_code(member.guild,mos,MOS_ROLE_CODES)
@@ -1477,6 +1478,26 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     if mos_role: desired.append(mos_role)
     current_ranks,current_mos=_role_code_hits(member)
     remove=[]
+    if lifecycle in {'SEPARATED','ARCHIVED'}:
+        # Separation removes only Battalion Clerk-managed personnel roles; general server membership remains untouched.
+        for code,_ in current_ranks:
+            r=_guild_role_for_code(member.guild,code,RANK_ROLE_CODES)
+            if r: remove.append(r)
+        for code,_ in current_mos:
+            r=_guild_role_for_code(member.guild,code,MOS_ROLE_CODES)
+            if r: remove.append(r)
+        managed_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
+        all_company_names={'A COMPANY','ALPHA COMPANY','A/1-5 CAV','B COMPANY','BRAVO COMPANY','B/1-5 CAV','C COMPANY','CHARLIE COMPANY','C/1-5 CAV','HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'}
+        for role in member.roles:
+            n=' '.join(role.name.upper().strip().split())
+            if n in all_company_names or role.name in PLATOON_ROLE_BLUEPRINT or role.name in SQUAD_ROLE_BLUEPRINT or role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in managed_names:
+                remove.append(role)
+        try:
+            remove=list(dict.fromkeys(remove))
+            if remove: await member.remove_roles(*remove,reason='Website personnel record shows separated/archived')
+        except discord.Forbidden:
+            log.warning('[SEPARATION ROLE SYNC BLOCKED] member=%s bot role hierarchy/permissions',member.id)
+        return
     for code,_ in current_ranks:
         if code!=rank:
             r=_guild_role_for_code(member.guild,code,RANK_ROLE_CODES)
@@ -1501,8 +1522,8 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     for role in member.roles:
         n=" ".join(role.name.upper().strip().split())
         if n in all_company_names and n not in desired_company: remove.append(role)
-        if role.name in PLATOON_ROLE_BLUEPRINT and desired_platoon_role and n != desired_platoon_role: remove.append(role)
-        if role.name in SQUAD_ROLE_BLUEPRINT and desired_squad_role and n != desired_squad_role: remove.append(role)
+        if role.name in PLATOON_ROLE_BLUEPRINT and n != desired_platoon_role: remove.append(role)
+        if role.name in SQUAD_ROLE_BLUEPRINT and n != desired_squad_role: remove.append(role)
         if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES: remove.append(role)
     for role in member.guild.roles:
         n=" ".join(role.name.upper().strip().split())
@@ -2388,6 +2409,53 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
     )
 
 
+
+@tasks.loop(minutes=1)
+async def canonical_role_sync_watch():
+    """Website personnel state is authoritative; process queued role mirrors safely."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/role-sync/pending',params={'guild_id':guild.id})
+            for item in data.get('items',[]):
+                qid=item.get('queue_id') or item.get('id'); uid=item.get('discord_user_id')
+                if not qid: continue
+                ok=False; error=None
+                try:
+                    member=guild.get_member(int(uid)) if uid else None
+                    if not member and uid:
+                        try: member=await guild.fetch_member(int(uid))
+                        except Exception: member=None
+                    if not member:
+                        raise RuntimeError('Discord member not found in guild')
+                    await reconcile_member_roles_from_canonical(member,item)
+                    ok=True
+                except Exception as exc:
+                    error=str(exc)[:400]
+                    log.warning('[ROLE SYNC QUEUE ITEM FAILED] queue=%s error=%s',qid,exc)
+                await web.request('POST',f'/internal/clerk/role-sync/{qid}/complete',json={'ok':ok,'error':error})
+        except Exception as exc:
+            log.warning('[CANONICAL ROLE SYNC WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+@tasks.loop(minutes=60)
+async def member_record_reminder_watch():
+    """Low-noise personal reminders for approaching weapon/qualification suspense."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/member-reminders',params={'guild_id':guild.id})
+            for item in data.get('reminders',[]):
+                uid=item.get('discord_user_id'); pid=item.get('personnel_id'); key=item.get('reminder_key')
+                if not uid or not pid or not key: continue
+                if not await _notice_once(guild.id,pid,'MEMBER_RECORD_REMINDER',key): continue
+                member=guild.get_member(int(uid))
+                if not member: continue
+                try: await member.send(item.get('message') or '**1/5 CAV — PERSONNEL NOTICE**\nA Soldier Record action is approaching its suspense date.')
+                except discord.Forbidden: pass
+        except Exception as exc:
+            log.warning('[MEMBER RECORD REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
 @bot.event
 async def on_ready():
     if not recruit_status_watch.is_running():
@@ -2445,6 +2513,10 @@ async def on_ready():
         promotion_eligibility_watch.start()
     if not personnel_suspense_watch.is_running():
         personnel_suspense_watch.start()
+    if not canonical_role_sync_watch.is_running():
+        canonical_role_sync_watch.start()
+    if not member_record_reminder_watch.is_running():
+        member_record_reminder_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
