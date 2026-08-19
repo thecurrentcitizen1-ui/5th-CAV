@@ -46,3 +46,12 @@
 - Default reminders: 24 hours, 2 hours, and 30 minutes before OPERATION step-off.
 - Scheduling an OPERATION immediately posts an Operation Scheduled notice to the reminder channel.
 - Reminder sends are persisted in PostgreSQL to prevent duplicates after restart.
+
+
+## 2026-08-18 — Prospective Replacements Live Intake (Battalion Clerk)
+- Every non-bot Discord member is tracked in discord_members on join.
+- Website now exposes active unlinked Discord arrivals on a Command-only Prospective Replacements board.
+- Prospective arrivals do not receive a 201 File, rank, strength credit, or official personnel status.
+- Board links to an existing Recruiting Case when one is linked; otherwise shows NO APPLICATION.
+- Battalion Clerk now preserves the true Discord joined_at timestamp.
+- Members automatically disappear from the prospective board once a website_member_links personnel link is created or they leave Discord.
