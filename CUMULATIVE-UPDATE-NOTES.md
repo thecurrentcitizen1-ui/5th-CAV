@@ -55,3 +55,7 @@
 - Board links to an existing Recruiting Case when one is linked; otherwise shows NO APPLICATION.
 - Battalion Clerk now preserves the true Discord joined_at timestamp.
 - Members automatically disappear from the prospective board once a website_member_links personnel link is created or they leave Discord.
+
+
+## 2026-08-18 — Operation Round Reconciliation
+- Added `/operation-rounds-reconcile operation_id:<UUID>` to repair missing M16 weapon-ledger rounds from filed operation participation.

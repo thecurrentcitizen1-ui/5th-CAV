@@ -2213,6 +2213,28 @@ async def schedule_duty(
             log.warning('[OP REMINDER SCHEDULE NOTICE FAILED] event=%s error=%s',result.get('event_id'),exc)
 
 
+
+@bot.tree.command(name='operation-rounds-reconcile', description='Repair missing M16 round expenditure for a website Operation.')
+@app_commands.describe(operation_id='Website Operation UUID to reconcile')
+async def operation_rounds_reconcile(interaction: discord.Interaction, operation_id: str):
+    if not await require_manage_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result=await web.request('POST',f'/internal/clerk/operations/{operation_id.strip()}/reconcile-rounds',json={})
+    except Exception as exc:
+        await interaction.followup.send(f'ROUND RECONCILIATION FAILED: `{exc}`',ephemeral=True)
+        return
+    members=result.get('members') or []
+    lines=['**S-4 — OPERATION AMMUNITION RECONCILIATION COMPLETE**',
+           f"Rounds repaired: **{result.get('repaired_rounds',0)}**",
+           f"Soldiers repaired: **{len(members)}**"]
+    for row in members[:15]:
+        lines.append(f"{row.get('name') or row.get('personnel_id')} — +{row.get('rounds',0)} rounds")
+    if not members:
+        lines.append('No missing weapon-ledger rounds were found.')
+    await interaction.followup.send('\\n'.join(lines)[:1900],ephemeral=True)
+
 @bot.tree.command(name='duty-status', description="Show current scheduled duty and each Soldier's credited voice time.")
 async def duty_status(interaction: discord.Interaction):
     if not await require_manage_guild(interaction):
