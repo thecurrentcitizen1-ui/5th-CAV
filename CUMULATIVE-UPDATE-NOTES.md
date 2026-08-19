@@ -66,3 +66,10 @@
 - Retained live Discord intake joined_at tracking and M16 operation-round reconciliation.
 - Added shared active-member index used by both website and Battalion Clerk.
 - No duplicate slash command names detected.
+
+
+## 2026-08-18 — Website-First S-3 Operations Support
+- Adds Clerk health heartbeat for website status.
+- Reloads website-selected OPERATION voice binding during announcement polling.
+- Detects website-published operation events and posts scheduled notices/reminders.
+- `/schedule` remains available as a backup and now accepts an optional custom credit-minutes threshold.

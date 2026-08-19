@@ -985,6 +985,7 @@ async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
     title=event.get('title') or 'UNNAMED OPERATION'
     duty_id=event.get('channel_id')
     duty=f'<#{duty_id}>' if duty_id else 'AS DIRECTED'
+    credit_minutes=int(event.get('credit_threshold_minutes') or 45)
     when=f"<t:{int(start.timestamp())}:F>" if start else "TIME TO BE ANNOUNCED"
     body=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\\n"
           f"**OPERATION SCHEDULED**\\n\\n"
@@ -1179,6 +1180,37 @@ async def post_battalion_order(
     return True
 
 
+
+@tasks.loop(seconds=60)
+async def clerk_health_watch():
+    await collector.start()
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            await collector.db.execute("""CREATE TABLE IF NOT EXISTS clerk_runtime_health(
+                guild_id BIGINT PRIMARY KEY,bot_user TEXT,status TEXT NOT NULL DEFAULT 'ONLINE',
+                voice_collector_running BOOLEAN NOT NULL DEFAULT FALSE,last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                details_json JSONB NOT NULL DEFAULT '{}'::jsonb)""")
+            await collector.db.execute("""INSERT INTO clerk_runtime_health(guild_id,bot_user,status,voice_collector_running,last_seen_at,details_json)
+                VALUES($1,$2,'ONLINE',$3,NOW(),$4::jsonb)
+                ON CONFLICT(guild_id) DO UPDATE SET bot_user=EXCLUDED.bot_user,status='ONLINE',voice_collector_running=EXCLUDED.voice_collector_running,last_seen_at=NOW(),details_json=EXCLUDED.details_json""",
+                guild.id,str(bot.user),flush_duty_chunks.is_running(),json.dumps({'guild_name':guild.name}))
+            await collector.db.execute("""CREATE TABLE IF NOT EXISTS discord_channel_directory(
+                guild_id BIGINT NOT NULL,channel_id BIGINT NOT NULL,channel_name TEXT NOT NULL,channel_type TEXT NOT NULL DEFAULT 'VOICE',
+                category_name TEXT,active BOOLEAN NOT NULL DEFAULT TRUE,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,channel_id))""")
+            await collector.db.execute("UPDATE discord_channel_directory SET active=FALSE,updated_at=NOW() WHERE guild_id=$1",guild.id)
+            for voice_channel in guild.voice_channels:
+                await collector.db.execute("""INSERT INTO discord_channel_directory(guild_id,channel_id,channel_name,channel_type,category_name,active,updated_at)
+                    VALUES($1,$2,$3,'VOICE',$4,TRUE,NOW()) ON CONFLICT(guild_id,channel_id) DO UPDATE SET channel_name=EXCLUDED.channel_name,category_name=EXCLUDED.category_name,active=TRUE,updated_at=NOW()""",
+                    guild.id,voice_channel.id,voice_channel.name,voice_channel.category.name if voice_channel.category else None)
+        except Exception as exc:
+            log.warning('[CLERK HEALTH] guild=%s error=%s',guild.id,exc)
+
+@clerk_health_watch.before_loop
+async def before_clerk_health_watch():
+    await bot.wait_until_ready()
+
 @tasks.loop(seconds=60)
 async def personnel_orders_watch():
     """Post newly filed personnel orders to the Discord channels selected by command."""
@@ -1216,7 +1248,7 @@ async def operation_reminder_watch():
         try:
             if not await get_operation_reminder_channel_id(guild.id):
                 continue
-            intervals=await get_operation_reminder_minutes(guild.id)
+            default_intervals=await get_operation_reminder_minutes(guild.id)
             status=await web.request('GET','/internal/clerk/events/status',params={'guild_id':guild.id})
         except Exception as exc:
             log.warning('[OP REMINDER WATCH] guild=%s error=%s',guild.id,exc)
@@ -1231,6 +1263,16 @@ async def operation_reminder_watch():
             seconds=(start-now).total_seconds()
             if seconds<=0:
                 continue
+            raw_intervals=str(event.get('reminder_minutes') or '').strip()
+            intervals=[]
+            if raw_intervals:
+                for piece in raw_intervals.split(','):
+                    try:
+                        val=int(piece.strip())
+                        if 5 <= val <= 10080: intervals.append(val)
+                    except Exception:
+                        pass
+            intervals=intervals or default_intervals
             for minutes_before in intervals:
                 target=minutes_before*60
                 if target-90<=seconds<=target+30:
@@ -1255,6 +1297,17 @@ async def duty_announcement_watch():
         if GUILD_ID and guild.id != GUILD_ID:
             continue
         try:
+            await load_duty_bindings(guild.id)
+            # If S-3 changed the OPERATION channel from the website, begin tracking
+            # members already sitting in that voice channel instead of waiting for
+            # their next voice-state change.
+            now_seed=utc_now()
+            for _event_type,_cid in duty_channel_bindings.get(guild.id,{}).items():
+                _channel=guild.get_channel(_cid)
+                if isinstance(_channel,discord.VoiceChannel):
+                    for _member in _channel.members:
+                        if not _member.bot:
+                            duty_voice_presence.setdefault((guild.id,_member.id,_channel.id),now_seed)
             status = await web.request('GET', '/internal/clerk/events/status', params={'guild_id': guild.id})
         except Exception as exc:
             log.warning('[ANNOUNCEMENT WATCH] status failed guild=%s error=%s', guild.id, exc)
@@ -1270,6 +1323,12 @@ async def duty_announcement_watch():
                 continue
 
             seconds_to_start = (start - now).total_seconds()
+            if str(event.get('event_type') or '').upper()=='OPERATION' and seconds_to_start>0 and seconds_to_start<=7*24*3600 and event_id not in announcement_notice_sent:
+                try:
+                    if await post_operation_scheduled_notice(guild,event):
+                        announcement_notice_sent.add(event_id)
+                except Exception as exc:
+                    log.warning('[WEBSITE OP SCHEDULE NOTICE FAILED] event=%s error=%s',event_id,exc)
             # Give a 2-minute polling tolerance around the 15-minute notice.
             if -30 <= seconds_to_start <= 15 * 60 and event_id not in announcement_reminder_sent:
                 # If already started, don't back-fill a late 15-minute reminder.
@@ -2101,7 +2160,7 @@ async def duty_channel(
             duty_voice_presence[(interaction.guild_id, member.id, channel.id)] = now
     await interaction.response.send_message(
         f'**{event_type.title()} duty station assigned:** {channel.mention}\n'
-        'Minimum credit remains **45 minutes during a scheduled duty period**.',
+        'Default credit is **45 minutes**; an S-3 scheduled event may set a different requirement.',
         ephemeral=True,
     )
 
@@ -2129,6 +2188,7 @@ async def duty_channel_status(interaction: discord.Interaction):
     duration_minutes='Scheduled duration in minutes',
     operation_id='Optional website Operation UUID for combat-operation filing',
     rounds_per_soldier='Optional OPERATION round expenditure; blank uses the battalion default',
+    credit_minutes='Official credit requirement in minutes; default 45',
 )
 @app_commands.choices(duty_type=DUTY_CHOICES)
 async def schedule_duty(
@@ -2140,6 +2200,7 @@ async def schedule_duty(
     duration_minutes: app_commands.Range[int, 45, 720],
     operation_id: Optional[str] = None,
     rounds_per_soldier: Optional[app_commands.Range[int,0,1000]] = None,
+    credit_minutes: Optional[app_commands.Range[int,5,720]] = None,
 ):
     if not await require_manage_guild(interaction):
         return
@@ -2180,6 +2241,7 @@ async def schedule_duty(
         'channel_id': channel_id,
         'operation_id': operation_id or None,
         'rounds_per_soldier': effective_rounds,
+        'credit_threshold_minutes': int(credit_minutes or 45),
     })
     await interaction.response.send_message(
         '**HEADQUARTERS — DUTY PERIOD FILED**\n'
@@ -2187,7 +2249,7 @@ async def schedule_duty(
         f"Duty Station: {channel.mention if channel else f'<#{channel_id}>'}\n"
         f'Start: <t:{int(local_start.timestamp())}:F>\n'
         f'End: <t:{int(local_end.timestamp())}:t>\n'
-        'Credit Requirement: **45 minutes present**\n'
+        f'Credit Requirement: **{int(credit_minutes or 45)} minutes present**\n'
         f"Record No.: `{result.get('event_id')}`"
     )
 
@@ -2308,7 +2370,7 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
         if ch:
             await ch.send(
                 f"**POST-OPERATION PROCESSING COMPLETE**\n**{selected.get('title')}**\n"
-                f"Tracked: **{summary.get('tracked',0)}** • 20+ min attendance: **{summary.get('participated',0)}** • Official 45-min operation credit: **{summary.get('credited',0)}**\n"
+                f"Tracked: **{summary.get('tracked',0)}** • 20+ min attendance: **{summary.get('participated',0)}** • Official operation credit: **{summary.get('credited',0)}**\n"
                 f"Weapon rounds applied: **{summary.get('weapon_rounds_applied',0)}** • AAR task: **{'OPEN' if summary.get('aar_task_opened') else 'ON FILE / NOT REQUIRED'}**"
             )
 
@@ -2321,7 +2383,7 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
     await interaction.followup.send(
         f"**DUTY PERIOD CLOSED**\n{selected.get('title')}\n"
         f"Soldiers tracked: **{summary.get('tracked', 0)}**\n"
-        f"Soldiers credited (45+ min): **{summary.get('credited', 0)}**",
+        f"Soldiers credited (threshold met): **{summary.get('credited', 0)}**",
         ephemeral=True,
     )
 
@@ -2371,6 +2433,8 @@ async def on_ready():
         operation_reminder_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
+    if not clerk_health_watch.is_running():
+        clerk_health_watch.start()
     if not operation_duty_watch.is_running():
         operation_duty_watch.start()
     if not live_activity_credit_watch.is_running():
@@ -3215,7 +3279,7 @@ async def operation_rounds_default(interaction:discord.Interaction, rounds:app_c
     if not await require_manage_guild(interaction): return
     await ensure_clerk_settings_table(); db=collector.db
     await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_rounds_default,updated_at) VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_rounds_default=EXCLUDED.operation_rounds_default,updated_at=NOW()""",str(interaction.guild_id),rounds)
-    await interaction.response.send_message(f'Default operation expenditure set to **{rounds} rounds per Soldier who earns full 45-minute operation credit**.',ephemeral=True)
+    await interaction.response.send_message(f'Default operation expenditure set to **{rounds} rounds per Soldier who earns full operation credit**.',ephemeral=True)
 
 async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db
