@@ -2200,123 +2200,19 @@ async def duty_channel_status(interaction: discord.Interaction):
     await interaction.response.send_message('\n'.join(lines), ephemeral=True)
 
 
-@bot.tree.command(name='schedule', description='Schedule an official Training, Operation, or Meeting duty period.')
-@app_commands.describe(
-    duty_type='Type of official duty',
-    title='Event title',
-    date='Local date: YYYY-MM-DD',
-    time='Local start time: HH:MM (24-hour)',
-    duration_minutes='Scheduled duration in minutes',
-    operation_id='Optional website Operation UUID for combat-operation filing',
-    rounds_per_soldier='Optional OPERATION round expenditure; blank uses the battalion default',
-    credit_minutes='Official credit requirement in minutes; default 45',
-)
-@app_commands.choices(duty_type=DUTY_CHOICES)
-async def schedule_duty(
-    interaction: discord.Interaction,
-    duty_type: app_commands.Choice[str],
-    title: str,
-    date: str,
-    time: str,
-    duration_minutes: app_commands.Range[int, 45, 720],
-    operation_id: Optional[str] = None,
-    rounds_per_soldier: Optional[app_commands.Range[int,0,1000]] = None,
-    credit_minutes: Optional[app_commands.Range[int,5,720]] = None,
-):
+@bot.tree.command(name='schedule', description='Operations are scheduled from the website S-3 Operations Center.')
+async def schedule_duty(interaction: discord.Interaction):
     if not await require_manage_guild(interaction):
         return
-    event_type = duty_type.value
-    if event_type == 'OPERATION' and not operation_id:
-        await interaction.response.send_message('Official Operation duty must be linked to a website Operation record. Create/publish it on the website first, then run `/schedule` with its `operation_id` so attendance, 201 File credit, M16 rounds, and career progression file automatically.',ephemeral=True)
-        return
-    if interaction.guild_id not in duty_channel_bindings:
-        await load_duty_bindings(interaction.guild_id)
-    channel_id = duty_channel_bindings.get(interaction.guild_id, {}).get(event_type)
-    if not channel_id:
-        await interaction.response.send_message(
-            f'No {event_type.title()} voice channel is assigned. Run `/duty-channel` first.',
-            ephemeral=True,
-        )
-        return
-    try:
-        tz = ZoneInfo(BATTALION_TIMEZONE)
-        local_start = datetime.strptime(f'{date} {time}', '%Y-%m-%d %H:%M').replace(tzinfo=tz)
-    except Exception:
-        await interaction.response.send_message(
-            'Use date `YYYY-MM-DD` and time `HH:MM` in 24-hour format.',
-            ephemeral=True,
-        )
-        return
-
-    local_end = local_start + timedelta(minutes=int(duration_minutes))
-    effective_rounds = int(rounds_per_soldier) if rounds_per_soldier is not None else (await operation_rounds_for_guild(interaction.guild_id) if event_type == 'OPERATION' else 0)
-    channel = interaction.guild.get_channel(channel_id)
-    external_id = f'discord:{interaction.guild_id}:{event_type}:{int(local_start.timestamp())}'
-    result = await web.request('POST', '/internal/clerk/events', json={
-        'external_event_id': external_id,
-        'event_type': event_type,
-        'title': title.strip(),
-        'starts_at': iso(local_start),
-        'ends_at': iso(local_end),
-        'channel_name': event_type.title(),
-        'channel_id': channel_id,
-        'operation_id': operation_id or None,
-        'rounds_per_soldier': effective_rounds,
-        'credit_threshold_minutes': int(credit_minutes or 45),
-    })
     await interaction.response.send_message(
-        '**HEADQUARTERS — DUTY PERIOD FILED**\n'
-        f'**{title}**\nType: **{event_type.title()}**\n'
-        f"Duty Station: {channel.mention if channel else f'<#{channel_id}>'}\n"
-        f'Start: <t:{int(local_start.timestamp())}:F>\n'
-        f'End: <t:{int(local_end.timestamp())}:t>\n'
-        f'Credit Requirement: **{int(credit_minutes or 45)} minutes present**\n'
-        f"Record No.: `{result.get('event_id')}`"
+        '**WEBSITE-AUTHORITATIVE OPERATIONS**\n'
+        'The Discord `/schedule` workflow has been retired to prevent duplicate or unlinked Operations.\n\n'
+        'Schedule and publish the Operation from the **S-3 Operations Center** on the website. '
+        'Battalion Clerk automatically receives the Operation ID, selected voice channel, start/end time, '
+        'credit threshold, reminders, and ammunition expenditure settings.',
+        ephemeral=True,
     )
 
-    # Publish the official notice to the configured battalion orders channel.
-    notice_event = {
-        'id': result.get('event_id'),
-        'title': title.strip(),
-        'event_type': event_type,
-        'starts_at': iso(local_start),
-        'ends_at': iso(local_end),
-        'channel_id': channel_id,
-    }
-    try:
-        if await post_battalion_order(interaction.guild, notice_event, 'filed'):
-            announcement_notice_sent.add(str(result.get('event_id')))
-    except Exception as exc:
-        log.warning('[ORDER NOTICE FAILED] event=%s error=%s', result.get('event_id'), exc)
-
-    if event_type == 'OPERATION':
-        try:
-            await post_operation_scheduled_notice(interaction.guild,notice_event)
-        except Exception as exc:
-            log.warning('[OP REMINDER SCHEDULE NOTICE FAILED] event=%s error=%s',result.get('event_id'),exc)
-
-
-
-@bot.tree.command(name='operation-rounds-reconcile', description='Repair missing M16 round expenditure for a website Operation.')
-@app_commands.describe(operation_id='Website Operation UUID to reconcile')
-async def operation_rounds_reconcile(interaction: discord.Interaction, operation_id: str):
-    if not await require_manage_guild(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        result=await web.request('POST',f'/internal/clerk/operations/{operation_id.strip()}/reconcile-rounds',json={})
-    except Exception as exc:
-        await interaction.followup.send(f'ROUND RECONCILIATION FAILED: `{exc}`',ephemeral=True)
-        return
-    members=result.get('members') or []
-    lines=['**S-4 — OPERATION AMMUNITION RECONCILIATION COMPLETE**',
-           f"Rounds repaired: **{result.get('repaired_rounds',0)}**",
-           f"Soldiers repaired: **{len(members)}**"]
-    for row in members[:15]:
-        lines.append(f"{row.get('name') or row.get('personnel_id')} — +{row.get('rounds',0)} rounds")
-    if not members:
-        lines.append('No missing weapon-ledger rounds were found.')
-    await interaction.followup.send('\\n'.join(lines)[:1900],ephemeral=True)
 
 @bot.tree.command(name='duty-status', description="Show current scheduled duty and each Soldier's credited voice time.")
 async def duty_status(interaction: discord.Interaction):
@@ -3238,6 +3134,11 @@ async def live_activity_credit_watch():
 @tasks.loop(minutes=60)
 async def inactivity_watch():
     await collector.start(); db=collector.db
+    # Keep issued-rifle neglect/fouling state current even when nobody opens the website.
+    try:
+        await web.request('POST','/internal/clerk/weapons/refresh-inactivity',json={})
+    except Exception as exc:
+        log.warning('[WEAPON INACTIVITY REFRESH FAILED] error=%s',exc)
     for guild in bot.guilds:
         await ensure_clerk_settings_table()
         async with db.pool.acquire() as conn:

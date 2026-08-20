@@ -78,3 +78,10 @@
 ## 2026-08-19 — Authoritative Role Mirror Queue / Member Reminders
 - Battalion Clerk now polls website personnel-state changes and mirrors rank, MOS, company, platoon, squad, and managed leadership roles in Discord.
 - Added low-noise deduplicated DMs for approaching M16 inspection and qualification suspense supplied by the website.
+
+
+## 2026-08-19 — Website-Authoritative Operations / Live M16 Accrual
+- `/schedule` is now a guidance-only deprecated command; normal Operations must be scheduled from S-3 on the website.
+- Existing 60-second website event/binding refresh remains the bridge that activates the selected Operation voice channel automatically.
+- Inactivity watcher now triggers website-side issued-M16 condition refresh hourly.
+- Existing 5-minute duty voice flush drives live time-proportional M16 ammunition expenditure.
