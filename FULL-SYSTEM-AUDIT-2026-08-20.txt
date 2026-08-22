@@ -1,34 +1,28 @@
 1ST BATTALION, 5TH CAVALRY REGIMENT
-WEBSITE FULL SYSTEM AUDIT — 20 AUG 2026
+BATTALION CLERK / DISCORD BOT FULL SYSTEM AUDIT — 20 AUG 2026
 
 BASELINE
-5th-Cavalry-Website-FULL-ARRIVAL-FUNCTIONALITY-REVIEWED.zip
+5th-CAV-Battalion-Clerk-REPLACEMENT-PIPELINE-AUTHORITY-FIX.zip
 
 RESULT: RELEASE CANDIDATE — STATIC/CONTRACT AUDIT PASS
 
 CHECKS COMPLETED
-- Python compile: PASS (app.py, auth.py, config.py, database.py)
-- Jinja syntax: PASS across all templates
-- Template dependency references (extends/include/import): PASS
-- render_template file references: PASS
-- 306 template url_for references resolve to registered Flask endpoints: PASS
-- Duplicate website routes: NONE
-- Static asset references: PASS; no missing local assets
-- Static JavaScript syntax: PASS
-- CSS brace integrity/responsive rule presence: PASS
-- 53 shipped image assets decoded/verified: PASS; no corrupt images
-- Website <-> Battalion Clerk internal API path contract: PASS
-- Website <-> Battalion Clerk HTTP method contract: PASS
+- Python compile: PASS (bot.py, collector.py, config.py, database.py)
+- Duplicate Discord slash-command registration names: NONE
+- Automation task definitions/start wiring reviewed: PASS
+- 33 website HTTP calls resolve to matching Flask routes: PASS
+- HTTP methods match website route methods: PASS
 - Shared X-Battalion-Clerk-Key authentication contract: PASS
-- Static SQL placeholder/argument audit: PASS
-- Railway Procfile/requirements structure: PASS
-- Packaging cleanup: removed transient TESTWRITE and __pycache__ artifacts
+- DATABASE_URL / WEBSITE_BASE_URL / CLERK_SYNC_KEY integration contract reviewed: PASS
+- Static asyncpg SQL placeholder/argument audit: PASS
+- Railway worker Procfile/requirements structure: PASS
+- Packaging cleanup: removed __pycache__ artifact
 
 INTEGRATION VERIFIED AGAINST
-5th-CAV-Battalion-Clerk-REPLACEMENT-PIPELINE-AUTHORITY-FIX.zip
+5th-Cavalry-Website-FULL-ARRIVAL-FUNCTIONALITY-REVIEWED.zip
 
 IMPORTANT LIVE-ENVIRONMENT LIMIT
-This review validates the code/package, route contracts, templates, assets and static automation wiring. It cannot reproduce the live Railway PostgreSQL data, Railway environment variables, Discord guild permissions, Discord API behavior, OAuth configuration, or every browser/device rendering condition from this offline audit environment. After deployment, verify Railway logs and perform a short logged-out/member/staff/Discord smoke test before treating production as fully proven.
+This review validates code syntax, command registration, automation wiring, static SQL/API contracts and packaging. It cannot reproduce the live Railway PostgreSQL contents, Railway environment variables, Discord permissions/intents, Discord API availability, or production network behavior from this offline audit environment. After deployment, verify Railway logs and smoke-test command sync, member/role sync, recruiting approval, operation voice credit, M16 credit/fouling, reminders, and website callbacks.
 
 UPLOAD TARGET
-WEBSITE GITHUB REPOSITORY
+BATTALION CLERK / BOT GITHUB REPOSITORY

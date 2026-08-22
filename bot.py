@@ -1234,6 +1234,27 @@ async def personnel_orders_watch():
         except Exception as exc:
             log.warning('[PERSONNEL ORDERS] guild=%s error=%s',guild.id,exc)
 
+@tasks.loop(minutes=10)
+async def operation_maintenance_watch():
+    """Keep operation history, weapon rounds, and archive state reconciled."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        result=await web.request('POST','/internal/clerk/operations/maintenance',json={})
+        summary=result.get('summary') or {}
+        if int(summary.get('rounds_applied') or 0) or int(summary.get('completed_operations') or 0) or int(summary.get('archived_operations') or 0):
+            log.info('[OPERATION MAINTENANCE] attendance=%s participation=%s full=%s rounds=%s completed=%s archived=%s',
+                     summary.get('attendance_rows',0),summary.get('participation_rows',0),summary.get('full_credit',0),
+                     summary.get('rounds_applied',0),summary.get('completed_operations',0),summary.get('archived_operations',0))
+    except Exception as exc:
+        log.warning('[OPERATION MAINTENANCE FAILED] %s',exc)
+
+
+@operation_maintenance_watch.before_loop
+async def before_operation_maintenance_watch():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=60)
 async def operation_reminder_watch():
     now=utc_now()
@@ -2282,7 +2303,7 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
         if ch:
             await ch.send(
                 f"**POST-OPERATION PROCESSING COMPLETE**\n**{selected.get('title')}**\n"
-                f"Tracked: **{summary.get('tracked',0)}** • 20+ min attendance: **{summary.get('participated',0)}** • Official operation credit: **{summary.get('credited',0)}**\n"
+                f"Tracked: **{summary.get('tracked',0)}** • Verified presence: **{summary.get('participated',0)}** • Official operation credit: **{summary.get('credited',0)}**\n"
                 f"Weapon rounds applied: **{summary.get('weapon_rounds_applied',0)}** • AAR task: **{'OPEN' if summary.get('aar_task_opened') else 'ON FILE / NOT REQUIRED'}**"
             )
 
@@ -2390,6 +2411,8 @@ async def on_ready():
         duty_announcement_watch.start()
     if not operation_reminder_watch.is_running():
         operation_reminder_watch.start()
+    if not operation_maintenance_watch.is_running():
+        operation_maintenance_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
     if not clerk_health_watch.is_running():

@@ -1,14 +1,41 @@
-# 5th Cavalry Website — Direct Entry Rank / Assignment Flow
+# 5th CAV Battalion Clerk — Strict Company / Platoon / Squad Access
 
-This build separates entry grade, battalion in-processing, Replacement Training, and organizational assignment.
+This build extends strict Discord assignment visibility through all three organizational levels.
 
-- A Soldier entering at PVT completes Replacement Training and the PVT → PFC requirements.
-- A Soldier entering directly at PFC, SGT, SFC, 2LT, CPT, etc. begins promotion progression from that actual entry grade. No lower-rank promotion history is invented.
-- Direct-entry Soldiers complete only S-1 administrative in-processing (S-1 interview, platoon, squad, Standing Orders acknowledgement); they do not inherit the PVT seven-day/first-operation gate.
-- A Soldier with company + platoon + squad roles is immediately treated as organizationally assigned and is not counted as an unassigned Replacement Depot member, regardless of rank.
-- A Soldier missing organizational assignment remains awaiting assignment even if the entry grade is senior.
-- The 201 File and My Soldier Record dynamically show either Replacement Training or Initial Battalion In-Processing.
-- Current promotion eligibility always derives from the authoritative personnel rank.
+## Access model
+- A Company cannot see B/C Company internal areas.
+- A Company • 1st Platoon cannot see A Company • 2nd/3rd/4th Platoon areas.
+- A Company • 1st Platoon • 1st Squad can see only its own squad text/voice channels inside the platoon area.
+- Platoon-wide channels remain visible to every Soldier assigned to that exact platoon.
+- Command, S-1, S-3, and appropriate leadership retain oversight access.
+- Rank, MOS, and qualification roles remain permission-neutral.
+
+## Migration
+After deployment run:
+`/strict-access-rebuild confirm:True`
+
+The command removes legacy generic platoon/squad assignment roles where possible, creates the company/platoon/squad-specific roles, and reapplies managed channel permissions.
+
+Then run:
+`/structure-status`
+
+Optionally run:
+`/permissions-repair confirm:True`
+
+RECRUITING PIPELINE
+- /verify-application code:<CAV-XXXX>
+- /application-status
+- New walk-ins receive Prospective Replacement when the role exists.
+- Approved cases receive Approved Replacement and are still not personnel until rank+MOS+assignment roles settle.
+- Run /structure-repair after deploy to add the new Recruiting Status roles to an existing server.
 
 FINAL RECRUITING FLOW — DISCORD OAUTH
-Public recruiting uses Discord OAuth identify-only. The Recruiting Case is tied to the recruit's permanent Discord user ID before Discord arrival. The status receipt provides the normal Discord invite. Battalion Clerk handles Prospective Replacement, Approved Replacement, status DMs, and final personnel conversion after staff assigns rank/MOS/company/platoon/squad.
+1. Applicant opens/fills the website application and verifies Discord identity with OAuth identify-only.
+2. Applicant submits the application and receives the normal Discord invite option.
+3. On joining Discord, Battalion Clerk matches the permanent Discord user ID and assigns Prospective Replacement.
+4. Battalion Headquarters reviews the Recruiting Case.
+5. Approval automatically swaps Prospective Replacement to Approved Replacement and DMs the applicant.
+6. Staff assigns rank, MOS, company, platoon, and squad roles.
+7. Every role edit restarts the 30-second settle timer.
+8. After a valid approved role set settles, Battalion Clerk creates/links the Soldier record, delivers credentials, files conversion, and removes recruiting holding roles.
+9. Denied/closed/enlisted cases cannot regain recruiting holding roles from later role changes.

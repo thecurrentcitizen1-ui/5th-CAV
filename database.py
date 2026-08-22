@@ -1,92 +1,40 @@
-from __future__ import annotations
+import os
+import asyncpg
+import logging
 
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Iterable
+log = logging.getLogger("battalion-clerk.database")
 
-import psycopg
-from psycopg.rows import dict_row
-from flask import g, has_request_context
+class Database:
+    def __init__(self):
+        self.url = os.getenv("DATABASE_URL")
+        self.pool = None
 
-from config import CONFIG
+    async def connect(self):
+        if not self.url:
+            log.warning("[POSTGRES DISABLED] DATABASE_URL is not set")
+            return
+        if self.pool is None:
+            self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=5)
+            async with self.pool.acquire() as conn:
+                version = await conn.fetchval("SELECT version()")
+            log.info("[POSTGRES READY] %s", version)
 
-ROOT = Path(__file__).resolve().parent
-SCHEMA_PATH = ROOT / "sql" / "schema.sql"
+    async def execute(self, query, *args):
+        if not self.pool:
+            return None
+        return await self.pool.execute(query, *args)
 
+    async def fetch(self, query, *args):
+        if not self.pool:
+            return []
+        return await self.pool.fetch(query, *args)
 
-def _new_connection(*, autocommit: bool = False):
-    if not CONFIG.database_url:
-        raise RuntimeError("DATABASE_URL is not configured")
-    return psycopg.connect(
-        CONFIG.database_url,
-        row_factory=dict_row,
-        autocommit=autocommit,
-        connect_timeout=10,
-    )
+    async def fetchrow(self, query, *args):
+        if not self.pool:
+            return None
+        return await self.pool.fetchrow(query, *args)
 
-
-def _request_connection():
-    """Reuse one PostgreSQL connection for the lifetime of an HTTP request."""
-    conn = getattr(g, "_battalion_db_conn", None)
-    if conn is None or conn.closed:
-        conn = _new_connection(autocommit=True)
-        g._battalion_db_conn = conn
-    return conn
-
-
-def close_request_connection(_error=None):
-    conn = g.pop("_battalion_db_conn", None) if has_request_context() else None
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-@contextmanager
-def connection():
-    if has_request_context():
-        # Autocommit request connection: each statement is independent, so a
-        # caught SQL error cannot leave all later page queries in an aborted tx.
-        conn = _request_connection()
-        yield conn
-        return
-
-    # Bootstrap/background code keeps normal transaction semantics.
-    conn = _new_connection(autocommit=False)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def init_schema() -> None:
-    sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (15051966,))
-            cur.execute(sql)
-
-
-def fetch_one(sql: str, params: Iterable[Any] = ()) -> dict | None:
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            return cur.fetchone()
-
-
-def fetch_all(sql: str, params: Iterable[Any] = ()) -> list[dict]:
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            return list(cur.fetchall())
-
-
-def execute(sql: str, params: Iterable[Any] = ()) -> None:
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+            self.pool = None

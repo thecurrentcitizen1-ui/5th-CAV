@@ -1,0 +1,7 @@
+1/5 CAV BATTALION CLERK — OPERATION MAINTENANCE UPDATE
+2026-08-22
+
+- Added recurring 10-minute operation maintenance reconciliation against the Website system of record.
+- Reconciles existing attendance -> operation history -> M16 round ledger.
+- Completes ended operations and archives stale past operations through the Website maintenance endpoint.
+- Existing recruiting auto-Discord-join / credential-delivery pipeline is retained.

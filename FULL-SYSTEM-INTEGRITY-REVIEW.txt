@@ -38,9 +38,3 @@ ROOT CAUSES FOUND
 
 NOTE
 Static/source validation cannot see live Railway environment values or the current live PostgreSQL schema/data. This build removes the source-level conflicts discovered in the cumulative packages and adds diagnostic references for any remaining live-data failure.
-
-POST-REVIEW CORRECTION — 2026-08-18
-- Railway traceback reviewed: `where_you_stand` missing at member_record.html line 55.
-- Route contract fix: PASS.
-- Template defensive default: PASS.
-- No unguarded `where_you_stand.*` uses remain in member_record.html.
