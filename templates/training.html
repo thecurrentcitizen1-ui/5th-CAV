@@ -1,0 +1,60 @@
+{% extends 'base.html' %}
+{% block title %}Training Office • {{site_name}}{% endblock %}
+{% block body_class %}page-training{% endblock %}
+{% block content %}
+<section class="training-office-hero"><div class="training-photo"></div><div class="training-shade"></div><div class="training-sign"><span>S-3 TRAINING</span><h1>TRAINING OFFICE</h1><p>Range records, qualification cards, school files, instructor sign-offs and training status.</p></div></section>
+<section class="training-office">
+  <article class="range-scorecard document-sheet"><header class="army-letterhead compact"><small>TRAINING OFFICE</small><strong>INDIVIDUAL TRAINING RECORD</strong><span>1ST BATTALION, 5TH CAVALRY</span></header>{% if personnel %}<h2>{{personnel.rank_code}} {{personnel.last_name|upper}}, {{personnel.first_name|upper}}</h2>{% else %}<h2>PERSONNEL FILE REQUIRED</h2>{% endif %}<p class="training-note">The training office maintains range records, school completions, role certifications, and requalification dates. These entries remain part of the Soldier's permanent 201 File.</p><div class="qualification-table header"><span>QUALIFICATION</span><span>STATUS</span><span>DATE</span><span>EXPIRATION</span></div>{% for q in qualifications %}<div class="qualification-table"><span>{{q.qualification_name}}</span><b>{{q.status}}</b><span>{{q.earned_at or 'NO ENTRY'}}</span><span>{{q.expires_at or 'NONE'}}</span></div>{% else %}<p class="typed-empty">NO QUALIFICATIONS ARE CURRENTLY FILED.</p>{% endfor %}</article>
+  <aside class="training-folder"><div class="manila-tab">SCHOOLS</div><h3>SCHOOL / MOS RECORDS</h3><p>Schools and specialist qualifications are filed into the Soldier's personnel record after instructor verification.</p><div class="ink-stamp small">QUALIFIED</div><div class="school-lines"><span>RIFLE</span><span>MOS DUTY</span><span>SCHOOLS</span><span>RANGE CARDS</span></div></aside>
+  <aside class="instructor-board"><header>TRAINING STATUS</header><p>QUALIFIED</p><p>UNQUALIFIED</p><p>IN TRAINING</p><p>EXPIRED</p><p>REQUALIFICATION DUE</p><small>STATUS CATEGORIES</small></aside>
+  <article class="document-sheet training-office-memo"><header class="army-letterhead compact"><small>S-3 TRAINING</small><strong>TRAINING OFFICE MEMORANDUM</strong><span>READINESS THROUGH QUALIFICATION</span></header><p>Instruction is tracked as a battalion record rather than a loose checklist. Weapons, duty qualifications, schools, and refresher training are meant to show whether a Soldier is prepared for operations — not simply whether he clicked through a page.</p></article>
+</section>
+{% endblock %}
+
+<section class="rank-progression-office">
+  <header class="document-sheet progression-office-heading"><div><small>HEADQUARTERS • S-1 / BATTALION TRAINING</small><h2>RANK PROGRESSION REQUIREMENTS</h2><p>Promotion is based on time in grade, official operations, training, readiness, qualifications, leadership experience, and command recommendation. Meeting the objective requirements makes a Soldier eligible for consideration; it does not automatically promote him.</p></div></header>
+
+  <div class="progression-tracks">
+    <article class="document-sheet progression-track">
+      <header><small>INITIAL ENTRY</small><strong>PRIVATE → PRIVATE FIRST CLASS</strong></header>
+      <div class="progression-line"><b>PVT → PFC</b><span>Replacement Training complete</span><small>S-1 onboarding • platoon assignment • squad assignment • rules acknowledged • 7 days service • 1 official operation</small></div>
+    </article>
+
+    <article class="document-sheet progression-track">
+      <header><small>NONCOMMISSIONED OFFICER TRACK</small><strong>ENLISTED LEADERSHIP</strong></header>
+      <div class="progression-line"><b>PFC → CPL</b><span>14 days TIG • 3 operations • Battalion Combat Orientation • current M16/rifle qualification • 80% readiness</span></div>
+      <div class="progression-line"><b>CPL → SGT</b><span>21 days TIG • 6 operations • 1 duty qualification • Squad Leadership Course • 85% readiness • NCO recommendation</span></div>
+      <div class="progression-line"><b>SGT → SSG</b><span>30 days TIG • 10 operations • squad leadership experience • 2 duty qualifications • 88% readiness • PSG/1SG recommendation</span></div>
+      <div class="progression-line"><b>SSG → SFC</b><span>45 days TIG • 15 operations • Platoon Leadership Course • successful Squad Leader service • 90% readiness • command review</span></div>
+      <div class="progression-line"><b>SFC → MSG</b><span>60 days TIG • 20 operations • platoon-level leadership • 3 duty qualifications • 90% readiness • command recommendation</span></div>
+      <div class="progression-line appointment"><b>MSG → 1SG</b><span>Command selection / Company First Sergeant appointment</span></div>
+      <div class="progression-line appointment"><b>1SG → SGM</b><span>Battalion senior enlisted appointment and Battalion Commander approval</span></div>
+    </article>
+
+    <article class="document-sheet progression-track">
+      <header><small>SPECIALIST TRACK</small><strong>TECHNICAL PROGRESSION</strong></header>
+      <div class="progression-line"><b>PFC → SP4</b><span>14 days TIG • 3 operations • Replacement Training • 2 duty qualifications • 80% readiness</span></div>
+      <div class="progression-line"><b>SP4 → SP5</b><span>30 days TIG • 7 operations • 3 duty qualifications • demonstrated specialist duty • 85% readiness • recommendation</span></div>
+      <div class="progression-line"><b>SP5 → SP6</b><span>45 days TIG • 12 operations • advanced qualifications • instructor/staff/specialist experience • 88% readiness • recommendation</span></div>
+      <div class="progression-line appointment"><b>SP6 → SP7</b><span>60 days TIG • 18 operations • multiple advanced qualifications • senior technical billet • command selection</span></div>
+    </article>
+
+    <article class="document-sheet progression-track">
+      <header><small>OFFICER TRACK</small><strong>COMMISSIONED LEADERSHIP</strong></header>
+      <div class="progression-line"><b>2LT → 1LT</b><span>30 days TIG • 5 operations • Officer Orientation • successful platoon leadership • command recommendation</span></div>
+      <div class="progression-line"><b>1LT → CPT</b><span>60 days TIG • 10 operations • Company Leadership Course • successful PL/XO service • 90% readiness • command recommendation</span></div>
+      <div class="progression-line appointment"><b>CPT → MAJ</b><span>Successful company command or battalion staff service • Battalion Commander selection</span></div>
+      <div class="progression-line appointment"><b>MAJ → LTC</b><span>Command appointment only — Battalion Commander</span></div>
+    </article>
+  </div>
+
+  <article class="document-sheet training-program-register">
+    <header class="army-letterhead compact"><small>BATTALION TRAINING</small><strong>FORMAL TRAINING PROGRAMS</strong><span>1ST BATTALION, 5TH CAVALRY</span></header>
+    <div class="training-program-line"><b>REPLACEMENT TRAINING</b><span>Initial processing and PVT → PFC gate</span></div>
+    <div class="training-program-line"><b>BATTALION COMBAT ORIENTATION</b><span>Field procedures and combat readiness</span></div>
+    <div class="training-program-line"><b>SQUAD LEADERSHIP COURSE</b><span>Junior NCO leadership preparation</span></div>
+    <div class="training-program-line"><b>PLATOON LEADERSHIP COURSE</b><span>Senior NCO platoon-level preparation</span></div>
+    <div class="training-program-line"><b>OFFICER ORIENTATION</b><span>Initial officer battalion integration</span></div>
+    <div class="training-program-line"><b>COMPANY LEADERSHIP COURSE</b><span>Company-level officer leadership preparation</span></div>
+  </article>
+</section>

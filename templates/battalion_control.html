@@ -1,0 +1,40 @@
+{% extends 'base.html' %}
+{% block title %}Battalion Control • {{site_name}}{% endblock %}
+{% block body_class %}page-battalion-control{% endblock %}
+{% block content %}
+<section class="staff-section-hero"><div class="staff-photo"></div><div class="staff-shade"></div><div class="staff-sign"><span>BATTALION HEADQUARTERS</span><h1>SYSTEM CONTROL & HISTORICAL LEDGER</h1><p>Command recovery tools, lifecycle status, staff audit, arms inspection, and the permanent battalion record.</p></div></section>
+<section class="staff-workspace battalion-control-grid">
+  <article class="document-sheet"><header class="army-letterhead compact"><small>COMMAND SYSTEM STATUS</small><strong>BATTALION HEALTH</strong><span>LIVE DATABASE CHECKS</span></header>
+    <div class="brief-strength"><div><small>ACTIVE SOLDIERS</small><b>{{health.active}}</b></div><div><small>ARCHIVED / FORMER</small><b>{{health.archived}}</b></div><div><small>OPEN ACTIONS</small><b>{{health.open_actions}}</b><span>{{health.urgent}} HIGH PRIORITY</span></div><div><small>WEAPONS DUE</small><b>{{health.weapon_due}}</b></div><div><small>MISSING MOS</small><b>{{health.missing_mos}}</b></div><div><small>UNLINKED RECORDS</small><b>{{health.unlinked}}</b></div></div>
+  </article>
+  <article class="document-sheet"><header><small>PERSONNEL LIFECYCLE</small><b>CURRENT STATES</b></header>{% for r in lifecycle %}<div class="entry-row"><span>{{r.lifecycle_state}}</span><b>{{r.total}}</b></div>{% endfor %}</article>
+  <article class="document-sheet"><header><small>COMMAND RECOVERY</small><b>REPAIR / VERIFY SOLDIER RECORD</b></header>
+    <form method="post" class="army-form-grid"><label class="wide">SOLDIER<select name="personnel_id" required>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}} — {{p.lifecycle_state}}</option>{% endfor %}</select></label>
+      <button name="action" value="RECALCULATE" class="paper-action button-reset"><span>RECALCULATE RECORD</span><small>LIFECYCLE / TRAINING / PROMOTION</small></button>
+      <button name="action" value="REGENERATE_ORDERS" class="paper-action button-reset"><span>VERIFY INITIAL ORDERS</span><small>IDEMPOTENT — NO DUPLICATES</small></button>
+      <button name="action" value="REISSUE_PROPERTY" class="paper-action button-reset"><span>VERIFY STANDARD ISSUE</span><small>M16 / UNIFORM</small></button>
+      <button name="action" value="REISSUE_ROSTER" class="paper-action button-reset"><span>VERIFY ROSTER CARD</span><small>RESTORE ONLY IF MISSING</small></button>
+    </form>
+  </article>
+  <article class="document-sheet"><header><small>S-4 ARMS ROOM</small><b>WEAPONS INSPECTION DUE</b></header>{% for w in due_weapons %}<div class="entry-row"><span>{{w.rank_code}} {{w.last_name|upper}}, {{w.first_name}}</span><b>M16 {{w.serial_number}}</b><small>RACK {{w.rack_number}} • LAST {{w.last_inspected_at.date() if w.last_inspected_at else 'NO INSPECTION'}}</small></div>{% else %}<p class="typed-empty">NO WEAPONS ARE OVERDUE FOR THE 14-DAY INSPECTION CYCLE.</p>{% endfor %}</article>
+  <article class="document-sheet command-danger-zone"><header class="army-letterhead compact"><small>COMMAND ONLY • PERMANENT ACTION</small><strong>DELETE DUPLICATE PERSONNEL RECORD</strong><span>USE ONLY FOR ACCIDENTAL / DUPLICATE 201 FILES</span></header>
+    <p>This permanently removes the selected Soldier's personnel record, Battle Roster credentials, member login link, and Soldier-owned records. Use <b>SEPARATE / ARCHIVE</b> for a real former member instead.</p>
+    <form method="post" class="army-form-grid danger-delete-form" onsubmit="return confirm('PERMANENTLY DELETE THIS PERSONNEL RECORD? This cannot be undone.');">
+      <label class="wide">DUPLICATE SOLDIER<select name="personnel_id" required><option value="">SELECT RECORD TO DELETE</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}} — {{p.unit_code or 'UNASSIGNED'}} — {{p.lifecycle_state}}</option>{% endfor %}</select></label>
+      <label class="wide">TYPE DELETE TO CONFIRM<input name="delete_confirmation" autocomplete="off" placeholder="DELETE" required></label>
+      <button name="action" value="DELETE_PERSONNEL" class="danger-delete-button" type="submit"><span>DELETE DUPLICATE RECORD</span><small>PERMANENT • CANNOT BE UNDONE</small></button>
+    </form>
+  </article>
+</section>
+
+<section class="staff-workspace battalion-control-grid">
+  <article class="document-sheet"><header><small>HEADQUARTERS DAILY LOG</small><b>TODAY'S STAFF ACTIVITY</b></header>{% for r in daily %}<div class="entry-row"><span>{{r.section}}</span><b>{{r.total}} ACTION{{'' if r.total==1 else 'S'}}</b></div>{% else %}<p class="typed-empty">NO STAFF ACTIONS HAVE BEEN FILED TODAY.</p>{% endfor %}</article>
+  <article class="document-sheet"><header><small>BATTALION SERVICE MILESTONES</small><b>UNIT HONORS / PROGRESS</b></header>{% for m in milestones %}<div class="entry-row"><span>{{m.title}}</span><b>{{'EARNED' if m.earned else (m.current|string ~ ' / ' ~ m.goal|string)}}</b><small>{{'FILED IN BATTALION HISTORY' if m.earned else 'IN PROGRESS'}}</small></div>{% endfor %}</article>
+  <article class="document-sheet"><header><small>COMPANY HISTORICAL INDEX</small><b>FORMATION RECORDS</b></header>{% for c in company_history %}<div class="entry-row"><span>{{c.unit_code}}</span><b>{{c.total}} HISTORICAL ENTRIES</b><small>LAST {{c.last_entry or 'NO ENTRY'}}</small></div>{% endfor %}</article>
+</section>
+
+<section class="command-action-overview">
+  <article class="document-sheet"><header><small>HEADQUARTERS DUTY LOG</small><b>RECENT STAFF ACTIONS</b></header>{% for l in logs %}<div class="journal-entry"><time>{{l.created_at.strftime('%d %b %Y %H%M') if l.created_at else ''}}</time><div><b>{{l.section}} — {{l.action_type}}</b><p>{{l.summary}}</p><small>{{l.actor or 'SYSTEM'}}{% if l.reference_number %} • {{l.reference_number}}{% endif %}</small></div></div>{% else %}<p class="typed-empty">NO STAFF LOG ENTRIES FILED.</p>{% endfor %}</article>
+  <article class="document-sheet"><header><small>BATTALION JOURNAL</small><b>HISTORICAL RECORD</b></header>{% for h in history %}<div class="journal-entry"><time>{{h.history_date}}</time><div><b>{{h.category}} — {{h.title}}</b><p>{{h.narrative}}</p><small>{{h.reference_number or 'BATTALION FILE'}}</small></div></div>{% else %}<p class="typed-empty">BATTALION HISTORY WILL ACCUMULATE AS ACTIONS ARE FILED.</p>{% endfor %}</article>
+</section>
+{% endblock %}

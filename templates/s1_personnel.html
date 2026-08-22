@@ -1,0 +1,223 @@
+{% extends 'base.html' %}
+{% block title %}S-1 Personnel • {{site_name}}{% endblock %}
+{% block body_class %}page-s1{% endblock %}
+{% block content %}
+<section class="staff-workload-strip document-sheet"><span>S-1 WORKLOAD</span><b>{{workload.counts.open or 0}} OPEN</b><b>{{workload.counts.urgent or 0}} HIGH PRIORITY</b><b>{{workload.overdue_count}} OVERDUE</b><a href="{{url_for('staff_workload_page',section='S-1')}}">OPEN WORKLOAD DESK</a></section>
+<section class="staff-section-hero s1-hero"><div class="staff-hero-photo"></div><div class="staff-sign"><span>BATTALION STAFF</span><h1>S-1 PERSONNEL</h1><p>Personnel records, battalion roster entry, in-country dates and Battle Roster Cards.</p></div></section>
+<section class="s1-workroom">
+  <article class="document-sheet s1-roster-control" id="personnel-roster-control">
+    <header class="army-letterhead compact"><small>S-1 / COMMAND</small><strong>PERSONNEL ROSTER CONTROL</strong><span>SEARCH • CORRECT • OPEN 201 FILE • REISSUE ACCESS • ARCHIVE</span></header>
+    <div class="roster-control-toolbar"><input type="search" id="s1-roster-search" placeholder="SEARCH NAME / RANK / MOS / UNIT / BATTLE ROSTER"><span>{{counts.total or 0}} ACTIVE RECORDS</span></div>
+    <div class="roster-control-list" id="s1-roster-list">
+    {% for row in recent %}{% set c=card_map.get(row.id|string) %}
+      <details class="roster-control-person" data-roster-search="{{row.rank_code}} {{row.first_name}} {{row.last_name}} {{row.mos_code}} {{row.unit_code}} {{row.platoon}} {{row.squad}} {{c.roster_number if c else ''}}">
+        <summary><span><b>{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</b><small>{{row.mos_code or 'MOS PENDING'}} • {{row.unit_code}} • {{row.platoon or 'PLT PENDING'}} • {{row.squad or 'SQD PENDING'}}</small></span><span>{{c.roster_number if c else 'NO ROSTER CARD'}}</span><strong>MANAGE</strong></summary>
+        <div class="roster-control-actions">
+          <a href="{{url_for('personnel_service_record',personnel_id=row.id)}}">OPEN 201 FILE</a>
+          <form method="post" class="roster-quick-correction">
+            <input type="hidden" name="action" value="quick_personnel_correction"><input type="hidden" name="personnel_id" value="{{row.id}}">
+            <label>RANK<select name="rank_code">{% for r in ranks %}<option value="{{r.rank_code}}" {% if r.rank_code==row.rank_code %}selected{% endif %}>{{r.rank_code}} — {{r.rank_name}}</option>{% endfor %}</select></label>
+            <label>MOS<select name="mos_code" required>{% for m in mos_catalog %}<option value="{{m.mos_code}}" {% if m.mos_code==row.mos_code %}selected{% endif %}>{{m.mos_code}} — {{m.mos_title}}</option>{% endfor %}</select></label>
+            <label class="wide">ASSIGNMENT<select name="unit_node_id" required>{% for n in assignment_options %}<option value="{{n.id}}" {% if n.id|string==row.unit_node_id|string %}selected{% endif %}>{{n.assignment_label}}</option>{% endfor %}</select></label>
+            <label>DUTY / BILLET<select name="duty_position" required>{% for d in duty_positions %}<option value="{{d.value}}" {% if d.value==row.duty_position %}selected{% endif %}>{{d.label}}{% if d.mos_code %} [{{d.mos_code}}]{% endif %}</option>{% endfor %}</select></label>
+            <button type="submit">SAVE PERSONNEL CORRECTION</button>
+          </form>
+          <form method="post"><input type="hidden" name="action" value="reset_field_code"><input type="hidden" name="personnel_id" value="{{row.id}}"><button type="submit">REISSUE MEMBER LOGIN</button></form>
+          {% if session.get('access_role') in ['battalion_hq','commander','admin'] %}<form method="post" action="{{url_for('battalion_control')}}" class="danger-record-action" onsubmit="return confirm('Delete this erroneous personnel record? This is not a separation action.')"><input type="hidden" name="action" value="DELETE_PERSONNEL"><input type="hidden" name="personnel_id" value="{{row.id}}"><input name="delete_confirmation" placeholder="TYPE DELETE" required><button type="submit">DELETE ERRONEOUS RECORD</button></form>{% endif %}
+        </div>
+      </details>
+    {% endfor %}
+    </div>
+  </article>
+
+  <article class="document-sheet s1-award-control">
+    <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>AWARD RECOMMENDATION CONTROL</strong><span>NCO RECOMMENDATIONS / ADMINISTRATIVE REVIEW / FORWARD TO COMMAND</span></header>
+    <section class="s1-award-issue-desk">
+      <header><span>AWARDS &amp; DECORATIONS</span><strong>DIRECT AWARD ISSUE</strong></header>
+      <p class="award-issue-note">File an approved award directly to a Soldier's permanent record. The official order number is generated automatically. Earned ribbons are added to the Soldier's profile as <b>NOT WORN</b> so the Soldier may choose whether to place the ribbon on the uniform.</p>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="grant_award">
+        <label>SOLDIER<select name="personnel_id" required><option value="">SELECT SOLDIER</option>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}} — {{row.unit_code}}</option>{% endfor %}</select></label>
+        <label>AWARD<select name="ribbon_code" required><option value="">SELECT AWARD</option>{% for a in award_catalog %}<option value="{{a.ribbon_code}}">{{a.ribbon_name}}{% if a.automation_mode %} — {{a.automation_mode|replace('_',' ')}}{% endif %}</option>{% endfor %}</select></label>
+        <label>AWARD DATE<input type="date" name="award_date" value="{{s1_today}}" required></label>
+        <label>ORDER NUMBER<div class="award-auto-order">AUTO-GENERATED ON FILING</div></label>
+        <label class="wide">CITATION<textarea name="citation" rows="5" placeholder="State the action, service, achievement, or qualifying performance for which the award is presented." required></textarea></label>
+        <label class="wide">S-1 REMARKS<input name="remarks" placeholder="OPTIONAL ADMINISTRATIVE REMARKS"></label>
+        <button class="paper-action primary button-reset" type="submit"><span>FILE AWARD</span><small>ISSUE ORDER / UPDATE 201 FILE / ADD TO MEMBER AWARDS</small></button>
+      </form>
+    </section>
+    <div class="award-control-summary"><b>{{award_queue|length}}</b><span>AWARD RECOMMENDATIONS AWAITING S-1 ACTION</span></div>
+    {% for r in award_queue %}
+    <form method="post" class="award-routing-sheet army-form-grid">
+      <input type="hidden" name="action" value="award_s1_forward">
+      <input type="hidden" name="recommendation_id" value="{{r.id}}">
+      <div class="wide award-routing-heading"><b>{{r.rank_code}} {{r.last_name|upper}}, {{r.first_name}}</b><small>{{r.unit_code}} • RECOMMENDED BY {% if r.recommender_last %}{{r.recommender_rank}} {{r.recommender_last|upper}}{% else %}NCO NOT LINKED{% endif %} • {{r.created_at.date() if r.created_at else ''}}</small></div>
+      <label>PROPOSED AWARD<input name="award_name" value="{{r.s1_award_name or r.recommended_action}}" required></label>
+      <label class="wide">JUSTIFICATION<textarea name="justification" rows="5" required>{{r.s1_justification or r.justification}}</textarea></label>
+      <label class="wide">S-1 REMARKS<input name="s1_remarks" value="{{r.remarks or ''}}" placeholder="ADMINISTRATIVE CORRECTIONS / NOTES"></label>
+      <button class="paper-action primary button-reset" type="submit"><span>FORWARD TO BATTALION HQ</span><small>S-1 REVIEW COMPLETE</small></button>
+      <button class="paper-action button-reset" type="submit" name="action" value="award_s1_return"><span>RETURN TO NCO</span><small>CORRECTION REQUIRED</small></button>
+    </form>
+    {% else %}<p class="typed-empty">NO AWARD RECOMMENDATIONS ARE AWAITING S-1 REVIEW.</p>{% endfor %}
+    {% if forwarded_awards %}<div class="award-forwarded-register"><h3>RECENT AWARD ACTIONS</h3>{% for r in forwarded_awards[:12] %}<div class="entry-row"><span>{{r.rank_code}} {{r.last_name|upper}} — {{r.s1_award_name or r.recommended_action}}</span><b>{{r.status|replace('_',' ')}}</b><small>{{r.s1_reviewed_by or 'S-1 REVIEW PENDING'}}</small></div>{% endfor %}</div>{% endif %}
+  </article>
+  <article class="s1-intake document-sheet">
+    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>PERSONNEL IN-PROCESSING</strong><span>1ST BATTALION, 5TH CAVALRY</span></header>
+    <h2>OPEN PERSONNEL RECORD</h2>
+    <form method="post" class="army-form-grid">
+      <input type="hidden" name="action" value="create">
+      <label>FIRST NAME<input name="first_name" required></label><label>LAST NAME<input name="last_name" required></label>
+      <label>MOS<select name="mos_code" required>{% for m in mos_catalog %}<option value="{{m.mos_code}}" {% if m.mos_code=='11R' %}selected{% endif %}>{{m.mos_code}} — {{m.mos_title}}</option>{% endfor %}</select></label><label>DUTY / BILLET<select name="duty_position" required>{% for d in duty_positions %}<option value="{{d.value}}" {% if d.value=='Rifleman' %}selected{% endif %}>{{d.label}}{% if d.mos_code %} [{{d.mos_code}}]{% endif %}</option>{% endfor %}</select></label>
+      <label class="wide">ORGANIZATIONAL ASSIGNMENT<select name="unit_node_id" required><option value="">SELECT COMPANY / PLATOON / SQUAD</option>{% for n in assignment_options %}<option value="{{n.id}}">{{n.assignment_label}}</option>{% endfor %}</select></label><label>BATTALION COMMUNICATIONS NAME<select name="communications_id"><option value="">NO ENTRY</option>{% for c in communications_roster %}<option value="{{c.guild_id}}:{{c.discord_user_id}}">{{c.display_name or c.username}}</option>{% endfor %}</select></label><label>DATE ASSIGNED<input type="date" name="date_joined"></label>
+      <label>ARRIVAL IN COUNTRY<input type="date" name="rvn_arrival_date"></label><label>DEROS<input type="date" name="deros_date"></label>
+      <button class="paper-action primary button-reset" type="submit"><span>ENTER ON BATTALION ROSTER</span><small>OPEN 201 FILE / ISSUE CARD / ISSUE M16</small></button>
+    </form>
+  </article>
+
+  {% if issued_packet %}
+  <article class="issued-packet">
+    <div class="ink-stamp">ISSUED</div><h2>IN-PROCESSING PACKET</h2>
+    <p><b>{{issued_packet.personnel.rank_code}} {{issued_packet.personnel.last_name|upper}}, {{issued_packet.personnel.first_name|upper}}</b></p>
+    <dl><dt>SERVICE NO.</dt><dd>{{issued_packet.personnel.service_number}}</dd><dt>BATTLE ROSTER NO.</dt><dd>{{issued_packet.card.roster_number}}</dd><dt>FIELD CODE</dt><dd class="field-code-reveal">{{issued_packet.field_code or 'PREVIOUSLY ISSUED — RESET REQUIRED TO REVEAL A NEW CODE'}}</dd><dt>INDIVIDUAL WEAPON</dt><dd>M16 • SN {{issued_packet.weapon.serial_number}} • RACK {{issued_packet.weapon.rack_number}}</dd></dl>
+    <p class="one-time-warning">THE FIELD CODE IS SHOWN ONLY AT ISSUE. PROVIDE IT DIRECTLY TO THE SOLDIER.</p>
+  </article>
+  {% endif %}
+
+
+  <article class="document-sheet assignment-orders-form">
+    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>PERSONNEL ASSIGNMENT ORDERS</strong><span>S-1 PERSONNEL</span></header>
+    <form method="post" class="army-form-grid">
+      <input type="hidden" name="action" value="assignment_action">
+      <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+      <label class="wide">ASSIGN TO<select name="unit_node_id" required><option value="">SELECT COMPANY / PLATOON / SQUAD</option>{% for n in assignment_options %}<option value="{{n.id}}">{{n.assignment_label}}</option>{% endfor %}</select></label>
+      <label>MOS<select name="mos_code">{% for m in mos_catalog %}<option value="{{m.mos_code}}">{{m.mos_code}} — {{m.mos_title}}</option>{% endfor %}</select></label>
+      <label>DUTY POSITION<select name="duty_position" required>{% for d in duty_positions %}<option value="{{d.value}}">{{d.label}}{% if d.mos_code %} [{{d.mos_code}}]{% endif %}</option>{% endfor %}</select></label>
+      <label>EFFECTIVE DATE<input type="date" name="effective_date" value="{{s1_today}}"></label>
+      <label>AUTHORITY<div class="system-readonly-field">{{staff_authority}} • AUTO FROM LOGIN</div></label>
+      <div class="auto-order-number-field"><small>ORDER NUMBER</small><strong>AUTO-GENERATED ON FILING</strong></div>
+      <label class="wide">REMARKS<input name="remarks"></label>
+      <button class="paper-action primary button-reset" type="submit"><span>FILE ASSIGNMENT ORDERS</span><small>UPDATE ROSTER / CHAIN OF COMMAND / 201 FILE</small></button>
+    </form>
+  </article>
+
+  <section class="replacement-processing-desk">
+    <article class="document-sheet replacement-certification-form">
+      <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>INITIAL SOLDIER PROCESSING</strong><span>INITIAL BATTALION IN-PROCESSING</span></header>
+      <p class="form-note">PVT entrants complete Replacement Training, including seven days as a Private and one official operation. Soldiers entered directly at PFC, SGT, officer, or another higher grade complete only administrative S-1 in-processing and retain their assigned entry grade.</p>
+      <div class="inprocessing-control-board">
+        <div><small>WORKING STATUS</small><strong>INITIAL BATTALION IN-PROCESSING</strong><span>Select a Soldier below and certify the outstanding S-1 requirement. Assignment requirements update automatically from the roster.</span></div>
+        <a href="#personnel-roster-control">OPEN ROSTER CONTROL</a>
+      </div>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="certify_s1_onboarding">
+        <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+        <label>CERTIFYING S-1 REPRESENTATIVE<input name="authority" placeholder="RANK / NAME"></label>
+        <button class="paper-action primary button-reset" type="submit"><span>CERTIFY ONBOARDING COMPLETE</span><small>FINAL S-1 REPRESENTATIVE CERTIFICATION</small></button>
+      </form>
+      <div class="replacement-status-board processing-status-board">
+        {% for row in recent[:12] %}{% set rt=replacement_map.get(row.id|string) %}
+        <details class="processing-soldier">
+          <summary><span><b>{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</b><small>{{row.platoon or 'PLATOON PENDING'}} • {{row.squad or 'SQUAD PENDING'}}</small></span><strong>{% if rt %}{{'COMPLETE' if rt.complete else 'ACTION REQUIRED'}}{% else %}IN PROCESSING{% endif %}</strong></summary>
+          {% if rt %}<div class="processing-requirements"><div class="processing-progress"><b>{{rt.requirements|selectattr('complete')|list|length}} OF {{rt.requirements|length}} COMPLETE</b><span>{{rt.program_title|upper}}</span></div>{% for req in rt.requirements %}<div class="processing-requirement {{'done' if req.complete else 'missing'}}"><i>{{'✓' if req.complete else '!'}}</i><span><b>{{req.label}}</b><small>{{req.detail}}</small></span>{% if req.code=='S1' and not req.complete %}<form method="post"><input type="hidden" name="action" value="certify_s1_onboarding"><input type="hidden" name="personnel_id" value="{{row.id}}"><button type="submit">CERTIFY NOW</button></form>{% endif %}</div>{% endfor %}{% if rt.complete %}<div class="processing-complete-banner">INITIAL IN-PROCESSING COMPLETE • FILED IN 201 RECORD</div>{% else %}<div class="processing-blocked-banner">CANNOT COMPLETE — FINISH THE ITEMS MARKED ACTION REQUIRED</div>{% endif %}</div>{% endif %}
+        </details>{% endfor %}
+      </div>
+    </article>
+
+
+
+    <article class="document-sheet promotion-recommendation-form">
+      <header class="army-letterhead compact"><small>CHAIN OF COMMAND</small><strong>PROMOTION RECOMMENDATION</strong><span>FOR COMMAND CONSIDERATION</span></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="promotion_recommendation">
+        <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+        <label>RECOMMEND FOR<select name="target_rank" required>{% for r in ranks if r.rank_code not in ['PVT','PV2'] %}<option value="{{r.rank_code}}">{{r.rank_code}} — {{r.rank_name}}</option>{% endfor %}</select></label>
+        <label class="wide">JUSTIFICATION<textarea name="justification" rows="4" placeholder="LEADERSHIP / TECHNICAL PERFORMANCE / FIELD SERVICE"></textarea></label>
+        <button class="paper-action primary button-reset" type="submit"><span>FORWARD RECOMMENDATION</span><small>COMMAND CONSIDERATION REQUIRED</small></button>
+      </form>
+    </article>
+
+    <article class="document-sheet promotion-hold-form">
+      <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>PROMOTION HOLD CONTROL</strong><span>COMMAND / DISCIPLINARY HOLD</span></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="set_promotion_hold">
+        <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+        <label>STATUS<select name="promotion_hold"><option value="1">PLACE ON HOLD</option><option value="0">REMOVE HOLD</option></select></label>
+        <label class="wide">REASON<input name="promotion_hold_reason" placeholder="COMMAND / DISCIPLINARY / ADMINISTRATIVE"></label>
+        <button class="paper-action button-reset" type="submit"><span>FILE HOLD STATUS</span><small>UPDATE PROMOTION WORKSHEET</small></button>
+      </form>
+    </article>
+  </section>
+
+  <article class="document-sheet promotion-eligibility-board">
+    <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>PROMOTION ELIGIBILITY BOARD</strong><span>OBJECTIVE REQUIREMENTS / COMMAND CONSIDERATION</span></header>
+    <div class="promotion-board-head"><span>SOLDIER</span><span>NEXT ACTION</span><span>STATUS</span></div>
+    {% for row in recent %}{% set paths=promotion_map.get(row.id|string,[]) %}{% if paths %}{% for path in paths %}<div class="promotion-board-row"><span><b>{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name[:1]|upper}}.</b><small>{{row.unit_code}}</small></span><span>{{row.rank_code}} → {{path.target}}<small>{{path.title}}</small></span><strong class="{{'eligible' if path.eligible else 'not-eligible'}}">{{path.status}}</strong></div>{% endfor %}{% endif %}{% endfor %}
+  </article>
+
+  <section class="personnel-actions-desk">
+    <article class="document-sheet personnel-action-form">
+      <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>RANK ACTION</strong><span>S-1 PERSONNEL</span></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="rank_action">
+        <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+        <label>NEW RANK<select name="rank_code" required>{% for r in ranks %}<option value="{{r.rank_code}}">{{r.rank_code}} — {{r.rank_name}} ({{r.pay_grade}})</option>{% endfor %}</select></label>
+        <label>EFFECTIVE DATE<input type="date" name="effective_date"></label>
+        <label>AUTHORITY<div class="system-readonly-field">{{staff_authority}} • AUTO FROM LOGIN</div></label>
+        <div class="auto-order-number-field"><small>ORDER NUMBER</small><strong>AUTO-GENERATED ON FILING</strong></div>
+        <label>REMARKS<input name="remarks"></label>
+        <button class="paper-action primary button-reset" type="submit"><span>FILE RANK ACTION</span><small>UPDATE 201 FILE / SERVICE HISTORY</small></button>
+      </form>
+    </article>
+
+    <article class="document-sheet personnel-action-form">
+      <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>APPOINTMENT ACTION</strong><span>S-1 PERSONNEL</span></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="appointment_action">
+        <label>SOLDIER<select name="personnel_id" required>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}}</option>{% endfor %}</select></label>
+        <label>APPOINTMENT<select name="appointment_code" required>{% for a in appointment_catalog %}<option value="{{a.appointment_code}}">{{a.echelon}} — {{a.appointment_name}}{% if a.suggested_rank %} [{{a.suggested_rank}}]{% endif %}</option>{% endfor %}</select></label>
+        <label>ORGANIZATION<select name="appointment_unit_node_id"><option value="">BATTALION / GENERAL</option>{% for n in organization_nodes %}<option value="{{n.id}}">{{n.unit_type|upper}} — {{n.display_name}}</option>{% endfor %}</select></label>
+        <label>STATUS<select name="appointment_status"><option>PERMANENT</option><option>ACTING</option><option>TEMPORARY</option></select></label>
+        <label>EFFECTIVE DATE<input type="date" name="effective_date"></label>
+        <label>AUTHORITY<div class="system-readonly-field">{{staff_authority}} • AUTO FROM LOGIN</div></label>
+        <div class="auto-order-number-field"><small>ORDER NUMBER</small><strong>AUTO-GENERATED ON FILING</strong></div>
+        <label>REMARKS<input name="remarks"></label>
+        <button class="paper-action primary button-reset" type="submit"><span>FILE APPOINTMENT</span><small>UPDATE DUTY ACCESS / 201 FILE</small></button>
+      </form>
+    </article>
+  </section>
+
+
+  <article id="action-suspense" class="document-sheet s1-suspense-board">
+    <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>PERSONNEL ACTION SUSPENSE BOARD</strong><span>DUE DATES / OVERDUE CONTROL</span></header>
+    <p class="form-note">Personnel actions with suspense dates remain on this board until completed, closed, or denied. Battalion Clerk can remind staff as the due date approaches and after it becomes overdue.</p>
+    <div class="suspense-head"><span>SOLDIER / ACTION</span><span>SECTION</span><span>DUE</span><span>STATUS</span></div>
+    {% for a in s1_suspense %}<div class="suspense-row {{'overdue' if a.days_remaining is not none and a.days_remaining < 0 else 'due-soon' if a.days_remaining is not none and a.days_remaining <= 2 else ''}}"><span><b>{% if a.last_name %}{{a.rank_code}} {{a.last_name|upper}}, {{a.first_name[:1]|upper}}. — {% endif %}{{a.subject}}</b><small>{{a.action_type}} • {{a.priority}}</small></span><span>{{a.owning_section}}</span><span>{{a.due_date or 'NO SUSPENSE'}}{% if a.days_remaining is not none %}<small>{% if a.days_remaining < 0 %}{{0-a.days_remaining}} DAYS OVERDUE{% elif a.days_remaining == 0 %}DUE TODAY{% else %}{{a.days_remaining}} DAYS{% endif %}</small>{% endif %}</span><span>{{a.status}}</span></div>{% else %}<p class="typed-empty">NO OPEN S-1 ACTIONS WITH SUSPENSE DATES.</p>{% endfor %}
+    <a class="paper-action" href="{{url_for('personnel_actions')}}"><span>OPEN PERSONNEL ACTION DESK</span><small>CREATE / ASSIGN SUSPENSE DATES</small></a>
+  </article>
+
+  <article id="inactivity-control" class="document-sheet inactivity-control-board">
+    <header class="army-letterhead compact"><small>S-1 PERSONNEL / S-4 PROPERTY ACCOUNTABILITY</small><strong>INACTIVITY CONTROL BOARD</strong><span>MEMBER ACCOUNTABILITY • M16 NEGLECT • COMMAND ESCALATION</span></header>
+    <div class="inactivity-count-grid">{% for label in ['CURRENT','WATCH','DEFICIENT','INACTIVE','COMMAND REVIEW','EXCUSED ABSENCE'] %}<span><small>{{label}}</small><b>{{inactivity_counts.get(label,0)}}</b></span>{% endfor %}</div>
+    <p class="form-note">QUALIFYING ACTIVITY: APPROVED DISCORD ACTIVITY VOICE, OFFICIAL TRAINING, OPERATION OR MEETING CREDIT. SIMPLY OPENING THE WEBSITE DOES NOT RESET THIS CLOCK. AUTHORIZED ABSENCE PAUSES READINESS AND M16 NEGLECT PENALTIES.</p>
+    <div class="inactivity-table head"><span>SOLDIER</span><span>LAST ACTIVITY</span><span>STATUS</span><span>M16</span><span>LAST CONTACT</span></div>
+    {% for item in inactivity_board %}{% set p=item.person %}{% set st=item.status %}
+    <details class="inactivity-soldier {{st.state|lower|replace(' ','-')}}">
+      <summary class="inactivity-table"><span><b>{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name[:1]|upper}}.</b><small>{{p.platoon or 'NO PLATOON'}} • {{p.squad or 'NO SQUAD'}}</small></span><span>{{st.last_activity or 'NO RECORD'}}<small>{{st.source}}</small></span><span><b>{{st.state}}</b><small>{% if st.excused %}CLOCK PAUSED{% else %}{{st.days}} DAYS{% endif %}</small></span><span>{% if item.weapon %}{{item.weapon.serial_number}}<small>RACK {{item.weapon.rack_number}}</small>{% else %}NOT ISSUED{% endif %}</span><span>{% if st.latest_contact %}{{st.latest_contact.contacted_at.date()}}<small>{{st.latest_contact.contacted_by}}</small>{% else %}NO CONTACT FILED{% endif %}</span></summary>
+      <div class="inactivity-actions-grid">
+        <form method="post" class="army-form-grid"><input type="hidden" name="action" value="inactivity_contact"><input type="hidden" name="personnel_id" value="{{p.id}}"><label>CONTACT METHOD<select name="contact_method"><option>DISCORD</option><option>VOICE</option><option>DM</option><option>OTHER</option></select></label><label class="wide">CONTACT NOTES<input name="notes" placeholder="CONTACTED / RESPONSE / FOLLOW-UP"></label><button class="paper-action button-reset" type="submit"><span>MARK CONTACTED</span><small>FILE CONTACT HISTORY</small></button></form>
+        <form method="post" class="army-form-grid"><input type="hidden" name="action" value="inactivity_leave"><input type="hidden" name="personnel_id" value="{{p.id}}"><label>ABSENCE START<input type="date" name="loa_start_date" value="{{s1_today}}"></label><label>EXPECTED RETURN<input type="date" name="loa_expected_return_date"></label><label class="wide">REASON / REMARKS<input name="notes" placeholder="WORK / MILITARY / FAMILY / VACATION / OTHER"></label><button class="paper-action button-reset" type="submit"><span>EXCUSE ABSENCE</span><small>PAUSE INACTIVITY / M16 CLOCK</small></button></form>
+        <form method="post"><input type="hidden" name="action" value="inactivity_return"><input type="hidden" name="personnel_id" value="{{p.id}}"><button class="paper-action button-reset" type="submit"><span>RETURN TO ACTIVE</span><small>RESUME ACCOUNTABILITY CLOCK</small></button></form>
+        <form method="post"><input type="hidden" name="action" value="inactivity_refer"><input type="hidden" name="personnel_id" value="{{p.id}}"><input name="notes" placeholder="COMMAND / PROPERTY REVIEW REMARKS"><button class="paper-action danger button-reset" type="submit"><span>REFER TO COMMAND</span><small>OPEN PROPERTY ACCOUNTABILITY ACTION</small></button></form>
+      </div>
+    </details>{% endfor %}
+  </article>
+
+  <article class="s1-roster-sheet document-sheet">
+    <header><span>PERSONNEL STRENGTH: {{counts.total or 0}}</span><b>BATTALION PERSONNEL ROSTER</b><small>READY: {{counts.ready or 0}}</small></header>
+    <div class="s1-roster-head"><span>SOLDIER</span><span>ASSIGNMENT</span><span>BATTLE ROSTER</span><span>INDIVIDUAL WEAPON</span><span>ACTION</span></div>
+    {% for row in recent %}
+    <div class="s1-roster-row"><span><button type="button" class="s1-roster-soldier-button" data-soldier-action-url="{{url_for('staff_personnel_drawer',personnel_id=row.id)}}"><b>{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name[:1]|upper}}.</b><small>{{row.service_number or 'NO SERVICE NO.'}}</small></button></span><span>{{row.unit_code}}<small>{{row.platoon or ''}} {{row.squad or ''}}</small></span><span>{% set c=card_map.get(row.id|string) %}{{c.roster_number if c else 'NOT ISSUED'}}{% set aps=appointment_map.get(row.id|string,[]) %}{% if aps %}<small>{% for ap in aps %}{{ap.appointment_name}}{% if not loop.last %} / {% endif %}{% endfor %}</small>{% endif %}</span><span>{% set w=weapon_map.get(row.id|string) %}{% if w %}M16 {{w.serial_number}}<small>RACK {{w.rack_number}}</small>{% else %}NOT ISSUED{% endif %}</span><span class="s1-actions"><form method="post"><input type="hidden" name="action" value="issue_credentials"><input type="hidden" name="personnel_id" value="{{row.id}}"><button type="submit">CHECK / ISSUE</button></form>{% if c %}<form method="post"><input type="hidden" name="action" value="reset_field_code"><input type="hidden" name="personnel_id" value="{{row.id}}"><button type="submit">NEW FIELD CODE</button></form>{% endif %}</span></div>
+    {% else %}<p class="typed-empty">NO PERSONNEL RECORDS ON FILE.</p>{% endfor %}
+  </article>
+</section>
+{% endblock %}

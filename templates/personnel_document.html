@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block title %}{{doc.document_number}} • {{site_name}}{% endblock %}
+{% block body_class %}page-official-order{% endblock %}
+{% block content %}
+<section class="official-order-room">
+  {% if doc.document_type == 'REPLACEMENT' %}
+  <article class="vietnam-order-document" aria-label="Orders to Vietnam">
+    <svg class="vietnam-order-svg" viewBox="0 0 1576 998" role="img" aria-label="Orders to Vietnam for {{doc.last_name|upper}}, {{doc.first_name}}">
+      <image href="{{ url_for('static', filename='art/vietnam-orders-template-transparent.webp') }}" x="0" y="0" width="1576" height="998" preserveAspectRatio="xMidYMid meet"/>
+      <g class="contract-typed-fields">
+        <text x="300" y="274" text-anchor="middle" class="contract-value contract-number">{{doc.document_number}}</text>
+        <text x="650" y="274" text-anchor="middle" class="contract-value contract-date">{{doc.rank_issue_date.strftime('%d %B %Y') if doc.rank_issue_date else ''}}</text>
+
+        <text x="225" y="392" text-anchor="middle" class="contract-label">GRADE</text>
+        <text x="330" y="392" text-anchor="middle" class="contract-label">MOS</text>
+        <text x="500" y="392" text-anchor="middle" class="contract-label">NAME</text>
+        <text x="700" y="392" text-anchor="middle" class="contract-label">RA NUMBER</text>
+        <text x="225" y="419" text-anchor="middle" class="contract-value">{{doc.display_rank}}</text>
+        <text x="330" y="419" text-anchor="middle" class="contract-value">{{doc.display_mos}}</text>
+        <text x="500" y="419" text-anchor="middle" class="contract-value contract-name">{{doc.last_name|upper}}, {{doc.first_name[:1]|upper}}.</text>
+        <text x="700" y="419" text-anchor="middle" class="contract-value contract-roster">{{doc.display_roster}}</text>
+
+        <text x="955" y="214" text-anchor="middle" class="contract-value contract-right-number">{{doc.document_number}}</text>
+        <text x="1190" y="244" text-anchor="middle" class="contract-value contract-right-date">{{doc.rank_issue_date.strftime('%d %B %Y') if doc.rank_issue_date else ''}}</text>
+        <text x="878" y="350" text-anchor="middle" class="contract-label contract-label-small">GRADE</text>
+        <text x="963" y="350" text-anchor="middle" class="contract-label contract-label-small">MOS</text>
+        <text x="1080" y="350" text-anchor="middle" class="contract-label contract-label-small">NAME</text>
+        <text x="1240" y="350" text-anchor="middle" class="contract-label contract-label-small">RA NUMBER</text>
+        <text x="878" y="375" text-anchor="middle" class="contract-value contract-value-small">{{doc.display_rank}}</text>
+        <text x="963" y="375" text-anchor="middle" class="contract-value contract-value-small">{{doc.display_mos}}</text>
+        <text x="1080" y="375" text-anchor="middle" class="contract-value contract-value-small contract-name">{{doc.last_name|upper}}, {{doc.first_name[:1]|upper}}.</text>
+        <text x="1240" y="375" text-anchor="middle" class="contract-value contract-value-small contract-roster">{{doc.display_roster}}</text>
+        <text x="1088" y="704" text-anchor="middle" class="contract-value contract-routing-date" transform="rotate(4 1088 704)">{{doc.rank_issue_date.strftime('%d %b %y')|upper if doc.rank_issue_date else ''}}</text>
+      </g>
+    </svg>
+  </article>
+  <div class="document-status-stamp">{{doc.workflow_status or 'FILED'}}</div>
+  <article class="order-record-caption document-sheet">
+    <header><small>S-1 PERSONNEL</small><b>{{doc.title}}</b></header>
+    <p>{{doc.body_text}}</p>
+    <dl><dt>GRADE</dt><dd>{{doc.display_rank}}</dd><dt>BATTLEFIELD MOS</dt><dd>{{doc.display_mos}} — {{doc.duty_position}}</dd><dt>BATTLE ROSTER NO.</dt><dd>{{doc.display_roster}}</dd><dt>DATE RANK ISSUED</dt><dd>{{doc.rank_issue_date}}</dd></dl>
+  </article>
+  {% else %}
+  <article class="official-order-sheet"><div class="document-status-stamp">{{doc.workflow_status or 'FILED'}}</div>
+    <header class="official-order-letterhead"><small>DEPARTMENT OF THE ARMY</small><strong>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY REGIMENT</strong><span>1ST CAVALRY DIVISION (AIRMOBILE)</span></header>
+    <div class="official-order-meta"><span>{{doc.document_number}}</span><span>{{doc.effective_date}}</span></div>
+    <h1>{{doc.title}}</h1>
+    <dl class="official-order-person"><dt>SOLDIER</dt><dd>{{doc.rank_code}} {{doc.last_name|upper}}, {{doc.first_name}}</dd><dt>SERVICE NO.</dt><dd>{{doc.service_number or 'PENDING'}}</dd><dt>ORGANIZATION</dt><dd>{{doc.unit_code}}{% if doc.platoon %} • {{doc.platoon}}{% endif %}{% if doc.squad %} • {{doc.squad}}{% endif %}</dd></dl>
+    <p class="official-order-body">{{doc.body_text}}</p>
+    <div class="official-order-authority"><b>{{doc.by_order_of or 'BY ORDER OF THE BATTALION COMMANDER'}}</b><br>{{doc.signature_block or doc.authority or 'HEADQUARTERS'}}</div>
+    <div class="official-order-filed">FILED<br>S-1</div>
+  </article>
+  {% endif %}
+</section>
+{% endblock %}

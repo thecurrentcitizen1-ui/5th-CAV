@@ -1,0 +1,34 @@
+{% extends 'base.html' %}
+{% block title %}{{section}} • {{site_name}}{% endblock %}
+{% block body_class %}page-staff page-{{section_code}}{% endblock %}
+{% block content %}
+<section class="staff-section-hero"><div class="staff-photo"></div><div class="staff-shade"></div><div class="staff-sign"><span>HEADQUARTERS STAFF SECTION</span><h1>{{section}}</h1><p>{{subtitle}}</p></div></section>
+<section class="field-desk-launcher">
+  <div class="field-desk-shortcuts staff-shortcuts">
+    <a href="{{url_for('staff_workload_page',section='S-3' if section_code=='s3' else ('S-4' if section_code=='s4' else ('S-1' if section_code=='s1' else section_code|upper)))}}">WORKLOAD DESK</a>
+    {% if section_code == 's3' %}<a href="{{url_for('operations')}}">OPERATIONS MAP</a><a href="{{url_for('training')}}">TRAINING LEDGER</a>{% endif %}
+    {% if section_code == 's4' %}<a href="{{url_for('supply')}}">ARMS ROOM LEDGER</a>{% endif %}
+    {% if section_code == 's1' %}<a href="{{url_for('personnel_actions')}}">PERSONNEL ACTIONS</a><a href="{{url_for('morning_report')}}">MORNING REPORT</a>{% endif %}
+  </div>
+</section>
+<section class="staff-workload-strip document-sheet"><span>SECTION WORKLOAD</span><b>{{workload.counts.open or 0}} OPEN</b><b>{{workload.counts.urgent or 0}} HIGH PRIORITY</b><b class="{{'attention' if workload.overdue_count else ''}}">{{workload.overdue_count}} OVERDUE</b></section>
+<section class="staff-workspace">
+  <article class="staff-status document-sheet"><header class="army-letterhead compact"><small>STAFF SECTION</small><strong>{{section}}</strong><span>SECTION STATUS</span></header>{% if counts %}<dl class="form-grid"><dt>TOTAL RECORDS</dt><dd>{{counts.total or 0}}</dd><dt>READY / CURRENT</dt><dd>{{counts.ready or 0}}</dd></dl>{% else %}<p>SECTION ONLINE. AUTHORIZED WORKING TOOLS ATTACH HERE WITHOUT CHANGING PROTECTED BACKEND IDENTIFIERS.</p>{% endif %}<div class="ink-stamp small">AUTHORIZED</div></article>
+  <aside class="staff-inbox"><div class="manila-tab">INCOMING</div><h3>SECTION WORK</h3><p>Pending requests, notes and workflow actions remain part of the existing protected system as those functions are connected.</p></aside>
+<a class="record-paper-link" href="{{url_for('personnel_actions')}}">OPEN SECTION ACTION QUEUE →</a></section>
+
+{% if section_code == 's3' %}
+<section class="staff-workspace s3-board">
+  <article class="document-sheet"><header class="army-letterhead compact"><small>S-3 OPERATIONS</small><strong>OPERATIONS STATUS BOARD</strong><span>PLANNING → PUBLISHED → ACTIVE → CLOSED → AAR FILED</span></header>
+  {% for op in operation_board %}<form method="post" action="{{url_for('operation_lifecycle_action',operation_id=op.id)}}" class="action-ledger-row"><div><small>{{op.operation_number or op.operation_code}}</small><b>{{op.title}}</b><span>{{op.lifecycle_status or op.status}}</span></div><button name="action" value="PUBLISH">PUBLISH</button><button name="action" value="START">START</button><button name="action" value="CLOSE">CLOSE</button><button name="action" value="FILE_AAR">FILE AAR</button></form>{% else %}<p class="typed-empty">NO OPERATIONS ARE CURRENTLY ON THE BOARD.</p>{% endfor %}
+  <a class="record-paper-link" href="{{url_for('operations')}}">OPEN FULL S-3 OPERATIONS LEDGER →</a></article>
+  <article class="document-sheet"><header><small>S-3 TRAINING</small><b>TRAINING DEFICIENCIES</b></header>{% for d in deficiencies[:20] %}<div class="entry-row"><span>{{d.rank_code}} {{d.last_name|upper}}, {{d.first_name}}</span><b>{{d.display_name}}</b><small>{{d.status}}{% if d.expiration_date %} • {{d.expiration_date}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO TRAINING DEFICIENCIES ARE CURRENTLY FILED.</p>{% endfor %}</article>
+</section>
+{% elif section_code == 's4' %}
+<section class="staff-workspace s4-board"><article class="document-sheet"><header class="army-letterhead compact"><small>S-4 ARMS ROOM</small><strong>14-DAY WEAPON INSPECTION BOARD</strong><span>OVERDUE / DUE FOR INSPECTION</span></header>
+{% for w in due_weapons %}<form method="post" action="{{url_for('weapon_inspection_action')}}" class="action-ledger-row"><input type="hidden" name="weapon_id" value="{{w.weapon_id}}"><input type="hidden" name="personnel_id" value="{{w.personnel_id}}"><div><small>{{w.rank_code}} {{w.last_name|upper}}, {{w.first_name}}</small><b>M16 {{w.serial_number}} • RACK {{w.rack_number}}</b><span>LAST INSPECTION {{w.last_inspected_at.date() if w.last_inspected_at else 'NO ENTRY'}}</span></div><select name="condition_state"><option>SERVICEABLE</option><option>FIELD WORN</option><option>CLEANING REQUIRED</option><option>MAINTENANCE REQUIRED</option><option>UNSERVICEABLE</option></select><input type="date" name="next_due_date"><input name="remarks" placeholder="Inspection remarks"><button type="submit">FILE INSPECTION</button></form>{% else %}<p class="typed-empty">ALL ISSUED WEAPONS ARE CURRENT ON INSPECTION.</p>{% endfor %}
+<a class="record-paper-link" href="{{url_for('supply')}}">OPEN PROPERTY BOOK / SUPPLY CONTROL →</a></article></section>
+{% endif %}
+
+{% if recent %}<section class="recent-ledger document-sheet"><header><small>ADMINISTRATIVE JOURNAL</small><b>RECENT RECORDS</b></header>{% for row in recent %}<div class="entry-row"><span>{{row.title or row.last_name or row.operation_code}}</span><b>{{row.status or row.rank_code or ''}}</b></div>{% endfor %}</section>{% endif %}
+{% endblock %}

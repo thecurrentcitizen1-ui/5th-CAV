@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block title %}Battle Roster Card • {{site_name}}{% endblock %}
+{% block body_class %}page-battle-roster{% endblock %}
+{% block content %}
+<section class="battle-roster-room">
+  <div class="battle-card-wrap">
+    <article class="battle-card-full">
+      <div class="battle-card-punch"></div>
+      <header><small>HEADQUARTERS</small><strong>1ST BATTALION, 5TH CAVALRY</strong><span>1ST CAVALRY DIVISION (AIRMOBILE)</span></header>
+      <h1>BATTLE ROSTER CARD</h1>
+      {% if personnel and roster_card %}
+      <dl><dt>NAME</dt><dd>{{personnel.last_name|upper}}, {{personnel.first_name|upper}}</dd><dt>RANK</dt><dd>{{personnel.rank_code}}</dd><dt>SERVICE NO.</dt><dd>{{personnel.service_number}}</dd><dt>UNIT</dt><dd>{{personnel.unit_code}}</dd><dt>PLATOON</dt><dd>{{personnel.platoon or 'NO ENTRY'}}</dd><dt>SQUAD</dt><dd>{{personnel.squad or 'NO ENTRY'}}</dd><dt>DUTY</dt><dd>{{personnel.duty_position or personnel.mos_code}}</dd><dt>ROSTER NO.</dt><dd class="roster-number-large">{{roster_card.roster_number}}</dd><dt>DATE ISSUED</dt><dd>{{roster_card.issued_at.date()}}</dd></dl>
+      <p class="battle-card-note">FIELD CODE IS ISSUED SEPARATELY AND IS NOT PRINTED ON THIS CARD.</p>
+      {% endif %}
+      <footer>PROPERTY OF 1ST BATTALION, 5TH CAVALRY • PRESENT WHEN REPORTING FOR DUTY</footer>
+    </article>
+  </div>
+</section>
+{% endblock %}

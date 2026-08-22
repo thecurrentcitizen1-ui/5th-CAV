@@ -1,0 +1,43 @@
+{% extends 'base.html' %}
+{% block title %}5th Cavalry • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-about-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--about">
+  <img src="{{url_for('static',filename='art/public-overhaul/tour-in-country.webp')}}" alt="Soldiers moving through jungle terrain in Vietnam">
+  <div class="public-section-hero__shade"></div>
+  <div><small>1ST BATTALION • 5TH CAVALRY REGIMENT</small><h1>THE FIRST TEAM</h1><p>Hell Let Loose: Vietnam built as a persistent battalion experience around the Soldier—not a disposable Discord rank.</p></div>
+</section>
+<section class="public-office-board">
+  <div class="about-ledger-grid">
+    <article class="public-office-paper"><small>THE BATTALION</small><h2>1ST BATTALION, 5TH CAVALRY REGIMENT</h2><p>The community is organized as a functioning battalion headquarters with personnel, operations, training, logistics, awards and unit formations connected through one website system.</p></article>
+    <article class="public-office-paper"><small>THE FORMATION</small><h2>YOU JOIN A UNIT WITH CONTINUITY.</h2><p>Company, platoon, squad, MOS, duty position and leadership appointments are recorded assignments. The unit structure is part of the experience, not decoration.</p><a href="{{url_for('organization')}}">VIEW UNITS →</a></article>
+  </div>
+
+  <section class="about-field-photo">
+    <img loading="lazy" src="{{url_for('static',filename='art/public-overhaul/squad-field.webp')}}" alt="Squad operating together in Vietnam jungle">
+    <div><small>SMALL-UNIT SERVICE</small><h2>YOUR SQUAD SHOULD MATTER.</h2><p>Operations, training and leadership are experienced through the formation you actually serve in.</p></div>
+  </section>
+
+  <section id="tour" class="tour-process-board">
+    <header><small>RECORD OF ACTIVE SERVICE</small><h2>YOUR TOUR OF DUTY</h2></header>
+    <div><b>01</b><span>RECRUITING CASE</span></div><i>→</i>
+    <div><b>02</b><span>REPLACEMENT DETACHMENT</span></div><i>→</i>
+    <div><b>03</b><span>TRAINING &amp; ISSUE</span></div><i>→</i>
+    <div><b>04</b><span>UNIT ASSIGNMENT</span></div><i>→</i>
+    <div><b>05</b><span>FIELD SERVICE</span></div>
+  </section>
+
+  <section class="public-system-manifest">
+    {% for title,copy in [
+      ('PERSONNEL','201 File, rank, MOS, assignments, actions and service history.'),
+      ('OPERATIONS','Website-scheduled events, attendance, field credit and AAR history.'),
+      ('TRAINING','Schools, qualifications, instructors and completion records.'),
+      ('LOGISTICS','Issued M16s, serials, rounds, fouling, cleaning and inspections.'),
+      ('HONORS','Ribbons, medals, citations and existing uniform display logic.'),
+      ('TOUR','Arrival, milestones, leadership, awards and accumulated service.')
+    ] %}<article><h3>{{title}}</h3><p>{{copy}}</p></article>{% endfor %}
+  </section>
+
+  <section class="public-personnel-cta"><div><small>THE STANDARD</small><h2>CHARLIE WON'T WAIT.<br>NEITHER SHOULD YOU.</h2><p>If you want a community where the time you put in leaves an actual record, report to the Recruiting &amp; Replacement Detachment.</p></div><a href="{{url_for('recruiting')}}">ENLIST WITH THE 1/5 CAV</a></section>
+</section>
+{% endblock %}

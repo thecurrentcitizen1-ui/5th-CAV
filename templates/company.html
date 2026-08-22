@@ -1,0 +1,26 @@
+{% extends 'base.html' %}
+{% block title %}Company Orderly Room • {{site_name}}{% endblock %}
+{% block body_class %}page-company phase5-company{% endblock %}
+{% block content %}
+<section class="company-area"><div class="company-photo"></div><div class="company-shade"></div><div class="company-sign"><span>COMPANY ORDERLY ROOM</span><h1>{{unit.display_name if unit else 'UNIT NOT FOUND'}}</h1><p>1ST BATTALION, 5TH CAVALRY REGIMENT</p></div></section>
+
+{% if unit %}
+<section class="company-office">
+  <article class="company-command-board">
+    <header><small>COMPANY HEADQUARTERS</small><h2>CHAIN OF COMMAND</h2></header>
+    <div class="command-lines">
+      <div><span>COMMANDING OFFICER</span><b>{% if leadership.co %}{{leadership.co.rank_code}} {{leadership.co.last_name|upper}}, {{leadership.co.first_name[:1]}}.{% else %}VACANT{% endif %}</b></div>
+      <div><span>EXECUTIVE OFFICER</span><b>{% if leadership.xo %}{{leadership.xo.rank_code}} {{leadership.xo.last_name|upper}}, {{leadership.xo.first_name[:1]}}.{% else %}VACANT{% endif %}</b></div>
+      <div><span>FIRST SERGEANT</span><b>{% if leadership.first_sergeant %}{{leadership.first_sergeant.rank_code}} {{leadership.first_sergeant.last_name|upper}}, {{leadership.first_sergeant.first_name[:1]}}.{% else %}VACANT{% endif %}</b></div>
+    </div>
+  </article>
+
+  <article class="company-roster document-sheet">
+    <header class="army-letterhead compact"><small>COMPANY ROSTER</small><strong>{{unit.display_name}}</strong><span>PERSONNEL ASSIGNMENT</span></header>
+    <div class="platoon-directory">{% for p in platoons %}<a href="{{url_for('platoon',unit_code=p.unit_code)}}">{{p.display_name|upper}}<small>OPEN PLATOON ROSTER</small></a>{% endfor %}</div>
+    <div class="roster-table header"><span>NAME</span><span>RANK</span><span>PLATOON</span><span>SQUAD</span><span>DUTY</span></div>
+    {% for row in roster %}<div class="roster-table"><span>{{row.last_name|upper}}, {{row.first_name[:1]|upper}}.</span><span>{{row.rank_code}}</span><span>{{row.platoon or 'HQ'}}</span><span>{{row.squad or '—'}}</span><span>{{row.duty_position or row.mos_code}}</span></div>{% else %}<p class="typed-empty">NO PERSONNEL ARE CURRENTLY ASSIGNED TO THIS COMPANY RECORD.</p>{% endfor %}
+  </article>
+</section>
+{% endif %}
+{% endblock %}

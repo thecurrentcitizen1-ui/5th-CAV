@@ -1,0 +1,53 @@
+{% extends 'base.html' %}
+{% block title %}Recruiting Case {{case.case_number}} • {{site_name}}{% endblock %}
+{% block body_class %}page-recruiting public-recruiting-1966 recruiting-status-page{% endblock %}
+{% block content %}
+{% set s=case.status %}
+{% set step = 1 if not case.discord_user_id else 2 %}
+{% if s in ['SUBMITTED','DISCORD_VERIFIED','PENDING_COMMAND','MORE_INFO_REQUIRED'] %}{% set step=3 %}{% endif %}
+{% if s in ['APPROVED_AWAITING_DISCORD','REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'] %}{% set step=4 %}{% endif %}
+{% if s == 'ENLISTED' %}{% set step=5 %}{% endif %}
+<section class="recruiting-office-intro recruiting-status-intro">
+  <img class="recruiting-office-intro__image" src="{{url_for('static',filename='art/public-overhaul/airmobile-operations.webp')}}" alt="1/5 Cavalry airmobile operations">
+  <div class="recruiting-office-intro__shade"></div>
+  <div><small>RECRUITING &amp; REPLACEMENT DETACHMENT</small><h1>RECRUITING CASE</h1><h2>{{case.case_number}}</h2><p>PERSONNEL ROUTING STATUS</p></div>
+</section>
+<section class="recruit-route-slip">
+  {% for n,label in [(1,'VERIFY IDENTITY'),(2,'FILE APPLICATION'),(3,'COMMAND REVIEW'),(4,'REPLACEMENT DETACHMENT'),(5,'REPORT FOR DUTY')] %}
+  <div class="{% if n < step %}complete{% elif n == step %}current{% endif %}"><b>{{n}}</b><span>{{label}}</span>{% if n < step %}<i>COMPLETE</i>{% elif n == step %}<i>CURRENT</i>{% endif %}</div>{% if not loop.last %}<em>→</em>{% endif %}
+  {% endfor %}
+</section>
+<section class="recruit-status-shell">
+  <article class="document-sheet recruit-status-paper">
+    <header class="army-letterhead"><small>HEADQUARTERS • REPLACEMENT DETACHMENT</small><strong>RECRUITING CASE RECEIPT</strong><span>{{case.case_number}}</span></header>
+    <div class="recruit-case-status"><small>CURRENT STATUS</small><strong>{{case.status|replace('_',' ')}}</strong></div>
+    <dl class="recruit-case-grid">
+      <dt>CASE NUMBER</dt><dd>{{case.case_number}}</dd>
+      <dt>DISCORD IDENTITY</dt><dd>{{case.discord_verified_username or case.discord_username_input or 'PENDING'}}</dd>
+      <dt>IDENTITY STATUS</dt><dd>{% if case.discord_user_id %}VERIFIED{% else %}NOT VERIFIED{% endif %}</dd>
+      <dt>SUBMITTED</dt><dd>{{case.created_at}}</dd>
+    </dl>
+    {% if case.discord_user_id %}<div class="rules-filed-stamp">DISCORD IDENTITY<br>VERIFIED</div>{% endif %}
+
+    {% if case.discord_user_id and 'guilds.join' not in (case.discord_oauth_scope or '') and case.status not in ['DENIED','CLOSED','ENLISTED'] %}
+    <section class="oauth-next-step"><small>BATTALION COMMUNICATIONS</small><h2>REFRESH DISCORD AUTHORIZATION</h2><p>Your Discord identity is verified, but this case predates automatic server entry. Reconnect Discord once so Battalion Clerk can add your account automatically if Headquarters approves the application.</p><a class="paper-action primary" href="{{url_for('recruiting_case_discord_connect',token=case.public_token)}}"><span>AUTHORIZE AUTOMATIC DISCORD ENTRY</span><small>UPDATE THIS RECRUITING CASE</small></a></section>
+    {% elif case.discord_user_id and case.status not in ['DENIED','CLOSED','ENLISTED'] %}
+    <section class="oauth-next-step"><small>BATTALION COMMUNICATIONS</small><h2>DISCORD ENTRY AUTHORIZED</h2><p>No invite link is required. If Headquarters approves this case, Battalion Clerk will add this verified Discord account to the 1/5 Cav server automatically and deliver your website login information by direct message.</p></section>
+    {% endif %}
+
+    {% if case.status in ['PENDING_COMMAND','DISCORD_VERIFIED','SUBMITTED'] %}
+    <section class="recruit-pending"><small>BATTALION HEADQUARTERS</small><h2>APPLICATION ON FILE</h2><p>Your application is awaiting Headquarters review. No private command notes are displayed on this public case receipt.</p></section>
+    {% endif %}
+    {% if case.status == 'MORE_INFO_REQUIRED' %}
+    <section class="recruit-more-info"><small>HEADQUARTERS REQUEST</small><h2>MORE INFORMATION REQUIRED</h2><p>{{case.command_request}}</p><form method="post"><label>YOUR RESPONSE<textarea name="applicant_response" rows="6" required>{{case.applicant_response or ''}}</textarea></label><button class="paper-action primary" type="submit"><span>RETURN RESPONSE</span><small>FORWARD TO COMMAND</small></button></form></section>
+    {% endif %}
+    {% if case.status == 'APPROVED_AWAITING_DISCORD' %}<section class="recruit-more-info"><small>BATTALION HEADQUARTERS</small><h2>APPLICATION APPROVED — VERIFY DISCORD</h2><p>Headquarters approved your application. Verify your Discord identity so the website can open the correct Replacement Detachment record.</p><a class="paper-action primary" href="{{url_for('recruiting_case_discord_connect',token=case.public_token)}}"><span>VERIFY DISCORD IDENTITY</span><small>CONTINUE PROCESSING</small></a></section>{% endif %}
+    {% if case.status in ['REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'] %}<section class="recruit-approved"><small>S-1 PERSONNEL</small><h2>REPLACEMENT DETACHMENT</h2><p>Your application is approved. Battalion Clerk is processing automatic Discord entry, Replacement Depot status, your 201 File, and delivery of your Battle Roster Number and Field Code. Once complete, S-1 can process MOS, initial issue, training and permanent formation assignment from the website.</p></section>{% endif %}
+    {% if case.discord_join_error and case.status in ['REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'] %}<section class="recruit-more-info"><small>BATTALION COMMUNICATIONS</small><h2>DISCORD ENTRY NEEDS ATTENTION</h2><p>{{case.discord_join_error}}</p><a class="paper-action primary" href="{{url_for('recruiting_case_discord_connect',token=case.public_token)}}"><span>RECONNECT DISCORD AUTHORIZATION</span><small>RETRY AUTOMATIC ENTRY</small></a></section>{% endif %}
+    {% if case.credentials_delivery_error and not case.credentials_sent_at %}<section class="recruit-more-info"><small>BATTALION CLERK</small><h2>LOGIN MESSAGE COULD NOT BE DELIVERED</h2><p>{{case.credentials_delivery_error}}. Enable direct messages from server members and Battalion Clerk will retry automatically.</p></section>{% endif %}
+    {% if case.status == 'ENLISTED' %}<section class="recruit-approved"><small>S-1 PERSONNEL</small><h2>REPORT FOR DUTY</h2><p>Your Recruiting Case has completed processing into active battalion personnel. Use the roster credentials issued for your Soldier Record.</p><a class="paper-action primary" href="{{url_for('my_soldier_record')}}"><span>OPEN MEMBER ACCESS</span><small>REPORT FOR DUTY</small></a></section>{% endif %}
+    {% if case.status == 'DENIED' %}<section class="recruit-denied"><small>BATTALION HEADQUARTERS</small><h2>APPLICATION CLOSED</h2><p>Your application was not approved at this time.</p></section>{% endif %}
+    <p class="recruit-bookmark">Bookmark this page until processing is complete. Internal Command notes are never displayed here.</p>
+  </article>
+</section>
+{% endblock %}

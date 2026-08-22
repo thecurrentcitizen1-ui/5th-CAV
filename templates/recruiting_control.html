@@ -1,0 +1,72 @@
+{% extends 'base.html' %}
+{% block title %}Recruiting Control • {{site_name}}{% endblock %}
+{% block body_class %}page-recruiting-control{% endblock %}
+{% block content %}
+<section class="command-hq-hero recruiting-control-hero"><div class="command-hq-hero-shade"></div><div class="command-hq-title"><small>HEADQUARTERS • REPLACEMENT CONTROL</small><h1>RECRUITING CONTROL</h1><p>Applications remain Recruiting Cases until Discord identity is verified, Command approves the applicant, and battalion processing converts the case into a Soldier record.</p></div></section>
+<section class="recruit-control-shell">
+  <div class="recruit-control-stats"><article><small>NEW / REVIEW</small><strong>{{(counts.get('SUBMITTED',0)+counts.get('PENDING_COMMAND',0)+counts.get('DISCORD_VERIFIED',0))}}</strong></article><article><small>MORE INFO</small><strong>{{counts.get('MORE_INFO_REQUIRED',0)}}</strong></article><article><small>REPLACEMENT DEPOT</small><strong>{{counts.get('REPLACEMENT_DEPOT',0)+counts.get('APPROVED_AWAITING_PROCESSING',0)+counts.get('APPROVED_AWAITING_DISCORD',0)}}</strong></article><article><small>ENLISTED</small><strong>{{counts.get('ENLISTED',0)}}</strong></article></div>
+  <nav class="recruit-control-tabs"><a href="#discord-intake">DISCORD INTAKE</a><a href="{{url_for('prospective_replacements')}}">FULL PROSPECTIVE ROSTER</a><a href="#active">ACTIVE APPLICATIONS</a><a href="#approved">REPLACEMENT DEPOT</a><a href="#closed">CLOSED FILES</a></nav>
+
+  <section id="discord-intake" class="recruit-case-board discord-intake-board">
+    <header>
+      <small>LIVE DISCORD INTAKE</small>
+      <h2>PROSPECTIVE REPLACEMENTS — DISCORD FIRST</h2>
+      <p>These members are currently in Discord but do not yet have an official website personnel record. Adopt a Discord-first member into Recruiting Control here.</p>
+    </header>
+
+    <div class="discord-intake-summary">
+      <span><b>{{prospective_counts.total}}</b> WAITING</span>
+      <span><b>{{prospective_counts.no_application}}</b> NO APPLICATION</span>
+      <span><b>{{prospective_counts.review}}</b> IN REVIEW</span>
+      <span><b>{{prospective_counts.approved}}</b> APPROVED / DEPOT</span>
+    </div>
+
+    {% for r in prospective_rows %}
+    <article class="document-sheet discord-intake-row">
+      <div class="discord-intake-name">
+        <small>DISCORD MEMBER</small>
+        <strong>{{r.display_name or r.username}}</strong>
+        <span>@{{r.username}}</span>
+      </div>
+      <div><small>JOINED</small><b>{{r.joined_at or r.updated_at}}</b></div>
+      <div><small>CASE</small><b>{{r.case_number or 'NONE FILED'}}</b></div>
+      <div><small>STATUS</small><b>{{r.intake_status}}</b></div>
+      <div class="discord-intake-action">
+        {% if r.case_id %}
+          <a href="{{url_for('recruiting_case_archive',case_id=r.case_id)}}">OPEN RECRUITING CASE</a>
+        {% else %}
+          <form method="post" action="{{url_for('adopt_prospective_replacement')}}">
+            <input type="hidden" name="guild_id" value="{{r.guild_id}}">
+            <input type="hidden" name="discord_user_id" value="{{r.discord_user_id}}">
+            <input type="hidden" name="username" value="{{r.username}}">
+            <input type="hidden" name="display_name" value="{{r.display_name}}">
+            <button type="submit">ADOPT TO RECRUITING CASE</button>
+          </form>
+        {% endif %}
+      </div>
+    </article>
+    {% else %}
+      <p class="command-empty">NO DISCORD-FIRST MEMBERS ARE CURRENTLY WAITING FOR PERSONNEL CONVERSION.</p>
+    {% endfor %}
+  </section>
+
+  <section id="active" class="recruit-case-board"><header><small>COMMAND INBOX</small><h2>ACTIVE APPLICATIONS</h2></header>
+  {% for c in cases if c.status in ['SUBMITTED','DISCORD_VERIFIED','PENDING_COMMAND','MORE_INFO_REQUIRED','APPROVED_AWAITING_DISCORD'] %}
+  <article class="document-sheet recruit-command-case"><div class="recruit-case-heading"><div><small>{{c.case_number}} • {{c.status|replace('_',' ')}}</small><h3>{{c.discord_verified_username or c.discord_username_input}}</h3></div><span class="{{'verified' if c.discord_user_id else 'unverified'}}">{{'DISCORD ID VERIFIED' if c.discord_user_id else 'IDENTITY NOT VERIFIED'}}</span></div>
+  <div class="recruit-answer-grid"><div><small>AGE</small><b>{{c.age or 'NOT PROVIDED'}}</b></div><div><small>TIME ZONE</small><b>{{c.timezone_name}}</b></div><div><small>HLL EXPERIENCE</small><b>{{c.hll_experience}}</b></div><div><small>ROLE INTEREST</small><b>{{c.role_interest}}</b></div><div><small>PLAY STYLE</small><b>{{c.play_style}}</b></div><div><small>PARTICIPATION</small><b>{{c.participation}}</b></div><div><small>CHAIN OF COMMAND</small><b>{{'YES' if c.follows_chain else 'NO'}}</b></div><div><small>RECRUITED BY</small><b>{% if c.recruiter_last_name %}{{c.recruiter_rank}} {{c.recruiter_last_name|upper}}, {{c.recruiter_first_name}}{% else %}NO REFERRAL FILED{% endif %}</b></div></div>
+  <div class="recruit-written-answer"><small>WHAT ARE YOU LOOKING FOR?</small><p>{{c.looking_for}}</p></div>{% if c.status=='APPROVED_AWAITING_DISCORD' %}<div class="recruit-written-answer response"><small>APPROVED — DISCORD LINK REQUIRED</small><p>Command has approved this application. Battalion Clerk cannot begin Replacement Depot processing until the applicant verifies the Discord account attached to this case.</p></div>{% endif %}{% if c.applicant_notes %}<div class="recruit-written-answer"><small>ADDITIONAL INFORMATION</small><p>{{c.applicant_notes}}</p></div>{% endif %}{% if c.applicant_response %}<div class="recruit-written-answer response"><small>APPLICANT RESPONSE</small><p>{{c.applicant_response}}</p></div>{% endif %}
+  <form method="post" class="recruit-command-actions"><input type="hidden" name="case_id" value="{{c.id}}"><label>REQUEST MORE INFORMATION<textarea name="command_request" rows="2" placeholder="Question or clarification for applicant"></textarea></label><label>INTERNAL COMMAND NOTES<textarea name="command_notes" rows="2" placeholder="Not shown to applicant">{{c.command_notes or ''}}</textarea></label><div><button name="action" value="APPROVE">{{'APPROVE — AWAIT DISCORD' if not c.discord_user_id else 'APPROVE'}}</button><button name="action" value="MORE_INFO">REQUEST MORE INFO</button><button class="deny" name="action" value="DENY">DENY</button></div></form></article>
+  {% else %}<p class="command-empty">NO ACTIVE RECRUITING CASES REQUIRE COMMAND ACTION.</p>{% endfor %}</section>
+
+  <section id="approved" class="recruit-case-board"><header><small>REPLACEMENT DETACHMENT</small><h2>APPROVED REPLACEMENT PIPELINE</h2><p>Approval is automatic from this point: Discord entry → Replacement Depot role → 201 File → login credential delivery.</p></header>
+  {% for c in cases if c.status in ['REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'] %}
+  <article class="document-sheet recruit-compact-case recruit-pipeline-case"><div><b>{{c.case_number}}</b><span>{{c.discord_verified_username}}</span>
+    <small>DISCORD: {{'JOINED' if c.discord_joined_at else ('ERROR' if c.discord_join_error else 'QUEUED')}} • 201 FILE: {{'OPEN' if c.personnel_id else 'QUEUED'}} • LOGIN DM: {{'SENT' if c.credentials_sent_at else ('ERROR' if c.credentials_delivery_error else 'QUEUED')}}</small>
+    {% if c.discord_join_error %}<p class="pipeline-error">Discord entry: {{c.discord_join_error}}</p>{% endif %}
+    {% if c.credentials_delivery_error %}<p class="pipeline-error">Credential delivery: {{c.credentials_delivery_error}}</p>{% endif %}
+  </div><a class="recruit-file-button" href="{{url_for('recruiting_case_archive',case_id=c.id)}}">VIEW FULL APPLICATION</a></article>
+  {% else %}<p class="command-empty">NO APPROVED REPLACEMENTS ARE CURRENTLY IN THE DEPOT.</p>{% endfor %}</section>
+
+  <section id="closed" class="recruit-case-board"><header><small>FILE CABINET</small><h2>CLOSED RECRUITING FILES</h2></header>{% for c in cases if c.status in ['DENIED','CLOSED','ENLISTED'] %}<article class="document-sheet recruit-compact-case"><div><b>{{c.case_number}}</b><span>{{c.discord_verified_username or c.discord_username_input}}</span><small>{{c.status|replace('_',' ')}}</small></div><a class="recruit-file-button" href="{{url_for('recruiting_case_archive',case_id=c.id)}}">VIEW FULL APPLICATION</a></article>{% else %}<p class="command-empty">NO CLOSED RECRUITING CASES.</p>{% endfor %}</section>
+</section>
+{% endblock %}

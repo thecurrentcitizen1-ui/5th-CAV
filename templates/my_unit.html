@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+{% block title %}My Unit • {{site_name}}{% endblock %}
+{% block body_class %}page-my-unit member-unit-redesign{% endblock %}
+{% block content %}
+<section class="member-unit-shell">
+  <header class="member-unit-heading">
+    <span>ASSIGNMENT-SCOPED ACCESS</span>
+    <h1>MY UNIT</h1>
+    <p>Your current formation and the Soldiers assigned alongside you.</p>
+  </header>
+
+  <article class="document-sheet member-unit-roster">
+    <header class="army-letterhead compact">
+      <small>1ST BATTALION, 5TH CAVALRY REGIMENT</small>
+      <strong>{{ personnel.unit_code or 'CURRENT ASSIGNMENT' }}</strong>
+      <span>YOUR FORMATION</span>
+    </header>
+
+    <div class="member-unit-summary">
+      <div><small>COMPANY / UNIT</small><b>{{ personnel.unit_code or '—' }}</b></div>
+      <div><small>PLATOON</small><b>{{ personnel.platoon or '—' }}</b></div>
+      <div><small>SQUAD</small><b>{{ personnel.squad or '—' }}</b></div>
+      <div><small>DUTY POSITION</small><b>{{ personnel.duty_position or personnel.mos_code or '—' }}</b></div>
+    </div>
+
+    <p class="member-unit-note">This roster is limited to the Soldier's current assigned unit.</p>
+
+    <div class="member-unit-table" role="table" aria-label="Current unit roster">
+      <div class="member-unit-table__head" role="row">
+        <span role="columnheader">SOLDIER</span>
+        <span role="columnheader">DUTY POSITION</span>
+        <span role="columnheader">PLATOON</span>
+        <span role="columnheader">SQUAD</span>
+      </div>
+      {% for m in members %}
+      <div class="member-unit-table__row" role="row">
+        <span class="member-unit-soldier" role="cell"><b>{{m.rank_code}} {{m.last_name|upper}}, {{m.first_name}}</b></span>
+        <span role="cell">{{m.duty_position or m.mos_code or '—'}}</span>
+        <span role="cell">{{m.platoon or '—'}}</span>
+        <span role="cell">{{m.squad or '—'}}</span>
+      </div>
+      {% else %}
+      <p class="typed-empty">NO OTHER SOLDIERS ARE CURRENTLY FILED WITHIN THIS ASSIGNMENT.</p>
+      {% endfor %}
+    </div>
+  </article>
+</section>
+{% endblock %}

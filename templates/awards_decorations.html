@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}1/5 Awards and Decorations • {{site_name}}{% endblock %}
+{% block body_class %}public-awards-page{% endblock %}
+{% block content %}
+<section class="public-awards-hero">
+  <div class="public-awards-hero__inner">
+    <span>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY REGIMENT</span>
+    <h1>1/5 AWARDS AND DECORATIONS</h1>
+    <p>The battalion awards program records service, leadership, participation, and distinguished contribution. Earned decorations remain part of the Soldier's permanent service record.</p>
+  </div>
+</section>
+
+<section class="public-awards-index">
+  <a href="#ribbons"><b>RIBBONS</b><small>Service • Leadership • Operations</small></a>
+  <a href="#medals"><b>MEDALS</b><small>Distinguished achievement and service</small></a>
+</section>
+
+<section id="ribbons" class="public-awards-section">
+  <header class="public-awards-section__head"><span>SECTION I</span><h2>RIBBONS</h2><p>Ribbons are displayed in official battalion order of precedence. Automatic awards are issued when recorded requirements are met; recommendation awards require Headquarters approval.</p></header>
+  <div class="public-awards-grid">
+    {% for r in ribbons %}
+    <article class="public-award-card">
+      <div class="public-award-card__image">
+        {% if r.image_filename %}<img src="{{url_for('static',filename='art/ribbons/' ~ r.image_filename)}}" alt="{{r.ribbon_name}}">{% else %}<span>IMAGE PENDING</span>{% endif %}
+      </div>
+      <div class="public-award-card__copy">
+        <div class="public-award-card__meta"><span>{{r.automation_mode|replace('_',' ')}}</span><small>ORDER OF PRECEDENCE {{r.sort_order}}</small></div>
+        <h3>{{r.ribbon_name}}</h3>
+        <p>{{r.requirement_text}}</p>
+        {% if r.ribbon_code == 'INSTRUCTOR' %}<ul><li>Complete 5 official training periods as a filed Instructor or Assistant Instructor.</li><li>Credit is filed when the training event closes.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'NCO_LEADERSHIP' %}<ul><li>Serve 30 qualifying days in Team Leader, Assistant Squad Leader, Squad Leader, or Platoon Sergeant.</li><li>Receive credit for at least 3 official events while serving in the billet.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'RECRUITING' %}<ul><li>Refer 3 applicants who complete the recruiting pipeline and become active personnel.</li><li>A referral alone does not count until the recruit is fully processed.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'COMBAT_INFANTRY' %}<ul><li>Receive credit for 10 official combat operations.</li><li>Only qualifying operation attendance entered by Battalion Clerk counts.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'CAMPAIGN' %}<ul><li>Meet the participation requirement established for a designated battalion campaign.</li><li>Campaign-specific thresholds are published by Headquarters.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'GOOD_CONDUCT' %}<ul><li>Complete 90 qualifying active-service days in good standing.</li><li>Administrative status may suspend eligibility.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'TOUR_OF_DUTY' %}<ul><li>Complete 180 qualifying service days.</li><li>Complete at least 20 credited official operations during the tour.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'MILITARY_SERVICE' %}<ul><li>For verified current or prior real-world military service.</li><li>Verification is handled privately by Battalion Headquarters.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'UNIT_CITATION' %}<ul><li>Awarded by Headquarters for exceptional collective performance by a qualifying unit.</li><li>Only members who participated in the cited action are eligible.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'COMBAT_ACTION' %}<ul><li>Requires an approved recommendation for distinguished action during an official combat operation.</li><li>Not based solely on kill count or raw statistics.</li></ul>{% endif %}
+        {% if r.ribbon_code == 'MERITORIOUS_SERVICE' %}<ul><li>Requires an approved recommendation for significant service beyond normal duties.</li><li>May recognize administration, training, recruiting, event support, or other major battalion contributions.</li></ul>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section id="medals" class="public-awards-section public-awards-section--medals">
+  <header class="public-awards-section__head"><span>SECTION II</span><h2>MEDALS</h2><p>Full-size medals will be added as Headquarters establishes higher-level decorations. They will appear here with the same eligibility and award guidance as ribbons.</p></header>
+  {% if medals %}<div class="public-awards-grid">{% for m in medals %}<article class="public-award-card"><h3>{{m.name}}</h3><p>{{m.requirement}}</p></article>{% endfor %}</div>{% else %}<div class="public-awards-empty"><b>MEDAL PROGRAM NOT YET ISSUED</b><p>No battalion medals are currently active. Future medals will be published here when approved.</p></div>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,34 @@
+{% extends 'base.html' %}
+{% block title %}Operations • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-operations-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--operations">
+  <img src="{{url_for('static',filename='art/public-overhaul/airmobile-operations.webp')}}" alt="Airmobile helicopters supporting an operation in Vietnam">
+  <div class="public-section-hero__shade"></div>
+  <div><small>S-3 • OPERATIONS</small><h1>OPERATIONS</h1><p>Website-scheduled battalion events, field service and operational history from the S-3 system of record.</p></div>
+</section>
+<section class="public-office-board">
+  <header class="public-board-heading"><small>S-3 OPERATIONS CENTER</small><h2>CURRENT / UPCOMING OPERATIONS</h2><p>Only real website-scheduled events are shown here. No fictional dates are generated for display.</p></header>
+  <div class="public-ops-cards">
+    {% for op in upcoming %}
+    <article>
+      <time>{% if op.starts_at %}<b>{{op.starts_at.strftime('%d')}}</b><span>{{op.starts_at.strftime('%b %Y')|upper}}</span>{% else %}<b>--</b><span>TBD</span>{% endif %}</time>
+      <div><small>{{op.event_type or 'OFFICIAL OPERATION'}}</small><h3>{{op.title}}</h3><p>{% if op.starts_at %}STEP-OFF {{op.starts_at.strftime('%H%M')}} HRS{% else %}STEP-OFF PENDING{% endif %}{% if op.area_of_operations %} • {{op.area_of_operations}}{% endif %}</p></div>
+      <span class="public-op-status">SCHEDULED</span>
+    </article>
+    {% else %}
+    <div class="public-empty-order"><b>NO OPERATION CURRENTLY POSTED.</b><span>Check back for Battalion Orders.</span></div>
+    {% endfor %}
+  </div>
+  <section class="public-ops-visual">
+    <img loading="lazy" src="{{url_for('static',filename='art/public-overhaul/combat-operations.webp')}}" alt="Battalion field operation in Vietnam">
+    <div><small>FIELD SERVICE</small><h2>ONE OPERATION MOVES THE WHOLE BATTALION FORWARD.</h2><p>Attendance, service credit, M16 expenditure, readiness, leadership service and history are connected to the same operational record.</p></div>
+  </section>
+  <section class="public-completed-ops">
+    <header>RECENT COMPLETED OPERATIONS</header>
+    {% for op in completed %}
+    <div><span>{{op.operation_number or op.operation_code or 'OPERATION'}}</span><b>{{op.title}}</b><small>{% if op.completed_at %}{{op.completed_at.strftime('%d %b %Y')|upper}}{% endif %}{% if op.result %} • {{op.result}}{% endif %}</small></div>
+    {% else %}<p>No completed operation records are currently published.</p>{% endfor %}
+  </section>
+</section>
+{% endblock %}

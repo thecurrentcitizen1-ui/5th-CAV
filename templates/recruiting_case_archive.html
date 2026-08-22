@@ -1,0 +1,78 @@
+{% extends 'base.html' %}
+{% block title %}{{case.case_number}} • Recruiting File • {{site_name}}{% endblock %}
+{% block body_class %}page-recruiting-archive{% endblock %}
+{% block content %}
+<section class="command-hq-hero recruiting-control-hero">
+  <div class="command-hq-hero-shade"></div>
+  <div class="command-hq-title">
+    <small>HEADQUARTERS • RECRUITING FILE CABINET</small>
+    <h1>{{case.case_number}}</h1>
+    <p>Permanent recruiting application record. This page is read-only unless Command deliberately returns the case to active review.</p>
+  </div>
+</section>
+
+<section class="recruit-archive-shell">
+  <nav class="recruit-archive-nav">
+    <a href="{{url_for('recruiting_control')}}#approved">← RETURN TO RECRUITING CONTROL</a>
+    <span class="recruit-archive-status">{{case.status|replace('_',' ')}}</span>
+  </nav>
+
+  <article class="document-sheet recruit-archive-file">
+    <header class="recruit-archive-header">
+      <div><small>DEPARTMENT OF THE ARMY</small><h2>APPLICATION FOR ENLISTMENT — FILE COPY</h2></div>
+      <div><small>CASE NUMBER</small><strong>{{case.case_number}}</strong></div>
+    </header>
+
+    <section class="recruit-archive-grid">
+      <div><small>APPLICANT</small><b>{{case.discord_verified_username or case.discord_username_input or 'NOT RECORDED'}}</b></div>
+      <div><small>DISCORD STATUS</small><b>{{'VERIFIED' if case.discord_user_id else 'NOT VERIFIED'}}</b></div>
+      <div><small>DISCORD USER ID</small><b>{{case.discord_user_id or 'NOT RECORDED'}}</b></div>
+      <div><small>AGE</small><b>{{case.age or 'NOT PROVIDED'}}</b></div>
+      <div><small>TIME ZONE</small><b>{{case.timezone_name or 'NOT PROVIDED'}}</b></div>
+      <div><small>HLL EXPERIENCE</small><b>{{case.hll_experience or 'NOT PROVIDED'}}</b></div>
+      <div><small>ROLE INTEREST</small><b>{{case.role_interest or 'NOT PROVIDED'}}</b></div>
+      <div><small>PLAY STYLE</small><b>{{case.play_style or 'NOT PROVIDED'}}</b></div>
+      <div><small>PARTICIPATION</small><b>{{case.participation or 'NOT PROVIDED'}}</b></div>
+      <div><small>CHAIN OF COMMAND</small><b>{{'YES' if case.follows_chain else 'NO'}}</b></div>
+      <div><small>RECRUITED BY</small><b>{% if case.recruiter_last_name %}{{case.recruiter_rank}} {{case.recruiter_last_name|upper}}, {{case.recruiter_first_name}}{% else %}NO REFERRAL FILED{% endif %}</b></div>
+      <div><small>FILE STATUS</small><b>{{case.status|replace('_',' ')}}</b></div>
+    </section>
+
+    <section class="recruit-archive-written">
+      <div><small>WHAT ARE YOU LOOKING FOR?</small><p>{{case.looking_for or 'NO RESPONSE FILED.'}}</p></div>
+      <div><small>ADDITIONAL INFORMATION</small><p>{{case.applicant_notes or 'NO ADDITIONAL INFORMATION FILED.'}}</p></div>
+      <div><small>APPLICANT RESPONSE / FOLLOW-UP</small><p>{{case.applicant_response or 'NO FOLLOW-UP RESPONSE FILED.'}}</p></div>
+      <div><small>COMMAND REQUEST</small><p>{{case.command_request or 'NO COMMAND REQUEST FILED.'}}</p></div>
+      <div><small>INTERNAL COMMAND NOTES</small><p>{{case.command_notes or 'NO COMMAND NOTES FILED.'}}</p></div>
+    </section>
+
+    <section class="recruit-archive-timeline">
+      <h3>PROCESSING HISTORY</h3>
+      <div><small>APPLICATION RECEIVED</small><b>{{case.created_at or 'NOT RECORDED'}}</b></div>
+      <div><small>LAST UPDATED</small><b>{{case.updated_at or 'NOT RECORDED'}}</b></div>
+      <div><small>REVIEWED BY</small><b>{{case.reviewed_by or 'NOT RECORDED'}}</b></div>
+      <div><small>REVIEWED AT</small><b>{{case.reviewed_at or 'NOT RECORDED'}}</b></div>
+      <div><small>APPROVED AT</small><b>{{case.approved_at or 'NOT APPLICABLE'}}</b></div>
+      <div><small>DENIED AT</small><b>{{case.denied_at or 'NOT APPLICABLE'}}</b></div>
+      <div><small>REPLACEMENT DEPOT ENTRY</small><b>{{case.replacement_depot_entered_at or 'NOT APPLICABLE'}}</b></div>
+      <div><small>BATTALION CLERK NOTIFIED</small><b>{{case.discord_notified_at or 'NOT RECORDED'}}</b></div>
+    </section>
+  </article>
+
+  {% if case.status in ['REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING','APPROVED_AWAITING_DISCORD','DENIED','CLOSED'] %}
+  <article class="document-sheet recruit-return-review">
+    <header><small>COMMAND AUTHORITY</small><h2>RETURN FILE TO ACTIVE REVIEW</h2></header>
+    <p>This does not create a new application or personnel record. It reopens this same Recruiting Case for Command action.</p>
+    <form method="post" action="{{url_for('recruiting_case_return_to_review',case_id=case.id)}}">
+      <label>REASON / COMMAND NOTE<textarea name="return_reason" rows="3" placeholder="Reason for reopening this file"></textarea></label>
+      <button type="submit">RETURN TO COMMAND REVIEW</button>
+    </form>
+  </article>
+  {% elif case.status == 'ENLISTED' %}
+  <article class="document-sheet recruit-return-review locked">
+    <header><small>FILE LOCKED</small><h2>ENLISTED PERSONNEL RECORD EXISTS</h2></header>
+    <p>This recruiting file remains viewable for historical reference but cannot be reopened through Recruiting Control.</p>
+  </article>
+  {% endif %}
+</section>
+{% endblock %}

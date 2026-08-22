@@ -1,0 +1,131 @@
+{% extends 'base.html' %}
+{% block title %}S-4 Supply • {{site_name}}{% endblock %}
+{% block body_class %}page-supply phase7-supply{% endblock %}
+{% block content %}
+<section class="supply-yard-hero">
+  <div class="supply-yard-photo"></div><div class="supply-yard-shade"></div>
+  <div class="supply-yard-sign"><small>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY</small><h1>S-4 SUPPLY</h1><p>Arms room • property records • company supply • maintenance journal</p></div>
+</section>
+
+<section class="supply-room">
+  <article class="document-sheet supply-intro-note"><header class="army-letterhead compact"><small>S-4 SUPPLY</small><strong>ARMS ROOM &amp; PROPERTY DESK</strong><span>INDIVIDUAL WEAPON RECORDS • GOVERNMENT PROPERTY</span></header><p>The supply section presents issued property as Army equipment rather than game inventory. A Soldier's M16, round expenditure, cleanliness, inspections, and additional field gear remain part of his permanent equipment record.</p></article>
+  <div class="supply-primary">
+    <article class="document-sheet weapon-record-sheet">
+      <header class="army-letterhead compact"><small>INDIVIDUAL WEAPON RECORD</small><strong>{% if weapon %}U.S. RIFLE, 5.56-MM, M16{% else %}NO INDIVIDUAL WEAPON ON RECORD{% endif %}</strong><span>S-4 ARMS ROOM</span></header>
+      {% if weapon %}<div class="weapon-issue-strip"><span>ASSIGNED SOLDIER</span><b>{% if personnel %}{{personnel.rank_code}} {{personnel.last_name|upper}}, {{personnel.first_name}}{% else %}NO PERSONNEL RECORD{% endif %}</b><small>{{weapon.status}} • {{weapon.condition_state}}</small></div>{% endif %}
+      {% if weapon %}
+      <div class="weapon-record-grid">
+        <div class="weapon-image-stage condition-{{weapon.condition_state|lower|replace(' ','-')}}">
+          <img src="{{url_for('static',filename='art/m16-rifle-master.png')}}" alt="M16 rifle">
+          <div class="weapon-wear-overlay"></div>
+        </div>
+        <dl>
+          <dt>SERIAL NO.</dt><dd>{{weapon.serial_number}}</dd>
+          <dt>RACK NO.</dt><dd>{{weapon.rack_number or '—'}}</dd>
+          <dt>STATUS</dt><dd>{{weapon.status}}</dd>
+          <dt>CONDITION</dt><dd>{{weapon.condition_state}}</dd>
+          <dt>ROUNDS FIRED</dt><dd>{{weapon.rounds_fired or 0}}</dd>
+          <dt>ROUNDS SINCE CLEANING</dt><dd>{{weapon.rounds_since_cleaning or 0}}</dd>
+          <dt>LAST CLEANED</dt><dd>{{weapon.last_cleaned_at or 'NOT FILED'}}</dd>
+          <dt>LAST INSPECTED</dt><dd>{{weapon.last_inspected_at or 'NOT FILED'}}</dd>
+        </dl>
+      </div>
+      <div class="serviceability-stamp state-{{weapon.condition_state|lower|replace(' ','-')}}">{{weapon.condition_state}}</div>
+      {% else %}<p class="typed-empty">NO INDIVIDUAL WEAPON HAS BEEN ISSUED.</p>{% endif %}
+    </article>
+
+    <article class="document-sheet equipment-record-sheet">
+      <header class="army-letterhead compact"><small>INDIVIDUAL EQUIPMENT RECORD</small><strong>GOVERNMENT PROPERTY ISSUED</strong><span>{% if personnel %}{{personnel.rank_code}} {{personnel.last_name|upper}}, {{personnel.first_name[:1]}}.{% endif %}</span></header>
+      <div class="property-table head"><span>ITEM</span><span>SERIAL / RACK</span><span>ISSUED</span><span>CONDITION</span></div>
+      {% for e in issued_equipment %}
+      <div class="property-table"><span>{{e.item_name}}</span><span>{{e.serial_number or e.rack_number or 'NON-SERIALIZED'}}</span><span>{{e.issued_at.date() if e.issued_at else '—'}}</span><span>{{e.condition_state}}</span></div>
+      {% else %}<p class="typed-empty">NO ADDITIONAL FIELD EQUIPMENT IS CURRENTLY ENTERED ON THIS RECORD.</p>{% endfor %}
+    </article>
+  </div>
+
+  {% if session.get('access_role') in ['s4','company_hq','battalion_hq','commander','admin'] %}
+  <aside class="supply-admin-stack">
+    <article class="document-sheet arms-room-ledger">
+      <header><small>ARMS ROOM</small><b>WEAPON RACK</b></header>
+      {% for w in weapons %}
+      <div class="rack-entry"><span>{{w.rack_number or '—'}}</span><b>M16 {{w.serial_number}}</b><small>{% if w.personnel_id %}ISSUED — {{w.rank_code}} {{w.last_name|upper}}{% else %}{{w.status}}{% endif %}</small><em>{{w.computed_state}} • {{w.computed_percent}}%</em></div>
+      {% endfor %}
+    </article>
+
+    <article class="document-sheet s4-action-form">
+      <header><small>S-4 ACTION</small><b>RECORD ROUND EXPENDITURE</b></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="record_rounds">
+        <label>WEAPON<select name="weapon_id" required>{% for w in weapons %}<option value="{{w.id}}">{{w.rack_number}} / M16 {{w.serial_number}}{% if w.last_name %} — {{w.rank_code}} {{w.last_name|upper}}{% endif %}</option>{% endfor %}</select></label>
+        <label>SOLDIER<select name="personnel_id"><option value="">NO PERSONNEL ENTRY</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}}</option>{% endfor %}</select></label>
+        <label>ROUNDS FIRED<input type="number" min="0" name="rounds_fired" required></label>
+        <label>SOURCE<select name="source_type"><option>MANUAL ENTRY</option><option>OPERATION RECORD</option><option>GAME DATA</option></select></label>
+        <label class="wide">REMARKS<input name="remarks"></label>
+        <button class="paper-action primary button-reset"><span>ENTER ROUND EXPENDITURE</span><small>UPDATE INDIVIDUAL WEAPON RECORD</small></button>
+      </form>
+    </article>
+
+    <article class="document-sheet s4-action-form">
+      <header><small>ARMS ROOM</small><b>WEAPON MAINTENANCE</b></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="weapon_maintenance">
+        <label>WEAPON<select name="weapon_id" required>{% for w in weapons %}<option value="{{w.id}}">{{w.rack_number}} / M16 {{w.serial_number}}</option>{% endfor %}</select></label>
+        <label>SOLDIER<select name="personnel_id"><option value="">NO PERSONNEL ENTRY</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}}</option>{% endfor %}</select></label>
+        <label>ACTION<select name="maintenance_action"><option>CLEANED</option><option>INSPECTED</option><option>PLACED IN MAINTENANCE</option><option>MAINTENANCE COMPLETED</option></select></label>
+        <label class="wide">REMARKS<input name="remarks"></label>
+        <button class="paper-action primary button-reset"><span>FILE MAINTENANCE ACTION</span><small>UPDATE WEAPON HISTORY</small></button>
+      </form>
+    </article>
+
+    <article class="document-sheet s4-action-form">
+      <header><small>PROPERTY ISSUE</small><b>ISSUE FIELD EQUIPMENT</b></header>
+      <form method="post" class="army-form-grid">
+        <input type="hidden" name="action" value="issue_equipment">
+        <label>SOLDIER<select name="personnel_id" required>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}}</option>{% endfor %}</select></label>
+        <label>ITEM<select name="item_code" required>{% for i in catalog if i.item_code != 'M16' %}<option value="{{i.item_code}}">{{i.category}} — {{i.item_name}}</option>{% endfor %}</select></label>
+        <label class="wide">REMARKS<input name="remarks"></label>
+        <button class="paper-action primary button-reset"><span>ISSUE EQUIPMENT</span><small>ENTER ON PROPERTY RECORD</small></button>
+      </form>
+    </article>
+  </aside>
+  {% endif %}
+</section>
+
+<section class="company-supply-area">
+  <article class="document-sheet company-stock-sheet">
+    <header class="army-letterhead compact"><small>S-4 SUPPLY</small><strong>COMPANY SUPPLY READINESS</strong><span>AMMUNITION • ARMS • RADIOS • FIELD GEAR</span></header><p class="journal-note">Company supply readiness reflects the battalion's ability to arm, equip, and support line companies in the field.</p>
+    {% for co in companies %}
+    <section class="company-stock-block">
+      <h3>{{co.display_name|upper}}</h3>
+      <div class="stock-table head"><span>ITEM</span><span>CATEGORY</span><span>ON HAND</span><span>REORDER</span><span>STATUS</span></div>
+      {% for s in stock.get(co.id|string,[]) %}
+      <div class="stock-table"><span>{{s.item_name}}</span><span>{{s.category}}</span><span>{{s.quantity_on_hand}} {{s.default_unit}}</span><span>{{s.reorder_level}}</span><span class="supply-state {{s.readiness_state|lower}}">{{s.readiness_state}}</span></div>
+      {% else %}<p class="typed-empty">NO COMPANY STOCK RECORDS HAVE BEEN FILED.</p>{% endfor %}
+    </section>
+    {% endfor %}
+  </article>
+
+  <article class="document-sheet requisition-sheet">
+    <header class="army-letterhead compact"><small>REQUISITIONS</small><strong>SUPPLY REQUESTS</strong><span>S-4 CONTROL</span></header>
+    <form method="post" class="army-form-grid requisition-form">
+      <input type="hidden" name="action" value="submit_requisition">
+      <label>REQUESTING UNIT<select name="unit_node_id"><option value="">BATTALION / GENERAL</option>{% for co in companies %}<option value="{{co.id}}">{{co.display_name}}</option>{% endfor %}</select></label>
+      <label>ITEM<select name="item_code" required>{% for i in catalog %}<option value="{{i.item_code}}">{{i.item_name}}</option>{% endfor %}</select></label>
+      <label>QUANTITY<input type="number" min="1" name="quantity_requested" value="1"></label>
+      <label>PRIORITY<select name="priority"><option>ROUTINE</option><option>PRIORITY</option><option>URGENT</option></select></label>
+      <label class="wide">REASON<input name="reason"></label>
+      <button class="paper-action primary button-reset"><span>SUBMIT REQUISITION</span><small>FORWARD TO S-4</small></button>
+    </form>
+    <div class="requisition-list">{% for r in requisitions %}<div><span>{{r.request_number}}</span><b>{{r.item_name}} × {{r.quantity_requested}}</b><small>{{r.requesting_unit or 'BATTALION'}} • {{r.priority}} • {{r.status}}</small></div>{% else %}<p class="typed-empty">NO REQUISITIONS ON FILE.</p>{% endfor %}</div>
+  </article>
+</section>
+
+{% if session.get('access_role') in ['s4','company_hq','battalion_hq','commander','admin'] %}
+<section class="s4-ledger-area">
+  <article class="document-sheet maintenance-journal">
+    <header class="army-letterhead compact"><small>ARMS ROOM</small><strong>MAINTENANCE JOURNAL</strong><span>RECENT ACTIONS</span></header>
+    {% for m in maintenance_log %}<div class="maintenance-entry"><span>{{m.performed_at}}</span><b>{{m.action_type}} — M16 {{m.serial_number}}</b><small>{% if m.last_name %}{{m.rank_code}} {{m.last_name|upper}} • {% endif %}{{m.condition_before}} → {{m.condition_after}} • {{m.rounds_at_action}} RDS</small></div>{% else %}<p class="typed-empty">NO MAINTENANCE ACTIONS HAVE BEEN FILED.</p>{% endfor %}
+  </article>
+</section>
+{% endif %}
+{% endblock %}
