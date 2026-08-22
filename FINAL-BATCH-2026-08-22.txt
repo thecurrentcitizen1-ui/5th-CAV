@@ -1,0 +1,8 @@
+1/5 CAV BATTALION CLERK FINAL BATCH — 2026-08-22
+- Existing configured Activity voice channel now drives M16 expenditure automatically.
+- 25 rounds per completed 5-minute block = 300 rounds/hour.
+- Scheduled Operation voice continues through the official duty binding and now uses the same 300 rounds/hour website model.
+- Activity round blocks are source-key idempotent and skipped when the channel is the active Operation duty channel.
+- Session close safely replays completed blocks; website de-duplicates them.
+- Ten-minute Activity/readiness threshold retained independently from five-minute M16 blocks.
+- Periodic historical Activity-voice round reconciliation added.
