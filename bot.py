@@ -1308,10 +1308,11 @@ async def operation_maintenance_watch():
                 log.info('[VOICE M16 RECONCILE] sessions=%s blocks=%s rounds=%s',voice_reconcile.get('sessions',0),voice_reconcile.get('blocks_checked',0),voice_reconcile.get('rounds_applied',0))
         except Exception as exc:
             log.warning('[VOICE M16 RECONCILE FAILED] %s',exc)
-        if int(summary.get('rounds_applied') or 0) or int(summary.get('completed_operations') or 0) or int(summary.get('archived_operations') or 0):
-            log.info('[OPERATION MAINTENANCE] attendance=%s participation=%s full=%s rounds=%s completed=%s archived=%s',
+        if int(summary.get('rounds_applied') or 0) or int(summary.get('completed_operations') or 0) or int(summary.get('archived_operations') or 0) or int(summary.get('weapon_timestamp_repairs') or 0):
+            log.info('[OPERATION MAINTENANCE] attendance=%s participation=%s full=%s rounds=%s completed=%s archived=%s weapon_ts_repairs=%s weapon_counters=%s',
                      summary.get('attendance_rows',0),summary.get('participation_rows',0),summary.get('full_credit',0),
-                     summary.get('rounds_applied',0),summary.get('completed_operations',0),summary.get('archived_operations',0))
+                     summary.get('rounds_applied',0),summary.get('completed_operations',0),summary.get('archived_operations',0),
+                     summary.get('weapon_timestamp_repairs',0),summary.get('weapon_counters_rebuilt',0))
     except Exception as exc:
         log.warning('[OPERATION MAINTENANCE FAILED] %s',exc)
 
@@ -1328,8 +1329,6 @@ async def operation_reminder_watch():
         if GUILD_ID and guild.id!=GUILD_ID:
             continue
         try:
-            if not await get_operation_reminder_channel_id(guild.id):
-                continue
             default_intervals=await get_operation_reminder_minutes(guild.id)
             status=await web.request('GET','/internal/clerk/events/status',params={'guild_id':guild.id})
         except Exception as exc:
@@ -1564,9 +1563,10 @@ async def send_activity_weapon_round_blocks(guild_id:int, member_id:int, channel
         start_epoch=int(started.timestamp())
         for idx in range(1,blocks+1):
             key=f"VOICE:{guild_id}:{member_id}:{channel_id}:{start_epoch}:{idx}"
+            occurred_at=(started+timedelta(seconds=idx*300)).isoformat()
             result=await web.request('POST','/internal/clerk/weapons/voice-rounds',json={
                 'guild_id':guild_id,'discord_user_id':member_id,'channel_id':channel_id,
-                'seconds':300,'source_key':key,'source_type':'DISCORD ACTIVITY VOICE',
+                'seconds':300,'source_key':key,'source_type':'DISCORD ACTIVITY VOICE','occurred_at':occurred_at,
                 'remarks':'Automatic M16 expenditure from configured Activity voice: 25 rounds / 5 verified minutes.'
             })
             applied+=int(result.get('applied') or 0)
@@ -2081,6 +2081,8 @@ async def publish_operation_duty_roster(guild: discord.Guild, operation: dict):
     channel_id=await get_operation_duty_channel_id(guild.id)
     channel=guild.get_channel(channel_id) if channel_id else None
     if not isinstance(channel, discord.TextChannel):
+        channel=await resolve_operation_notice_channel(guild)
+    if not isinstance(channel, discord.TextChannel):
         return False
     assignments=operation.get('assignments') or []
     if not assignments:
@@ -2108,7 +2110,6 @@ async def operation_duty_watch():
     for guild in bot.guilds:
         if GUILD_ID and guild.id != GUILD_ID: continue
         try:
-            if not await get_operation_duty_channel_id(guild.id): continue
             data=await web.request('GET','/internal/clerk/operation-duty/pending',params={'guild_id':guild.id})
             for op in data.get('operations',[]):
                 try: await publish_operation_duty_roster(guild,op)
@@ -2521,12 +2522,53 @@ async def member_record_reminder_watch():
             log.warning('[MEMBER RECORD REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
+@tasks.loop(minutes=1)
+async def welcome_packet_watch():
+    """Deliver Website-authoritative Welcome Packet phase changes through Discord."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            data=await web.request('GET','/internal/clerk/welcome-packet/notifications',params={'guild_id':guild.id})
+            for item in data.get('notifications',[]):
+                member=guild.get_member(int(item.get('discord_user_id') or 0))
+                ok=False; error=None
+                if member:
+                    message=(f"**1/5 CAV — {item.get('title') or 'WELCOME PACKET'}**\n"
+                             f"{item.get('message') or 'Your onboarding record has been updated.'}\n\n"
+                             f"Open your packet: {WEBSITE_BASE_URL}/welcome-packet")
+                    try:
+                        await member.send(message[:1900]); ok=True
+                    except discord.Forbidden:
+                        error='Discord direct messages are disabled or blocked for this member'
+                    except Exception as exc:
+                        error=str(exc)[:500]
+                else:
+                    error='Linked Discord member is not currently available in the guild'
+                if ok and str(item.get('event_type') or '').upper()=='COMPLETE':
+                    channel=(discord.utils.get(guild.text_channels,name='headquarters-notices')
+                             or discord.utils.get(guild.text_channels,name='personnel-orders')
+                             or discord.utils.get(guild.text_channels,name='battalion-orders'))
+                    if channel:
+                        try: await channel.send(f"**S-1 ONBOARDING COMPLETE**\n{member.mention} has completed the 1/5 CAV Welcome Packet and filed Report for Duty."[:1900])
+                        except Exception: pass
+                await web.request('POST',f"/internal/clerk/welcome-packet/notifications/{item.get('id')}/delivered",json={'ok':ok,'error':error})
+        except Exception as exc:
+            log.warning('[WELCOME PACKET WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
 @bot.event
 async def on_ready():
+    if not applicant_intake_watch.is_running():
+        applicant_intake_watch.start()
     if not recruit_status_watch.is_running():
         recruit_status_watch.start()
     if not approved_recruit_watch.is_running():
         approved_recruit_watch.start()
+    if not welcome_packet_watch.is_running():
+        welcome_packet_watch.start()
     global collector_started, commands_synced
 
     # Persistent Help Desk buttons survive bot restarts.
@@ -2744,7 +2786,9 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         f"Battle Roster Number: **{roster}**\n"
         f"Field Code: **{field_code}**" + weapon_line + "\n\n"
         "Use **Member Access** on the public homepage and enter the Battle Roster Number and Field Code exactly as shown. Keep these credentials private.\n\n"
-        "You now hold **Replacement Depot** status. S-1 will complete your MOS, training, property, and permanent formation assignment through your 201 File."
+        f"**YOUR NEXT STEP — OPEN YOUR WELCOME PACKET**\n{site}/welcome-packet\n"
+        "Your Welcome Packet explains Replacement Detachment, walks you through the battalion systems, and updates automatically when S-1 issues your permanent assignment. Complete each required item as you go.\n\n"
+        "You are now attached to the **Replacement Detachment**. Discord will notify you when your packet or assignment advances; the battalion Website remains the official personnel record."
     )
     try:
         await member.send(message)
@@ -2761,6 +2805,31 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
     except Exception:
         pass
     return False
+
+
+@tasks.loop(seconds=30)
+async def applicant_intake_watch():
+    """Admit website applicants to Discord before Command approval.
+
+    This is communications-only intake. The applicant receives no Soldier record, rank,
+    MOS, formation, Replacement status, or member credentials until Command approves.
+    Status messaging is left to on_member_join/recruit_status_watch so it remains idempotent.
+    """
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            data=await web.request('GET','/internal/clerk/recruiting/pending-entry',params={'guild_id':guild.id})
+            for case in data.get('cases',[]): 
+                member=await auto_join_approved_recruit(guild,case)
+                if not member:
+                    continue
+                await collector.upsert_member(member)
+                await ensure_recruit_status_role(member,approved=False)
+                log.info('[APPLICANT INTAKE COMPLETE] case=%s member=%s guild=%s',case.get('case_number'),member.id,guild.id)
+        except Exception as exc:
+            log.warning('[APPLICANT INTAKE WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
 @tasks.loop(minutes=1)
@@ -2858,7 +2927,7 @@ async def on_member_join(member: discord.Member):
                 await clear_recruit_status_roles(member)
             else:
                 # Normal recruiting intake: no operational/unit access yet.
-                # Pending applicants receive Prospective Replacement; approval swaps it to Approved Replacement.
+                # Pending applicants receive Applicant — Awaiting Review; approval then moves them into the Replacement Detachment workflow.
                 await ensure_recruit_status_role(member,approved=approved)
             try:
                 if case:
@@ -2873,7 +2942,7 @@ async def on_member_join(member: discord.Member):
                         msg=f"**1/5 CAV — PERSONNEL FILE LOCATED**\nRecruiting Case **{case.get('case_number')}** has already been converted to battalion personnel."
                     else:
                         msg=(f"**1/5 CAV — APPLICATION LOCATED**\nRecruiting Case **{case.get('case_number')}** is linked to this Discord account. "
-                             "You now hold **Prospective Replacement** while Battalion Headquarters reviews your application. No verification code is required.")
+                             "You now hold **Applicant — Awaiting Review** while Battalion Headquarters reviews your application. No verification code is required. You do not need to keep checking the website; Battalion Clerk will DM you when Command acts on your case.")
                 else:
                     app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
                     msg=("**1/5 CAV — REPLACEMENT DETACHMENT**\nNo enlistment application is linked to this Discord account yet. "

@@ -1,0 +1,3 @@
+1/5 CAV Battalion Clerk — Applicant Discord Intake Pipeline — 2026-08-22
+
+Adds pre-approval Discord intake polling every 30 seconds. Website applications with verified OAuth guilds.join authorization are admitted to Discord while still pending Command review. Existing Prospective Replacement role permissions are reused for safe recruiting-area access; user-facing messaging identifies the state as Applicant — Awaiting Review. Approval continues through the existing deterministic Replacement Detachment provisioning + credential delivery pipeline.

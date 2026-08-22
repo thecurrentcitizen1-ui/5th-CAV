@@ -1,0 +1,8 @@
+BATTALION CLERK — WELCOME PACKET INTEGRATION — 2026-08-22
+
+- Approved recruit credential DM now directs the member to the Website Welcome Packet.
+- New watcher consumes Website-authoritative onboarding phase notifications.
+- Member receives Discord DM on phase/assignment changes.
+- Stalled in-progress onboarding reminders are delivered from Website events.
+- Final Report for Duty completion can post an S-1 completion notice to existing HQ/personnel/orders channels.
+- No onboarding state is stored as Discord authority; Website remains authoritative.
