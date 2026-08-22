@@ -1,0 +1,25 @@
+1/5 CAV RECRUITING AUTO-JOIN + CREDENTIAL DELIVERY RELEASE
+Date: 2026-08-21
+
+APPROVAL PIPELINE
+1. Applicant authorizes Discord with identify + guilds.join.
+2. Website stores OAuth tokens encrypted at rest using the stable website SECRET_KEY.
+3. Command approves the Recruiting Case.
+4. Battalion Clerk automatically adds the approved Discord identity to the configured 1/5 Cav server.
+5. Battalion Clerk applies Replacement Depot status.
+6. Website opens/reuses the Replacement Detachment 201 File.
+7. Website creates or safely recovers one pending Battle Roster Number + Field Code package.
+8. Battalion Clerk sends one approval DM containing website login information.
+9. Website records credentials_sent_at only after Discord confirms the DM send.
+10. Failed joins and failed DMs remain queued for controlled retry; staff can see the error in Recruiting Control.
+
+IMPORTANT DISCORD SETUP
+- Website DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET must be from the same Discord Application as Battalion Clerk's DISCORD_TOKEN.
+- Battalion Clerk must already be installed in the target server.
+- Battalion Clerk needs CREATE_INSTANT_INVITE for Discord's Add Guild Member endpoint.
+- Battalion Clerk needs MANAGE_ROLES to apply Replacement Depot.
+- Set GUILD_ID on the bot to the target 1/5 Cav server ID.
+- Keep website SECRET_KEY stable. Changing it invalidates encrypted pending OAuth grants; affected applicants can reconnect Discord from their Recruiting Case page.
+
+EXISTING APPLICATIONS
+Cases authorized before this release may only have the old `identify` grant. Their Recruiting Case page now displays a one-click authorization refresh when guilds.join is missing.

@@ -85,3 +85,8 @@
 - Existing 60-second website event/binding refresh remains the bridge that activates the selected Operation voice channel automatically.
 - Inactivity watcher now triggers website-side issued-M16 condition refresh hourly.
 - Existing 5-minute duty voice flush drives live time-proportional M16 ammunition expenditure.
+
+## 2026-08-20 — Website-Authoritative Replacement Provisioning
+- Approved recruits are provisioned through the website Replacement Detachment endpoint without waiting for Discord rank/MOS/formation roles.
+- Approved Replacement role remains during S-1 processing and is cleared when the website Recruiting Case reaches ENLISTED after final release.
+- Battalion Clerk is now the notification/role-mirroring layer for this workflow, not the personnel-creation authority.

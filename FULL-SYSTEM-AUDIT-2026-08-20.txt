@@ -1,0 +1,28 @@
+1ST BATTALION, 5TH CAVALRY REGIMENT
+BATTALION CLERK / DISCORD BOT FULL SYSTEM AUDIT — 20 AUG 2026
+
+BASELINE
+5th-CAV-Battalion-Clerk-REPLACEMENT-PIPELINE-AUTHORITY-FIX.zip
+
+RESULT: RELEASE CANDIDATE — STATIC/CONTRACT AUDIT PASS
+
+CHECKS COMPLETED
+- Python compile: PASS (bot.py, collector.py, config.py, database.py)
+- Duplicate Discord slash-command registration names: NONE
+- Automation task definitions/start wiring reviewed: PASS
+- 33 website HTTP calls resolve to matching Flask routes: PASS
+- HTTP methods match website route methods: PASS
+- Shared X-Battalion-Clerk-Key authentication contract: PASS
+- DATABASE_URL / WEBSITE_BASE_URL / CLERK_SYNC_KEY integration contract reviewed: PASS
+- Static asyncpg SQL placeholder/argument audit: PASS
+- Railway worker Procfile/requirements structure: PASS
+- Packaging cleanup: removed __pycache__ artifact
+
+INTEGRATION VERIFIED AGAINST
+5th-Cavalry-Website-FULL-ARRIVAL-FUNCTIONALITY-REVIEWED.zip
+
+IMPORTANT LIVE-ENVIRONMENT LIMIT
+This review validates code syntax, command registration, automation wiring, static SQL/API contracts and packaging. It cannot reproduce the live Railway PostgreSQL contents, Railway environment variables, Discord permissions/intents, Discord API availability, or production network behavior from this offline audit environment. After deployment, verify Railway logs and smoke-test command sync, member/role sync, recruiting approval, operation voice credit, M16 credit/fouling, reminders, and website callbacks.
+
+UPLOAD TARGET
+BATTALION CLERK / BOT GITHUB REPOSITORY
