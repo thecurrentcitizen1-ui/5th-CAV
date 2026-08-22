@@ -1,0 +1,32 @@
+PUBLIC HOMEPAGE — CAV65 PROFESSIONAL RECRUITING OVERHAUL
+Date: 2026-08-21
+
+Goal:
+Transform the public homepage from a feature-heavy dashboard into a cinematic, professional 1965 U.S. Army / 1st Cavalry Division (Airmobile) recruiting experience for the 1st Battalion, 5th Cavalry Regiment Hell Let Loose: Vietnam community.
+
+Major changes:
+- Complete public homepage layout rewrite.
+- 1965 Republic of Vietnam / 1st Cav (Airmobile) arrival hero.
+- Preserved and elevated the clipboard Member Access experience.
+- Preserved separate Staff Access link and previous staff-login routing hotfix.
+- Strong tactile CTA/button system with hover, press, depth and clearer destinations.
+- New field-headquarters section using the 1/5 Cav tent artwork.
+- Reframed core systems around three recruiting pillars: 201 File, issued M16, formation.
+- New cinematic "A Night in the 1/5" operation sequence.
+- Live Field Situation Board retained and visually rebuilt.
+- Honors/awards system moved into a premium recruiting presentation.
+- New high-impact final enlistment section.
+- Reduced feature-card clutter and increased hierarchy, contrast, whitespace and visual depth.
+- Responsive desktop/tablet/mobile behavior.
+- Public masthead year updated to 1965 for homepage-era consistency.
+- Static optimization from prior cumulative build retained.
+
+Historical visual grounding used in design decisions:
+- 1st Cavalry Division yellow/black horsehead identity.
+- 1965 airmobility and helicopter dependence.
+- Forward/base camp and field headquarters visual language.
+- M16, signal communications, tropical field equipment and battalion-level service themes.
+
+UPLOAD TARGET:
+WEBSITE GITHUB REPOSITORY ONLY.
+No Battalion Clerk/Bot changes are required for this release.

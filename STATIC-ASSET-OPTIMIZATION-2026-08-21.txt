@@ -1,0 +1,15 @@
+STATIC ASSET OPTIMIZATION — 2026-08-21
+
+Purpose:
+Reduce GitHub upload size without removing site features or visibly degrading the website.
+
+Result:
+- Static folder reduced from approximately 41 MB to approximately 19 MB.
+- Large PNG artwork converted to high-quality WebP where safe.
+- Existing source references updated to the optimized asset filenames.
+- Transparent artwork retains alpha/transparency.
+- Large recruiting imagery re-encoded at display-appropriate resolutions with high-quality resampling.
+- No pages, images, awards, ranks, login assets, or website functionality were intentionally removed.
+
+Upload target:
+WEBSITE GITHUB REPOSITORY ONLY.

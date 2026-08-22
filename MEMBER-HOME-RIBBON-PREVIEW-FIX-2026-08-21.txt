@@ -1,0 +1,11 @@
+MEMBER HOME UNIFORM PREVIEW RIBBON FIX — 2026-08-21
+
+Changed only the ribbon rack position on the My Soldier / member landing-page
+Service Uniform preview.
+
+- Preview rack moved to correct upper-left chest position.
+- Issued Service Uniform / 201 File ribbon placement was NOT changed.
+- Existing ribbon wear logic and rack construction were NOT changed.
+- Responsive preview placement kept consistent on desktop/tablet/mobile.
+
+UPLOAD TARGET: WEBSITE GITHUB REPOSITORY ONLY.

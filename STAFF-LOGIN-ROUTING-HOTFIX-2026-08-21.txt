@@ -1,0 +1,13 @@
+STAFF LOGIN ROUTING HOTFIX — 2026-08-21
+
+ROOT CAUSE:
+The dedicated /staff-login route existed and the homepage button correctly targeted it, but the global before_request access-control middleware did not include the staff_login endpoint in its public authentication whitelist. An unauthenticated visitor clicking OPEN STAFF LOGIN was therefore redirected back to the homepage before the staff login route could render.
+
+FIX:
+- Added staff_login to the public authentication endpoint whitelist.
+- Kept /staff-login as the dedicated GET/POST staff-only authentication portal.
+- Kept /staff-access as the legacy compatibility route.
+- No member login behavior changed.
+- No bot changes required.
+
+UPLOAD TARGET: WEBSITE GITHUB REPOSITORY ONLY.

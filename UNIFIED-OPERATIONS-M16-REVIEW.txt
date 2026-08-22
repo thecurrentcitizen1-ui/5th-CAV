@@ -1,9 +1,15 @@
 1/5 CAV — UNIFIED OPERATIONS + M16 REVIEW
 
 Website-authoritative Operation scheduling: PASS
-Discord /schedule guidance-only: PASS
-60-second website duty binding refresh: RETAINED
-5-minute live duty presence flush: RETAINED
-Hourly M16 inactivity refresh request: PASS
+Shared Clerk event creation from S-3: PASS
+Homepage scheduled-operation source retained: PASS
+Discord /schedule parallel creation retired: PASS
+Live 5-minute attendance → proportional M16 rounds: PASS
+Operation closeout idempotent reconciliation: PASS
+Rounds → fouling/condition: PASS
+Inactivity → neglect fouling after warning period: PASS
+Cleaning/reissue resets neglect clock: PASS
+Hourly issued-weapon inactivity refresh: PASS
 Python compile: PASS
-Duplicate slash command audit: PASS
+Jinja parse: PASS
+Endpoint audit: PASS

@@ -1,4 +1,7 @@
-discord.py>=2.5,<3
-aiohttp>=3.10,<4
+Flask>=3.1,<4
+psycopg[binary]>=3.2,<4
+gunicorn>=23,<24
 python-dotenv>=1.0,<2
-asyncpg>=0.29,<1
+Werkzeug>=3.1,<4
+
+cryptography>=43,<47

@@ -1,0 +1,18 @@
+5TH CAVALRY — PUBLIC BATTALION PAGE RECOVERY
+
+Issue:
+The public Battalion / Organization page could throw Record Processing Error if any one of its live database sources failed.
+
+Fix:
+- Unit structure, personnel roster, and appointments now load independently.
+- Personnel roster includes a compatibility fallback for older live schemas.
+- Appointment data is supplemental and cannot crash the page.
+- Organization tree construction skips malformed rows instead of failing the request.
+- Existing public visual overhaul and homepage fail-soft recovery are retained.
+
+Validation:
+Python compile: PASS
+Jinja templates: PASS
+Template endpoint audit: PASS
+Battalion fail-soft contract: PASS
+ZIP CRC: PASS

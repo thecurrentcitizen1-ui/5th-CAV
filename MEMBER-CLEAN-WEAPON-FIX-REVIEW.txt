@@ -1,0 +1,19 @@
+5TH CAVALRY — MEMBER CLEAN WEAPON FIX
+
+Issue:
+Member dashboard CLEAN WEAPON could reach the generic Record Processing Error.
+
+Fixes:
+- Added backward-compatible weapon_maintenance_log migrations for older Railway databases.
+- Member clean action now safely completes the core M16 cleaning even if an optional audit/history write encounters a legacy schema issue.
+- Errors remain logged for Headquarters diagnostics.
+- Existing current-weapon and S-4 maintenance safeguards retained.
+- Replacement Detachment / S-1 pipeline / unified operations / homepage schedule / M16 operation logic retained.
+
+Validation:
+Python compile: PASS
+Jinja templates: PASS
+Template endpoint audit: PASS
+Member clean route contract: PASS
+Weapon maintenance migration contract: PASS
+ZIP CRC: PASS

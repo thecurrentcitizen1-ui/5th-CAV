@@ -1,0 +1,19 @@
+5TH CAVALRY — PUBLIC FRONT EXPERIENCE OVERHAUL
+
+Scope
+- Public homepage rebuilt as a recruiting-first battalion arrival experience.
+- New hero, live battalion status strip, persistent-system feature showcase, replacement pipeline, Headquarters activity, next-operation block, formation CTA, and final enlistment CTA.
+- Public navigation simplified and Battalion structure exposed directly.
+- Recruiting page receives a clear five-step process strip; existing application/OAuth logic unchanged.
+- Public reading typography and Awards card presentation polished.
+- Responsive layouts added for desktop, tablet, and mobile.
+- Logged-in staff/member workspaces intentionally not redesigned by this release.
+
+Validation
+Python compile: PASS
+Jinja templates: PASS
+Template endpoint audit: PASS
+CSS brace integrity: PASS
+Public navigation contract: PASS
+Homepage schedule data retained: PASS
+Recruiting application behavior retained: PASS

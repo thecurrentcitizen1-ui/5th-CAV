@@ -1,0 +1,15 @@
+5TH CAVALRY — REPLACEMENT ROSTER ASSIGNMENT REMOVAL FIX
+
+Behavior corrected:
+- Replacement Detachment is now an unassigned holding roster.
+- A Soldier leaves the Replacement Detachment immediately after a real Company or HQ/Section assignment is filed.
+- Outstanding Standing Orders, Replacement Training, M16, MOS, or lower-echelon assignment follow-up does not keep an assigned Soldier on the Replacement roster.
+- Company-assigned Soldiers missing Platoon/Squad placement are surfaced as S-1 Personnel Exceptions instead.
+- Existing Replacement/S-1/Training/M16/Operations systems retained.
+
+Validation:
+Python AST: PASS
+Jinja templates: PASS
+Template endpoint audit: PASS
+Replacement roster removal contract: PASS
+ZIP CRC: PASS
