@@ -95,6 +95,7 @@ DIVIDER_ROLE_NAMES = [
     "──────── COMPANY ASSIGNMENT ────────",
     "──────── PLATOON ASSIGNMENT ────────",
     "──────── SQUAD ASSIGNMENT ────────",
+    "──────── FIRE TEAM ────────",
     "──────── QUALIFICATIONS ────────",
     "──────── STAFF ACCESS ────────",
 ]
@@ -157,6 +158,8 @@ LEGACY_ASSIGNMENT_ROLE_NAMES = {
     "1st Platoon", "2nd Platoon", "3rd Platoon", "4th Platoon",
     "1st Squad", "2nd Squad", "3rd Squad", "4th Squad",
 }
+# Fire-team roles stay intentionally simple: Company/Platoon/Squad roles already provide scope.
+TEAM_ROLE_BLUEPRINT = ["Alpha Team", "Bravo Team"]
 QUALIFICATION_ROLE_BLUEPRINT = [
     "Battalion Instructor", "M16 Qualified", "Mortar Qualified", "Recon Qualified",
     "Aviation Qualified", "Armor Qualified", "Medic Qualified",
@@ -174,6 +177,7 @@ ROLE_SECTIONS = [
     ("──────── COMPANY ASSIGNMENT ────────", COMPANY_ROLE_BLUEPRINT),
     ("──────── PLATOON ASSIGNMENT ────────", PLATOON_ROLE_BLUEPRINT),
     ("──────── SQUAD ASSIGNMENT ────────", SQUAD_ROLE_BLUEPRINT),
+    ("──────── FIRE TEAM ────────", TEAM_ROLE_BLUEPRINT),
     ("──────── QUALIFICATIONS ────────", QUALIFICATION_ROLE_BLUEPRINT),
     ("──────── STAFF ACCESS ────────", STAFF_ACCESS_ROLE_BLUEPRINT),
 ]
@@ -1506,7 +1510,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
         all_company_names={'A COMPANY','ALPHA COMPANY','A/1-5 CAV','B COMPANY','BRAVO COMPANY','B/1-5 CAV','C COMPANY','CHARLIE COMPANY','C/1-5 CAV','HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'}
         for role in member.roles:
             n=' '.join(role.name.upper().strip().split())
-            if n in all_company_names or role.name in PLATOON_ROLE_BLUEPRINT or role.name in SQUAD_ROLE_BLUEPRINT or role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in managed_names:
+            if n in all_company_names or role.name in PLATOON_ROLE_BLUEPRINT or role.name in SQUAD_ROLE_BLUEPRINT or role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in TEAM_ROLE_BLUEPRINT or role.name in managed_names:
                 remove.append(role)
         try:
             remove=list(dict.fromkeys(remove))
@@ -1524,6 +1528,13 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             if r: remove.append(r)
     # Assignment roles also mirror the canonical website record when matching roles exist.
     unit=(result.get('unit_code') or '').upper().strip(); platoon=(result.get('platoon') or '').upper().strip(); squad=(result.get('squad') or '').upper().strip()
+    # Company assignment ends Replacement status immediately. Do not wait for
+    # platoon/squad completion or the recruiting-status watcher to catch up.
+    field_status=str(result.get('field_status') or '').upper().strip()
+    if field_status == 'ASSIGNED' and unit not in {'','1-5 CAV','REPLACEMENT DETACHMENT'}:
+        for role in member.roles:
+            if role.name in {'Prospective Replacement','Approved Replacement','Replacement Depot'}:
+                remove.append(role)
     company_aliases={
         'A/1-5 CAV':{'A COMPANY','ALPHA COMPANY','A/1-5 CAV'},
         'B/1-5 CAV':{'B COMPANY','BRAVO COMPANY','B/1-5 CAV'},
@@ -1545,6 +1556,22 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
         n=" ".join(role.name.upper().strip().split())
         if n in desired_company or (desired_platoon_role and n==desired_platoon_role) or (desired_squad_role and n==desired_squad_role):
             desired.append(role)
+
+    # Fire-team membership is an additional assignment layer. Keep only one team role.
+    fire_team=(result.get('fire_team') or '').strip().upper()
+    desired_team_name={'ALPHA TEAM':'Alpha Team','BRAVO TEAM':'Bravo Team'}.get(fire_team)
+    for role in member.roles:
+        if role.name in TEAM_ROLE_BLUEPRINT and role.name != desired_team_name:
+            remove.append(role)
+    if desired_team_name:
+        team_role=discord.utils.get(member.guild.roles,name=desired_team_name)
+        if team_role is None:
+            try:
+                team_role=await member.guild.create_role(name=desired_team_name,permissions=discord.Permissions.none(),hoist=False,mentionable=False,reason='Battalion Clerk — active fire-team assignment')
+            except discord.Forbidden:
+                team_role=None
+                log.warning('[TEAM ROLE CREATE BLOCKED] guild=%s role=%s',member.guild.id,desired_team_name)
+        if team_role: desired.append(team_role)
 
     # Field-leadership appointments are billets, not ranks. The website 201 File
     # is authoritative; Battalion Clerk mirrors only this managed appointment set.
