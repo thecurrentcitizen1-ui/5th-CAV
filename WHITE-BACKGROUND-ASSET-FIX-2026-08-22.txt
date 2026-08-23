@@ -1,0 +1,14 @@
+WHITE BACKGROUND ASSET FIX — 2026-08-22
+
+Actual website assets corrected (no replacement artwork generated):
+- How Enlistment Works — Field Journal asset
+- How Enlistment Works — Field Telephone asset
+- Your Formation / Situation Board — Operations Desk asset
+
+The opaque white matte pixels were removed from the source assets.
+The corrected files use new versioned filenames so browser/CDN cache cannot keep serving the old matte-contaminated assets.
+
+Existing assets already verified clean on the site:
+- Recruiting clipboard
+- Orders envelope
+- Helmet

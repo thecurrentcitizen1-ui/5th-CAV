@@ -1,9 +1,15 @@
-PERSONNEL ASSIGNMENT CONTROL / FIRE TEAM DISCORD MIRROR — 2026-08-22
+PERSONNEL ASSIGNMENT CONTROL RELEASE — 2026-08-22
 
-- Existing Discord role structure preserved.
-- Team Leader appointment role remains managed by Battalion Clerk.
-- Adds simple Alpha Team / Bravo Team roles.
-- Fire Team roles are mirrored from website-authoritative personnel records.
-- Only one Fire Team role is retained per member.
-- Missing Alpha/Bravo role can be created on demand if the bot has Manage Roles.
-- Rank, MOS, Company, Platoon, Squad and field-leadership role synchronization remains intact.
+Website remains authoritative for personnel state.
+
+Added:
+- Staff all-in-one Personnel Assignment Control.
+- Rank, MOS/role, Company/Platoon/Squad, Fire Team, Duty/Billet, field leadership appointment, Duty Status.
+- Alpha Team / Bravo Team field assignment.
+- Team Leader appointment supported through existing FTL appointment catalog.
+- Member Wall Locker assignment panel displays Fire Team.
+- Team Leaders' My Soldiers scope is limited to their assigned Alpha/Bravo Team when FTL appointment is active.
+- Team Leader appears in chain of command for Soldiers in the same squad/fire team.
+- Changes preserve rank/assignment/appointment/service histories and queue Discord role synchronization.
+
+No existing Discord organizational roles were removed or renamed.

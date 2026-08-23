@@ -1,8 +1,13 @@
-1/5 CAV BATTALION CLERK FINAL BATCH — 2026-08-22
-- Existing configured Activity voice channel now drives M16 expenditure automatically.
-- 25 rounds per completed 5-minute block = 300 rounds/hour.
-- Scheduled Operation voice continues through the official duty binding and now uses the same 300 rounds/hour website model.
-- Activity round blocks are source-key idempotent and skipped when the channel is the active Operation duty channel.
-- Session close safely replays completed blocks; website de-duplicates them.
-- Ten-minute Activity/readiness threshold retained independently from five-minute M16 blocks.
-- Periodic historical Activity-voice round reconciliation added.
+1/5 CAV FINAL BATCH — 2026-08-22
+- Billet-driven Formation Assignment Control retained.
+- Duplicate clipboard Staff Login removed; dedicated Staff Access retained.
+- Member Orders/Training/Operations access corrected to show member data instead of staff-section restriction.
+- Public Battalion Organization Board typography enlarged substantially.
+- Homepage slogan changed to THIS IS YOUR TOUR. DEFINE IT.
+- How Enlistment Works / Your Formation transparent assets cleaned and CSS desaturation removed.
+- M16 Activity voice expenditure: 300 rounds/hour in 5-minute (25 round) blocks.
+- Scheduled Operation selected voice automatically uses the same 300 rounds/hour model.
+- Voice round events are source-key idempotent; Activity and Operation paths avoid double counting.
+- Historical configured-Activity voice sessions can be reconciled safely.
+- M16 fouling thresholds: 300 Light Fouling, 600 Heavily Fouled, 900 Unserviceable.
+- Clean Weapon persists maintenance history and resets rounds since cleaning without resetting lifetime rounds.

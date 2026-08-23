@@ -1,0 +1,16 @@
+5TH CAVALRY — STAFF LOGIN DEEP ROUTING + VISIBILITY FIX — 2026-08-22
+
+AUTHENTICATION CONTRACT
+- Member authentication: /login and /my-soldier-record (Battle Roster Number + Field Code)
+- Staff authentication: /staff-login (staff username + password)
+- Legacy /staff-access renders the same dedicated staff portal directly.
+- /staff-login and /staff-access are both public-whitelisted before authentication.
+- Staff links never target /login or /my-soldier-record.
+
+VISIBLE ENTRY POINTS
+- Homepage clipboard backup link -> /staff-login
+- Homepage permanent Staff Access panel below clipboard -> /staff-login
+- Standard public header Staff Login tab -> /staff-login
+- Contact page Staff Access card -> /staff-login
+
+The Staff Access panel must never be display:none. Member and Staff authentication lanes are visually and functionally separate.

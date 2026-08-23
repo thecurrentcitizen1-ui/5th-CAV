@@ -263,6 +263,20 @@ CREATE TABLE IF NOT EXISTS weapon_inventory (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Backward-compatible weapon inventory migrations.  Production Railway databases
+-- may predate the current M16 fouling/maintenance model; CREATE TABLE IF NOT EXISTS
+-- does not add later columns to an existing table.
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'AVAILABLE FOR ISSUE';
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS condition_state TEXT NOT NULL DEFAULT 'SERVICEABLE';
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS condition_percent INTEGER NOT NULL DEFAULT 100;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS total_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS rounds_since_cleaning INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS last_fired_at TIMESTAMPTZ;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS last_cleaned_at TIMESTAMPTZ;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS last_inspected_at TIMESTAMPTZ;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS maintenance_notes TEXT;
+ALTER TABLE weapon_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE TABLE IF NOT EXISTS weapon_issue_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     weapon_id UUID NOT NULL REFERENCES weapon_inventory(id) ON DELETE CASCADE,
@@ -410,9 +424,26 @@ ON personnel_appointments(personnel_id,effective_date DESC,created_at DESC);
 -- for compatibility; unit_node_id becomes the structured source for hierarchy.
 -- ---------------------------------------------------------------------------
 
+ALTER TABLE personnel ADD COLUMN IF NOT EXISTS fire_team TEXT;
+ALTER TABLE assignment_history ADD COLUMN IF NOT EXISTS fire_team TEXT;
+
 ALTER TABLE personnel ADD COLUMN IF NOT EXISTS unit_node_id UUID REFERENCES unit_nodes(id);
 ALTER TABLE assignment_history ADD COLUMN IF NOT EXISTS unit_node_id UUID REFERENCES unit_nodes(id);
 ALTER TABLE personnel_appointments ADD COLUMN IF NOT EXISTS unit_node_id UUID REFERENCES unit_nodes(id);
+ALTER TABLE personnel_appointments ADD COLUMN IF NOT EXISTS fire_team TEXT;
+
+CREATE TABLE IF NOT EXISTS formation_migration_exceptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+    exception_code TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    UNIQUE(personnel_id, exception_code)
+);
+CREATE INDEX IF NOT EXISTS formation_migration_exceptions_active_idx
+ON formation_migration_exceptions(is_active, detected_at DESC);
 
 -- The early airmobile battalion presentation uses HHC, A/B/C rifle companies,
 -- and a Combat Support Company. Keep any legacy D Company row for database
@@ -680,8 +711,26 @@ CREATE TABLE IF NOT EXISTS weapon_round_events (
     recorded_by TEXT,
     remarks TEXT
 );
+ALTER TABLE weapon_round_events ADD COLUMN IF NOT EXISTS source_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS weapon_round_events_source_key_uidx ON weapon_round_events(source_key) WHERE source_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS weapon_round_events_weapon_idx
 ON weapon_round_events(weapon_id,recorded_at DESC);
+
+-- Shared Battalion Clerk voice telemetry tables are also declared here so
+-- website-side historical M16 reconciliation is safe even on a fresh database
+-- before the Discord process has completed its own schema bootstrap.
+CREATE TABLE IF NOT EXISTS voice_sessions (
+    id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, discord_user_id BIGINT NOT NULL,
+    username TEXT, display_name TEXT, channel_id TEXT, channel_name TEXT,
+    started_at TIMESTAMPTZ NOT NULL, ended_at TIMESTAMPTZ NOT NULL,
+    duration_seconds INTEGER NOT NULL DEFAULT 0, close_reason TEXT,
+    recovered_after_restart BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_member ON voice_sessions(guild_id,discord_user_id,ended_at DESC);
+CREATE TABLE IF NOT EXISTS activity_voice_channels (
+    guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, channel_name TEXT, added_by BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,channel_id)
+);
 
 CREATE TABLE IF NOT EXISTS company_supply_stock (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1512,20 +1561,23 @@ CREATE TABLE IF NOT EXISTS ribbon_catalog (
 );
 
 ALTER TABLE ribbon_catalog ADD COLUMN IF NOT EXISTS image_filename TEXT;
+ALTER TABLE ribbon_catalog ADD COLUMN IF NOT EXISTS description_text TEXT;
+ALTER TABLE ribbon_catalog ADD COLUMN IF NOT EXISTS earning_text TEXT;
+ALTER TABLE ribbon_catalog ADD COLUMN IF NOT EXISTS award_type_label TEXT;
 
-INSERT INTO ribbon_catalog(ribbon_code,ribbon_name,automation_mode,requirement_text,sort_order) VALUES
-('INSTRUCTOR','Instructor Ribbon','AUTOMATIC','5 completed official training periods as a filed instructor or assistant instructor.',10),
-('NCO_LEADERSHIP','NCO Leadership Ribbon','AUTOMATIC','30 qualifying days in Team Leader, Assistant Squad Leader, Squad Leader, or Platoon Sergeant billet and 3 qualifying official events while serving in that billet.',20),
-('RECRUITING','Recruiting Ribbon','AUTOMATIC','3 referred applicants who complete the recruiting pipeline and are converted to active personnel.',30),
-('COMBAT_INFANTRY','Combat Infantry Ribbon','AUTOMATIC','10 credited official combat operations.',40),
-('CAMPAIGN','Campaign Ribbon','AUTOMATIC','Qualify under a designated battalion campaign.',50),
-('GOOD_CONDUCT','Good Conduct Ribbon','AUTOMATIC','90 qualifying active-service days in good standing.',60),
-('TOUR_OF_DUTY','Tour of Duty Ribbon','AUTOMATIC','180 qualifying service days and 20 credited official operations.',70),
-('MILITARY_SERVICE','Military Service Ribbon','VERIFICATION','Command verification of current or prior real-world military service.',80),
-('UNIT_CITATION','Unit Citation Ribbon','RECOMMENDATION','Filed by Headquarters for qualifying collective performance.',90),
-('COMBAT_ACTION','Combat Action Ribbon','RECOMMENDATION','Command-approved distinguished action during official combat operations.',100),
-('MERITORIOUS_SERVICE','Meritorious Service Ribbon','RECOMMENDATION','Command-approved significant service beyond normal duties.',110)
-ON CONFLICT(ribbon_code) DO UPDATE SET ribbon_name=EXCLUDED.ribbon_name,automation_mode=EXCLUDED.automation_mode,requirement_text=EXCLUDED.requirement_text,sort_order=EXCLUDED.sort_order,is_active=TRUE;
+INSERT INTO ribbon_catalog(ribbon_code,ribbon_name,automation_mode,requirement_text,description_text,earning_text,award_type_label,sort_order) VALUES
+('INSTRUCTOR','Instructor Ribbon','AUTOMATIC','5 completed official training periods as a filed instructor or assistant instructor.','Recognizes Soldiers who contribute directly to the training and development of battalion personnel by serving as instructors during organized training periods.','Complete 5 official training periods while serving as a filed Instructor or Assistant Instructor. Training credit must be recorded through the battalion Training system after the event is completed. Informal coaching or unrecorded sessions do not count toward the requirement.','PROGRESSION AWARD',10),
+('NCO_LEADERSHIP','NCO Leadership Ribbon','AUTOMATIC','30 qualifying days in Team Leader, Assistant Squad Leader, Squad Leader, or Platoon Sergeant billet and 3 qualifying official events while serving in that billet.','Recognizes sustained service in a leadership billet and the successful supervision of Soldiers during battalion activities.','Serve at least 30 qualifying days as a Team Leader, Assistant Squad Leader, Squad Leader, or Platoon Sergeant and receive credit for at least 3 official battalion events while holding that billet. Leadership days and event participation must be reflected in the Soldier''s official personnel record.','PROGRESSION AWARD',20),
+('RECRUITING','Recruiting Ribbon','AUTOMATIC','3 referred applicants who complete the recruiting pipeline and are converted to active personnel.','Recognizes Soldiers who actively contribute to the growth of the battalion by bringing qualified new members into the organization.','Receive recruiting credit for 3 applicants who successfully complete the recruiting process and become active battalion personnel. A referral alone does not count; the applicant must be approved, processed into the battalion, and credited to the referring member.','PROGRESSION AWARD',30),
+('COMBAT_INFANTRY','Combat Infantry Ribbon','AUTOMATIC','10 credited official combat operations.','Recognizes sustained participation in battalion combat operations and continued service in the field alongside the unit.','Receive attendance credit for 10 official combat operations. Only Operations recorded through the battalion Operations and attendance system count. Training nights, informal games, or events not designated as qualifying combat operations do not count.','PROGRESSION AWARD',40),
+('CAMPAIGN','Campaign Ribbon','AUTOMATIC','Qualify under a designated battalion campaign.','Recognizes participation in a designated battalion campaign consisting of multiple operations or events conducted toward a common operational objective.','Meet the participation requirement established for a specific battalion campaign. Headquarters publishes the qualifying campaign dates and required number of Operations or events. Once the campaign requirement is met, eligible members receive the ribbon for that campaign.','CAMPAIGN AWARD',50),
+('GOOD_CONDUCT','Good Conduct Ribbon','AUTOMATIC','90 qualifying active-service days in good standing.','Recognizes sustained dependable service, participation, and good standing within the battalion over an extended period.','Complete 90 qualifying active-service days in good standing. The Soldier must remain an active member and avoid administrative status that suspends service credit. Eligibility is based on the official personnel record and qualifying service days recorded by the Website.','PROGRESSION AWARD',60),
+('TOUR_OF_DUTY','Tour of Duty Ribbon','AUTOMATIC','180 qualifying service days and 20 credited official operations.','Recognizes the completion of a substantial period of active service with the battalion and consistent participation throughout that tour.','Complete at least 180 qualifying service days and receive credit for at least 20 official combat operations during that period. Both requirements must be satisfied, and the member must remain in qualifying active status for service-day credit to continue accumulating.','PROGRESSION AWARD',70),
+('MILITARY_SERVICE','Military Service Ribbon','VERIFICATION','Command verification of current or prior real-world military service.','Recognizes members of the battalion who have served, or are currently serving, in the armed forces outside of the gaming community.','Provide private verification of current or prior real-world military service to authorized Battalion Headquarters staff. Once service has been verified, Command may award the ribbon. Military documentation is never displayed publicly on the Website.','VERIFICATION AWARD',80),
+('UNIT_CITATION','Unit Citation Ribbon','RECOMMENDATION','Filed by Headquarters for qualifying collective performance.','Recognizes Soldiers who were members of a formation cited by Headquarters for exceptional collective performance during a specific operation, campaign, or period of service.','Headquarters must formally approve a Unit Citation for a qualifying Company, Platoon, Squad, or other formation. A Soldier must have participated in the cited action or qualifying period to receive the ribbon; membership in the unit alone does not automatically qualify a Soldier who did not participate.','COMMAND AWARD',90),
+('COMBAT_ACTION','Combat Action Ribbon','RECOMMENDATION','Command-approved distinguished action during official combat operations.','Recognizes an individual Soldier for distinguished performance, initiative, or exceptional conduct during an official combat operation.','A Soldier must be formally recommended following a qualifying combat operation. Command reviews the circumstances and approves or denies the recommendation. The ribbon is based on demonstrated performance and contribution to the unit, not solely on kills, score, or other game statistics.','COMMAND AWARD',100),
+('MERITORIOUS_SERVICE','Meritorious Service Ribbon','RECOMMENDATION','Command-approved significant service beyond normal duties.','Recognizes exceptional service to the battalion that significantly exceeds the normal expectations of a member''s assigned duties.','A Soldier must receive a formal recommendation describing the service performed. Examples may include exceptional administration, training support, recruiting efforts, event organization, technical support, sustained leadership, or another major contribution to the battalion. Final approval rests with authorized Command staff.','COMMAND AWARD',110)
+ON CONFLICT(ribbon_code) DO UPDATE SET ribbon_name=EXCLUDED.ribbon_name,automation_mode=EXCLUDED.automation_mode,requirement_text=EXCLUDED.requirement_text,description_text=EXCLUDED.description_text,earning_text=EXCLUDED.earning_text,award_type_label=EXCLUDED.award_type_label,sort_order=EXCLUDED.sort_order,is_active=TRUE;
 
 CREATE TABLE IF NOT EXISTS personnel_ribbons (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1560,28 +1612,28 @@ CREATE TABLE IF NOT EXISTS personnel_military_service_verification (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-UPDATE ribbon_catalog SET image_filename='military-service-ribbon.png' WHERE ribbon_code='MILITARY_SERVICE';
+UPDATE ribbon_catalog SET image_filename='military-service-ribbon.webp' WHERE ribbon_code='MILITARY_SERVICE';
 
-UPDATE ribbon_catalog SET image_filename='unit-citation-ribbon.png' WHERE ribbon_code='UNIT_CITATION';
+UPDATE ribbon_catalog SET image_filename='unit-citation-ribbon.webp' WHERE ribbon_code='UNIT_CITATION';
 
-UPDATE ribbon_catalog SET image_filename='meritorious-service-ribbon.png' WHERE ribbon_code='MERITORIOUS_SERVICE';
+UPDATE ribbon_catalog SET image_filename='meritorious-service-ribbon.webp' WHERE ribbon_code='MERITORIOUS_SERVICE';
 
-UPDATE ribbon_catalog SET image_filename='nco-leadership-ribbon.png' WHERE ribbon_code='NCO_LEADERSHIP';
+UPDATE ribbon_catalog SET image_filename='nco-leadership-ribbon.webp' WHERE ribbon_code='NCO_LEADERSHIP';
 
-UPDATE ribbon_catalog SET image_filename='instructor-ribbon.png' WHERE ribbon_code='INSTRUCTOR';
+UPDATE ribbon_catalog SET image_filename='instructor-ribbon.webp' WHERE ribbon_code='INSTRUCTOR';
 
 
-UPDATE ribbon_catalog SET image_filename='tour-of-duty-ribbon.png' WHERE ribbon_code='TOUR_OF_DUTY';
+UPDATE ribbon_catalog SET image_filename='tour-of-duty-ribbon.webp' WHERE ribbon_code='TOUR_OF_DUTY';
 
-UPDATE ribbon_catalog SET image_filename='good-conduct-ribbon.png' WHERE ribbon_code='GOOD_CONDUCT';
+UPDATE ribbon_catalog SET image_filename='good-conduct-ribbon.webp' WHERE ribbon_code='GOOD_CONDUCT';
 
-UPDATE ribbon_catalog SET image_filename='recruiting-ribbon.png' WHERE ribbon_code='RECRUITING';
+UPDATE ribbon_catalog SET image_filename='recruiting-ribbon.webp' WHERE ribbon_code='RECRUITING';
 
-UPDATE ribbon_catalog SET image_filename='campaign-ribbon.png' WHERE ribbon_code='CAMPAIGN';
+UPDATE ribbon_catalog SET image_filename='campaign-ribbon.webp' WHERE ribbon_code='CAMPAIGN';
 
-UPDATE ribbon_catalog SET image_filename='combat-infantry-ribbon.png' WHERE ribbon_code='COMBAT_INFANTRY';
+UPDATE ribbon_catalog SET image_filename='combat-infantry-ribbon.webp' WHERE ribbon_code='COMBAT_INFANTRY';
 
-UPDATE ribbon_catalog SET image_filename='combat-action-ribbon.png' WHERE ribbon_code='COMBAT_ACTION';
+UPDATE ribbon_catalog SET image_filename='combat-action-ribbon.webp' WHERE ribbon_code='COMBAT_ACTION';
 
 ALTER TABLE personnel_ribbons ALTER COLUMN is_worn SET DEFAULT TRUE;
 
@@ -1888,3 +1940,60 @@ ALTER TABLE recruiting_cases ADD COLUMN IF NOT EXISTS credentials_sent_at TIMEST
 ALTER TABLE recruiting_cases ADD COLUMN IF NOT EXISTS credentials_delivery_error TEXT;
 ALTER TABLE recruiting_cases ADD COLUMN IF NOT EXISTS credentials_last_attempt_at TIMESTAMPTZ;
 ALTER TABLE recruiting_cases ADD COLUMN IF NOT EXISTS credentials_pending_field_code_enc TEXT;
+
+-- ---------------------------------------------------------------------------
+-- Welcome Packet / onboarding workflow (2026-08-22)
+-- Website remains authoritative; Battalion Clerk only delivers notifications.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS welcome_packets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    personnel_id UUID NOT NULL UNIQUE REFERENCES personnel(id) ON DELETE CASCADE,
+    recruiting_case_id UUID REFERENCES recruiting_cases(id) ON DELETE SET NULL,
+    current_phase TEXT NOT NULL DEFAULT 'REPLACEMENT_ORIENTATION',
+    status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    replacement_completed_at TIMESTAMPTZ,
+    assignment_phase_started_at TIMESTAMPTZ,
+    unit_orientation_started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS welcome_packets_status_idx ON welcome_packets(status,current_phase,last_activity_at DESC);
+
+CREATE TABLE IF NOT EXISTS welcome_packet_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    packet_id UUID NOT NULL REFERENCES welcome_packets(id) ON DELETE CASCADE,
+    task_code TEXT NOT NULL,
+    phase_code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    target_endpoint TEXT,
+    completion_mode TEXT NOT NULL DEFAULT 'VISIT',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    required BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'LOCKED',
+    completed_at TIMESTAMPTZ,
+    completed_by TEXT,
+    waived_at TIMESTAMPTZ,
+    waived_by TEXT,
+    staff_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(packet_id,task_code)
+);
+CREATE INDEX IF NOT EXISTS welcome_packet_tasks_packet_idx ON welcome_packet_tasks(packet_id,phase_code,sort_order);
+
+CREATE TABLE IF NOT EXISTS welcome_packet_notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    packet_id UUID NOT NULL REFERENCES welcome_packets(id) ON DELETE CASCADE,
+    personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    delivered_at TIMESTAMPTZ,
+    delivery_error TEXT
+);
+CREATE INDEX IF NOT EXISTS welcome_packet_notifications_pending_idx ON welcome_packet_notifications(delivered_at,created_at);

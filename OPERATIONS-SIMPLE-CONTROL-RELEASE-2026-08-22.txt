@@ -1,7 +1,13 @@
 OPERATIONS SIMPLE CONTROL RELEASE — 2026-08-22
 
-Battalion Clerk Operations distribution changes:
-- Scheduled Website Operations continue to post automatically to Discord.
-- Operation reminders no longer require a separately configured reminder channel; safe fallback routing is used.
-- Operation duty-roster distribution no longer requires a separately configured duty-roster channel; safe fallback routing is used.
-- Event-specific Operation voice tracking remains authoritative for attendance and M16 round expenditure.
+Website is authoritative for Operations.
+- Single-screen S-3 scheduling/control.
+- One-click schedule; no normal draft/publish split.
+- Immediate Current/Upcoming visibility after successful schedule.
+- Inline edit and Discord resync.
+- Inline Soldier duty-role assignment and removal.
+- Inline complete, cancel, and safe delete.
+- Safe delete uses DELETED lifecycle state and removes Clerk event so FK/audit history cannot break deletion.
+- Discord voice channel is event-specific.
+- Voice attendance and 300 rounds/hour M16 tracking remain linked to scheduled Operation event.
+- Public Operations only reads Website operation records and sanitizes public operation numbers.

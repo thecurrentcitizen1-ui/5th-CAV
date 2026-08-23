@@ -1,0 +1,26 @@
+1/5 CAV WELCOME PACKET / ONBOARDING SYSTEM — 2026-08-22
+
+Website-authoritative onboarding layer integrated with existing recruiting, Replacement Detachment, personnel assignment, 201 File, Training, M16, Operations, My Unit, My Squad, and Battalion Clerk Discord delivery.
+
+FLOW
+1. Command approval immediately opens the Replacement 201 File and Welcome Packet when Discord identity is already verified.
+2. Battalion Clerk completes Discord guild entry/Replacement status and privately delivers Member Access credentials plus the direct Welcome Packet link.
+3. First successful Website login opens the Welcome Packet.
+4. Phase I: Replacement Detachment Orientation.
+5. Completion waits safely for Company assignment if necessary.
+6. Company assignment automatically unlocks Movement & Assignment tasks.
+7. Platoon/Squad assignment automatically unlocks Unit Orientation after the movement phase is complete.
+8. Existing M16 issue, orders, unit/squad pages, operations, training, Standing Orders, and 201 File drive checklist completion.
+9. Final REPORT FOR DUTY files permanent completion in the Soldier's 201/service record.
+
+STAFF
+- Dedicated S-1/Command Onboarding Control board.
+- Welcome Packet status embedded in staff 201 File.
+- Staff can complete, waive, or reset individual onboarding items; overrides are staff-logged.
+
+DISCORD
+- Approval credential DM links directly to /welcome-packet.
+- Phase changes are DMed automatically.
+- In-progress packets stalled for 24+ hours receive at most one reminder per day.
+- Final completion can post to headquarters-notices/personnel-orders/battalion-orders.
+- Website remains source of truth; Discord only delivers/mirrors.

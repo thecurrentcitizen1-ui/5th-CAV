@@ -1,0 +1,27 @@
+1/5 CAV WEBSITE — MY SQUAD + RANK PRECEDENCE
+2026-08-22
+
+MEMBER NAVIGATION
+- Every member login now has MY SQUAD.
+- Legacy /my-soldiers redirects to /my-squad for compatibility.
+
+MY SQUAD PERMISSIONS
+- PVT/PFC and non-leadership ranks: view-only squad roster and uniform inspection.
+- CPL/SGT/SSG/SFC: leadership Quick Actions within their assigned squad.
+- Quick Actions: promotion recommendation, award recommendation, leadership note.
+- Staff/Command retains approval authority for recommendations.
+
+SOLDIER INSPECTOR
+- Clicking a squad member opens that Soldier on the same MY SQUAD page.
+- Displays service uniform and worn ribbon rack.
+- Displays rank, team, squad and duty assignment.
+- Leadership Quick Actions render beside the uniform only for authorized leadership ranks.
+
+RANK PRECEDENCE
+- MY SQUAD sorted by rank precedence, then name.
+- Public Battalion roster derives from canonical rank-precedence roster.
+- Company and Platoon rosters inherit canonical rank precedence.
+- Staff Battalion Personnel Index sorted by rank precedence.
+- S-1 active personnel roster sorted by rank precedence.
+- MY UNIT sorted by rank precedence.
+- Formation snapshots sorted by rank precedence.

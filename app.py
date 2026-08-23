@@ -11,7 +11,11 @@ import urllib.request
 import urllib.error
 import hashlib
 import base64
-from datetime import date, datetime, timezone, timedelta
+import os
+from datetime import date, datetime, timezone, timedelta, time
+from decimal import Decimal
+from uuid import UUID
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from flask import Flask, Response, abort, flash, redirect, render_template, request, session, url_for, g
@@ -37,6 +41,19 @@ app.config.update(
 app.teardown_appcontext(close_request_connection)
 
 
+@app.after_request
+def prevent_authenticated_record_caching(response):
+    """Member/staff records must always reflect the latest authoritative database state."""
+    try:
+        if session.get("user_id") and str(response.mimetype or "").lower()=="text/html":
+            response.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"]="no-cache"
+            response.headers["Expires"]="0"
+    except Exception:
+        pass
+    return response
+
+
 def database_ready() -> bool:
     return bool(CONFIG.database_url)
 
@@ -58,6 +75,13 @@ def bootstrap() -> None:
         """,
         (CONFIG.admin_username, generate_password_hash(CONFIG.admin_password)),
     )
+    try:
+        reconcile_formation_billets()
+    except NameError:
+        # Function is defined later during module import; a request/next process boot will reconcile.
+        pass
+    except Exception:
+        log.exception("Formation billet reconciliation failed during bootstrap")
     log.info("Initial site administrator ensured: %s", CONFIG.admin_username)
 
 
@@ -77,6 +101,26 @@ def unhandled_application_error(exc):
     log.exception("UNHANDLED WEBSITE ERROR [%s] endpoint=%s path=%s",ref,request.endpoint,request.path)
     if request.path.startswith("/internal/"):
         return {"ok":False,"error":"internal server error","reference":ref},500
+    # Member workspace pages are mission-critical. A data exception must never
+    # strand a logged-in Soldier on the generic global error page.
+    member_endpoints={"my_soldier_record","my_201_file","my_action_center","my_unit","my_squad","training","operations"}
+    member_paths={"/my-soldier-record","/my-201-file","/my-action-center","/my-unit","/my-squad","/training","/operations"}
+    if session.get("user_id") and session.get("access_role") in {"member","nco","company_hq"} and ((request.endpoint or "") in member_endpoints or request.path.rstrip("/") in member_paths):
+        try:
+            pid=session.get("personnel_id")
+            person=fetch_one("SELECT * FROM personnel WHERE id=%s",(pid,)) if pid else None
+            if person:
+                context=member_record_fallback_context(person,ref)
+                context["record_warning"]="A member-workspace module failed to load. Core personnel access has been preserved and Headquarters logged the diagnostic reference."
+                return render_template("member_record_core.html",**context),200
+        except Exception:
+            log.exception("MEMBER GLOBAL RECOVERY FAILURE [%s]",ref)
+        return Response(
+            "<!doctype html><html><head><meta charset='utf-8'><title>Member Records Recovery</title></head>"
+            "<body><main><h1>MEMBER RECORDS — RECOVERY MODE</h1>"
+            f"<p>Headquarters logged diagnostic reference <b>{ref}</b>.</p>"
+            "<p><a href='/my-soldier-record'>Retry Wall Locker</a> &nbsp; <a href='/logout'>Sign Out</a></p>"
+            "</main></body></html>",status=200,mimetype="text/html")
     return render_template("server_error.html",error_reference=ref),500
 
 
@@ -143,6 +187,8 @@ def _order_number(prefix: str) -> str:
 
 
 def create_personnel_order(personnel_id, document_type, title, body_text, *, effective_date=None, authority=None, details=None, source_key=None, document_number=None):
+    # Official paperwork uses an all-uppercase authority/signature block.
+    authority = str(authority or "HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY").upper()
     if source_key:
         existing = fetch_one("SELECT * FROM personnel_documents WHERE source_key=%s", (source_key,))
         if existing:
@@ -153,10 +199,10 @@ def create_personnel_order(personnel_id, document_type, title, body_text, *, eff
            (personnel_id,document_type,document_number,title,effective_date,authority,body_text,details_json,source_key,source_guild_id,workflow_status,by_order_of,signature_block)
            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'FILED',%s,%s) RETURNING *""",
         (personnel_id, document_type.upper(), document_number or _order_number(document_type), title,
-         effective_date or date.today(), authority or "HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY",
+         effective_date or date.today(), authority,
          body_text, Json(details or {}), source_key, guild.get("guild_id") if guild else None,
          "BY ORDER OF THE BATTALION COMMANDER" if document_type.upper() in {"REPLACEMENT","ASSIGNMENT","PROMOTION","APPOINTMENT","AWARD","SEPARATION","TOUR EXTENSION"} else "FOR THE COMMANDER",
-         authority or "HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY"),
+         authority),
     )
     if row:
         try:
@@ -319,10 +365,10 @@ def derive_weapon_state(weapon: dict | None, personnel: dict | None):
         inactive_days = 0
     state,pct=weapon_condition_from_rounds_and_time(record,personnel)
     since_clean=max(0,int(record.get("rounds_since_cleaning") or 0))
-    if since_clean>=450: fouling="CLEANING REQUIRED"
-    elif since_clean>=250: fouling="HEAVY"
-    elif since_clean>=100: fouling="MODERATE"
-    elif since_clean>0: fouling="LIGHT"
+    if since_clean>=900: fouling="UNSERVICEABLE"
+    elif since_clean>=600: fouling="HEAVILY FOULED"
+    elif since_clean>=300: fouling="LIGHT FOULING"
+    elif since_clean>0: fouling="TRACE FOULING"
     else: fouling="CLEAN"
     t=inactivity_thresholds_for_person(personnel) if personnel else {"warning":7,"s1":14,"property":21,"command":30}
     if absence_paused: neglect="AUTHORIZED ABSENCE — CLOCK PAUSED"
@@ -333,7 +379,7 @@ def derive_weapon_state(weapon: dict | None, personnel: dict | None):
     else: neglect="CURRENT"
     inspection=weapon_inspection_status(personnel["id"]) if personnel else None
     inspection_label="OVERDUE" if inspection and inspection.get("overdue") else "CURRENT"
-    stages={"SERVICEABLE":0,"FOULED":2,"HEAVY FOULING":3,"CLEANING REQUIRED":3,"MAINTENANCE REQUIRED":4,"UNSERVICEABLE":5}
+    stages={"SERVICEABLE":0,"TRACE FOULING":1,"FOULED":2,"LIGHT FOULING":2,"HEAVY FOULING":3,"HEAVILY FOULED":3,"CLEANING REQUIRED":3,"MAINTENANCE REQUIRED":4,"UNSERVICEABLE":5}
     record.update({"display_state":state,"display_condition_percent":pct,"dirt_stage":stages.get(state,0),"inactive_days":inactive_days,"last_duty_date":last_duty,"fouling_status":fouling,"cleanliness_status":"CLEAN" if since_clean==0 else "DIRTY","neglect_status":neglect,"inspection_status":inspection_label,"serviceability_status":state})
     return record
 
@@ -359,23 +405,30 @@ def battle_roster_for(personnel: dict | None):
 @app.context_processor
 def inject_globals():
     member_nco=False
+    member_welcome_active=False
     try:
         if session.get("user_id") and session.get("access_role") in {"member","nco","company_hq"}:
             lp=linked_personnel()
             member_nco=bool(lp and str(lp.get("rank_code") or "").upper() in NCO_RANKS)
+            if lp:
+                wp=fetch_one("SELECT status FROM welcome_packets WHERE personnel_id=%s",(lp.get('id'),))
+                member_welcome_active=bool(wp and str(wp.get('status') or '').upper()!='COMPLETE')
     except Exception:
         member_nco=False
+        member_welcome_active=False
     return {
         "site_name": "5th Cavalry Regiment",
         "unit_name": "1st Battalion, 5th Cavalry Regiment",
         "today": date.today(),
         "member_nco": member_nco,
+        "member_welcome_active": member_welcome_active,
         "public_system_configured": database_ready(),
     }
 
 
 COMMAND_ROLES = {"battalion_hq", "commander", "admin"}
 NCO_RANKS = {"CPL", "SGT", "SSG", "SFC", "MSG", "1SG", "SGM"}
+SQUAD_LEADERSHIP_RANKS = {"CPL", "SGT", "SSG", "SFC"}
 
 
 def staff_landing(role: str | None) -> str:
@@ -433,6 +486,8 @@ def enforce_private_battalion_sections():
         "my_weekly_report", "my_qualification_card",
         "my_weapon_service_history", "my_squad", "my_platoon_identity",
         "my_unit", "my_tour_book", "weapon_history",
+        "orders", "training", "operations", "operation_detail",
+        "welcome_packet",
     }
     staff_common = {
         "staff_action_center", "staff_personnel_snapshot", "staff_personnel_drawer",
@@ -441,12 +496,13 @@ def enforce_private_battalion_sections():
     }
     scoped = {
         "s1": staff_common | {
-            "staff_batch_action", "staff_soldier_action", "staff_personnel_manage",
+            "staff_batch_action", "staff_soldier_action", "staff_personnel_manage", "staff_formation_control",
             "replacement_detachment", "replacement_quick_action", "replacement_batch_action",
             "personnel_action_quick", "s1", "personnel_office", "personnel_service_record",
             "personnel_document", "personnel_document_preview", "morning_report",
             "duty_status_action", "personnel_actions", "document_amendment",
             "personnel_lifecycle_action", "staff_workload_page", "award_recommendation",
+            "staff_onboarding", "staff_welcome_packet",
         },
         "s2": staff_common | {"s2"},
         "s3": staff_common | {
@@ -543,7 +599,7 @@ def soldier_action_items(personnel):
         items.append({"title":"Acknowledge Battalion Standing Orders","section":"S-1","status":"ACTION REQUIRED"})
     if not replacement.get("complete"):
         remaining=sum(1 for r in replacement.get("requirements",[]) if not r.get("complete"))
-        items.append({"title":f"{replacement.get('program_title','Replacement Training')} — {remaining} requirement(s) remaining","section":"S-1 / S-3" if replacement.get("replacement_required") else "S-1","status":"IN PROCESSING"})
+        items.append({"title":f"{replacement.get('program_title','Replacement Training')} — {remaining} requirement{' remains' if remaining == 1 else 's remain'}","section":"S-1 / S-3" if replacement.get("replacement_required") else "S-1","status":"IN PROCESSING"})
     weapon=current_weapon_for(personnel)
     if weapon and int(weapon.get("dirt_stage") or 0)>=3:
         items.append({"title":f"M16 {weapon.get('serial_number')} requires cleaning / maintenance","section":"S-4","status":"DUE"})
@@ -636,7 +692,7 @@ def refresh_member_notices(personnel):
         notify_soldier(pid,"S-1","Standing Orders require acknowledgement","Open Replacement Training and acknowledge the Battalion Standing Orders.",priority="HIGH",source_key=f"RULES:{pid}",target_anchor="replacement-training")
     if not repl.get("complete"):
         remaining=sum(1 for r in repl.get("requirements",[]) if not r.get("complete"))
-        notify_soldier(pid,"S-1 / S-3",f"{repl.get('program_title','Replacement Training')} — {remaining} requirement(s) remaining","Complete the remaining battalion in-processing requirements.",source_key=f"ENTRY-PROCESSING:{pid}",target_anchor="replacement-training")
+        notify_soldier(pid,"S-1 / S-3",f"{repl.get('program_title','Replacement Training')} — {remaining} requirement{' remains' if remaining == 1 else 's remain'}","Complete the remaining battalion in-processing requirements.",source_key=f"ENTRY-PROCESSING:{pid}",target_anchor="replacement-training")
     inspection=weapon_inspection_status(pid)
     if inspection and inspection["overdue"]:
         notify_soldier(pid,"S-4",f"M16 inspection overdue — Serial {inspection['weapon']['serial_number']}",f"Weapon inspection was due {inspection['due']}.",priority="HIGH",source_key=f"WEAPON-INSP:{pid}:{inspection['due']}",target_anchor="weapon")
@@ -712,7 +768,7 @@ def process_rank_action(personnel_id, new_rank_code: str, effective_date=None, a
     enqueue_discord_role_sync(personnel_id,f'RANK {old_rank}->{new_rank_code}')
 
 
-def process_appointment_action(personnel_id, appointment_code: str, organization=None, status="PERMANENT", effective_date=None, authority=None, order_number=None, remarks=None, unit_node_id=None):
+def process_appointment_action(personnel_id, appointment_code: str, organization=None, status="PERMANENT", effective_date=None, authority=None, order_number=None, remarks=None, unit_node_id=None, fire_team=None):
     appt = fetch_one("SELECT * FROM appointment_catalog WHERE appointment_code=%s AND is_active=TRUE", (appointment_code,))
     if not appt:
         raise ValueError("Appointment not found")
@@ -723,9 +779,9 @@ def process_appointment_action(personnel_id, appointment_code: str, organization
         organization = format_assignment_node(unit_node_id) if node else organization
     execute(
         """INSERT INTO personnel_appointments
-        (personnel_id,appointment_code,unit_node_id,organization,appointment_status,effective_date,authority,order_number,remarks)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (personnel_id, appointment_code, unit_node_id, organization, status, eff, authority, order_number, remarks),
+        (personnel_id,appointment_code,unit_node_id,fire_team,organization,appointment_status,effective_date,authority,order_number,remarks)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (personnel_id, appointment_code, unit_node_id, (fire_team or None), organization, status, eff, authority, order_number, remarks),
     )
     narrative = f"Appointed {appt['appointment_name']}"
     if organization:
@@ -843,11 +899,17 @@ def format_assignment_node(node_id):
 
 def process_assignment_action(personnel_id, unit_node_id, duty_position=None,
                               effective_date=None, authority=None,
-                              order_number=None, remarks=None):
+                              order_number=None, remarks=None, fire_team=None):
     person = fetch_one("SELECT * FROM personnel WHERE id=%s", (personnel_id,))
     target = unit_node(unit_node_id)
     if not person or not target:
         raise ValueError("Personnel record or organization not found")
+
+    target_type=str(target.get('unit_type') or '').upper()
+    if target_type not in {'COMPANY','PLATOON','SQUAD','HEADQUARTERS','SECTION'}:
+        raise ValueError(
+            "Personnel assignments must terminate at a Company, Platoon, Squad, Headquarters, or Section."
+        )
 
     eff = effective_date or date.today()
     order_number = order_number or _order_number("ASSIGNMENT")
@@ -866,21 +928,24 @@ def process_assignment_action(personnel_id, unit_node_id, duty_position=None,
     execute(
         """UPDATE personnel
            SET unit_node_id=%s,unit_code=%s,platoon=%s,squad=%s,
-               duty_position=%s,field_status='Assigned',updated_at=NOW()
+               fire_team=%s,duty_position=%s,field_status='Assigned',updated_at=NOW()
            WHERE id=%s""",
         (unit_node_id, legacy["unit_code"], legacy["platoon"], legacy["squad"],
-         new_duty, personnel_id),
+         fire_team if fire_team is not None else person.get("fire_team"), new_duty, personnel_id),
     )
     execute(
         """INSERT INTO assignment_history
-           (personnel_id,unit_node_id,unit_code,platoon,squad,duty_position,effective_date,is_current)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE)""",
+           (personnel_id,unit_node_id,unit_code,platoon,squad,fire_team,duty_position,effective_date,is_current)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE)""",
         (personnel_id, unit_node_id, legacy["unit_code"], legacy["platoon"],
-         legacy["squad"], new_duty, eff),
+         legacy["squad"], fire_team if fire_team is not None else person.get("fire_team"), new_duty, eff),
     )
 
     new_label = format_assignment_node(unit_node_id) or target["display_name"]
     narrative = f"Reassigned from {old_label or 'Replacement / Unassigned'} to {new_label}"
+    effective_team = fire_team if fire_team is not None else person.get("fire_team")
+    if effective_team:
+        narrative += f"; fire team: {effective_team}"
     if new_duty:
         narrative += f"; duty: {new_duty}"
     narrative += "."
@@ -890,14 +955,19 @@ def process_assignment_action(personnel_id, unit_node_id, duty_position=None,
                         authority, order_number, eff)
     create_personnel_order(personnel_id, "ASSIGNMENT", "UNIT ASSIGNMENT ORDERS", narrative, effective_date=eff, authority=authority, details={"assignment":new_label,"duty_position":new_duty}, source_key=f"ASSIGNMENT:{personnel_id}:{unit_node_id}:{eff}", document_number=order_number)
     enqueue_discord_role_sync(personnel_id,f'ASSIGNMENT {old_label}->{new_label}')
-    # Any assignment entry point may complete a Replacement Detachment workflow.
-    # The helper is intentionally idempotent and releases only when every gate is met.
+    # Replacement status ends the moment a Soldier receives a real Company/HQ
+    # assignment. Platoon/Squad/training/onboarding may continue afterward as
+    # normal personnel suspense, but the Soldier is no longer a Replacement.
     try:
-        case=fetch_one("SELECT id FROM recruiting_cases WHERE personnel_id=%s AND status IN ('REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING') LIMIT 1",(personnel_id,))
-        if case and 'finalize_replacement_release' in globals():
-            finalize_replacement_release(personnel_id,authority or 'BATTALION S-1')
+        if 'release_replacement_on_company_assignment' in globals():
+            release_replacement_on_company_assignment(personnel_id,authority or 'BATTALION S-1')
     except Exception:
-        log.exception('Replacement release check failed after assignment for %s',personnel_id)
+        log.exception('Replacement company-release check failed after assignment for %s',personnel_id)
+    try:
+        if 'reconcile_welcome_packet' in globals() and fetch_one("SELECT 1 FROM welcome_packets WHERE personnel_id=%s",(personnel_id,)):
+            reconcile_welcome_packet(personnel_id)
+    except Exception:
+        log.exception('Welcome Packet assignment reconciliation failed for %s',personnel_id)
 
 
 def personnel_form_catalogs():
@@ -907,7 +977,10 @@ def personnel_form_catalogs():
     nodes=fetch_all("""SELECT id,parent_id,unit_code,display_name,unit_type,sort_order FROM unit_nodes WHERE is_active=TRUE ORDER BY CASE unit_type WHEN 'Battalion' THEN 0 WHEN 'Company' THEN 1 WHEN 'Headquarters' THEN 2 WHEN 'Section' THEN 3 WHEN 'Platoon' THEN 4 WHEN 'Squad' THEN 5 ELSE 9 END,sort_order,display_name""")
     assignments=[]
     for n in nodes:
-        if str(n.get('unit_type') or '').lower()=='battalion':
+        unit_type=str(n.get('unit_type') or '').upper()
+        # Company assignment is the point at which a Soldier leaves Replacement
+        # Detachment. Platoon and Squad may be filed immediately or later.
+        if unit_type not in {'COMPANY','PLATOON','SQUAD','HEADQUARTERS','SECTION'}:
             continue
         assignments.append({**n,'assignment_label':format_assignment_node(n['id']) or n['display_name']})
     billets=fetch_all("""SELECT billet_code,billet_title,preferred_mos_code,unit_code,sort_order,is_leadership FROM unit_billets WHERE is_active=TRUE ORDER BY unit_code,sort_order,billet_title""")
@@ -922,7 +995,15 @@ def personnel_form_catalogs():
     for a in appointments:
         name=(a.get('appointment_name') or '').strip()
         if name: duty.setdefault(name.upper(),{'value':name,'label':name,'mos_code':None,'source':'APPOINTMENT'})
-    return {'ranks':ranks,'mos_catalog':mos,'organization_nodes':nodes,'assignment_options':assignments,'duty_positions':sorted(duty.values(),key=lambda x:x['label'].upper()),'appointment_catalog':appointments,'billet_catalog':billets}
+    fire_teams=[{'value':'','label':'UNASSIGNED / SQUAD HQ'},{'value':'ALPHA TEAM','label':'ALPHA TEAM'},{'value':'BRAVO TEAM','label':'BRAVO TEAM'}]
+    duty_statuses=[
+        {'value':'PRESENT FOR DUTY','label':'PRESENT FOR DUTY'},
+        {'value':'LEAVE','label':'AUTHORIZED LEAVE'},
+        {'value':'TEMPORARY DUTY','label':'TEMPORARY DUTY'},
+        {'value':'DETACHED','label':'DETACHED'},
+        {'value':'NOT PRESENT','label':'NOT PRESENT'},
+    ]
+    return {'ranks':ranks,'mos_catalog':mos,'organization_nodes':nodes,'assignment_options':assignments,'duty_positions':sorted(duty.values(),key=lambda x:x['label'].upper()),'appointment_catalog':appointments,'billet_catalog':billets,'fire_teams':fire_teams,'duty_statuses':duty_statuses}
 
 
 def validate_system_choice(value, rows, key):
@@ -1035,7 +1116,7 @@ def field_reputation(person):
     if weapon:
         insp=weapon_inspection_status(pid)
         if str(weapon.get('serviceability_status') or '').upper()=='SERVICEABLE' and int(weapon.get('rounds_since_cleaning') or 0)<250 and not (insp or {}).get('overdue'):
-            tags.append({'code':'WEAPONS_DISCIPLINED','label':'WEAPONS DISCIPLINED','detail':'Issued M16 is serviceable and maintained within battalion standards.'})
+            tags.append({'code':'M16_MAINTAINED','label':'M16 MAINTAINED','detail':'Your issued M16 is serviceable, recently maintained, and within battalion fouling/inspection standards.'})
     instructed=int((fetch_one("SELECT COUNT(DISTINCT event_id) total FROM battalion_event_instructors WHERE personnel_id=%s",(pid,)) or {'total':0}).get('total') or 0)
     if instructed>=5:
         tags.append({'code':'TRAINING_CADRE','label':'TRAINING CADRE','detail':f'{instructed} official training events instructed.'})
@@ -1051,6 +1132,36 @@ def field_reputation(person):
     return tags
 
 
+def hll_field_service_timeline(personnel_id, limit=80):
+    """Create immutable-looking timeline entries from the authoritative RCON ledger.
+
+    These rows are derived from hll_player_match_stats rather than manually filed;
+    they never grant awards, rank, qualifications, or official operation credit.
+    """
+    try:
+        rows=fetch_all("""SELECT ps.connected_seconds,ps.distance_meters,ps.infantry_kills,ps.deaths,ps.vehicle_kills,
+                                 ps.last_role_id,ms.id AS match_id,ms.map_id,ms.map_name,ms.game_mode,ms.started_at
+                          FROM hll_player_match_stats ps JOIN hll_match_sessions ms ON ms.id=ps.match_id
+                          WHERE ps.personnel_id=%s AND COALESCE(ps.connected_seconds,0)>0
+                          ORDER BY ms.started_at DESC LIMIT %s""",(str(personnel_id),limit)) or []
+        out=[]
+        for r in rows:
+            mode=r.get('game_mode') or _hll_mode_from_layer(r.get('map_id')) or 'Field Service'
+            seconds=int(r.get('connected_seconds') or 0); km=float(r.get('distance_meters') or 0)/1000
+            narrative=(f"RCON-verified HLL: Vietnam service: {seconds//3600}h {(seconds%3600)//60}m, "
+                       f"{km:.2f} km traveled, {int(r.get('infantry_kills') or 0)} infantry kills / {int(r.get('deaths') or 0)} deaths")
+            if r.get('vehicle_kills'): narrative+=f", {int(r.get('vehicle_kills') or 0)} vehicle kills"
+            if r.get('last_role_id'): narrative+=f". Last observed HLL role {r.get('last_role_id')}."
+            else: narrative+='.'
+            out.append({'id':f"HLL-{r.get('match_id')}",'event_type':'HLL_FIELD_SERVICE','personnel_id':personnel_id,
+                        'effective_date':r.get('started_at').date() if r.get('started_at') else date.today(),
+                        'title':f"FIELD SERVICE — {r.get('map_name') or r.get('map_id') or 'HLL: VIETNAM'}",
+                        'narrative':narrative,'reference_number':str(mode).upper(),'created_at':r.get('started_at')})
+        return out
+    except Exception:
+        return []
+
+
 def active_service_timeline(personnel_id, limit=250):
     rows=fetch_all("""SELECT bse.*,o.operation_number,o.title AS operation_title,wi.serial_number AS weapon_serial
                        FROM battalion_state_events bse
@@ -1063,7 +1174,18 @@ def active_service_timeline(personnel_id, limit=250):
         rows=fetch_all("""SELECT id,'SERVICE_RECORD_ENTRY' AS event_type,personnel_id,entry_date AS effective_date,
                            title,narrative,reference_number,created_at FROM personnel_service_history
                            WHERE personnel_id=%s ORDER BY entry_date ASC,created_at ASC LIMIT %s""",(personnel_id,limit))
-    return rows
+    # RCON field-service events are derived evidence, merged chronologically with
+    # administrative history without mutating Command-owned personnel records.
+    rows=list(rows or []) + hll_field_service_timeline(personnel_id, min(80,limit))
+    def _event_sort(r):
+        d=r.get('effective_date') or date.min
+        c=r.get('created_at') or datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            if isinstance(c,datetime) and c.tzinfo is None: c=c.replace(tzinfo=timezone.utc)
+        except Exception: pass
+        return (d,c)
+    rows.sort(key=_event_sort)
+    return rows[-limit:]
 
 
 def weapon_personality(weapon_id):
@@ -1086,7 +1208,15 @@ def weapon_personality(weapon_id):
                         LEFT JOIN operations o ON o.id=wre.operation_id WHERE wre.weapon_id=%s
                         ORDER BY wre.recorded_at DESC LIMIT 50""",(weapon_id,))
     maintenance=fetch_all("SELECT * FROM weapon_maintenance_log WHERE weapon_id=%s ORDER BY performed_at DESC LIMIT 40",(weapon_id,))
-    return {'weapon':w,'operations_carried':ops,'cleanings':cleanings,'inspections':inspections,'holders':holders,'round_events':events,'maintenance':maintenance}
+    try:
+        current_holder=fetch_one("SELECT personnel_id FROM weapon_issue_history WHERE weapon_id=%s AND turned_in_at IS NULL ORDER BY issued_at DESC LIMIT 1",(weapon_id,)) or {}
+        hll=hll_service_statistics(current_holder.get('personnel_id')) if current_holder.get('personnel_id') else {}
+        rcon_observation={'verified_field_seconds':int(((hll or {}).get('totals') or {}).get('connected_seconds') or 0),
+                          'verified_matches':int(((hll or {}).get('totals') or {}).get('matches') or 0),
+                          'note':'RCON FIELD-CARRY OBSERVATION ONLY — server play does not automatically add rounds fired or change weapon condition.'}
+    except Exception:
+        rcon_observation={'verified_field_seconds':0,'verified_matches':0,'note':'RCON field-carry observation unavailable.'}
+    return {'weapon':w,'operations_carried':ops,'cleanings':cleanings,'inspections':inspections,'holders':holders,'round_events':events,'maintenance':maintenance,'rcon_observation':rcon_observation}
 
 
 def award_recommendation_evidence(personnel_id):
@@ -1276,7 +1406,7 @@ def operation_duty_suggestions(operation_id):
             if any(x in str(req.get('duty_role') or '').upper() for x in ['LEADER','SERGEANT','COMMANDER']):
                 load=leadership_load.get(str(p['id']),0)
                 score-=min(15,load*3)
-                if load: reasons.append(f'{load} recent leadership assignment(s)')
+                if load: reasons.append(f"{load} recent leadership assignment{'s' if load != 1 else ''}")
             if req.get('minimum_rank_code') and rank_order.get(p.get('rank_code'),0)<rank_order.get(req.get('minimum_rank_code'),0): continue
             if req.get('qualification_code'):
                 ok=fetch_one("""SELECT 1 FROM personnel_duty_qualifications pdq JOIN duty_qualification_types dqt ON dqt.id=pdq.qualification_type_id
@@ -1292,17 +1422,20 @@ def operation_duty_suggestions(operation_id):
 def member_personal_action_center(person):
     if not person: return []
     p=soldier_view(person); pid=p['id']; items=[]
+    weapon=current_weapon_for(p)
+    if weapon and int(weapon.get('rounds_since_cleaning') or 0)>=300:
+        items.append({'section':'S-4','title':'M16 CLEANING REQUIRED','detail':f"{int(weapon.get('rounds_since_cleaning') or 0)} rounds since last cleaning. Clean the issued rifle from the Wall Locker.",'priority':'HIGH' if int(weapon.get('rounds_since_cleaning') or 0)>=600 else 'WATCH','target':'my_weapon_service_history','anchor':None})
     insp=weapon_inspection_status(pid)
     if insp and insp.get('days') is not None and int(insp.get('days'))<=7:
-        items.append({'section':'S-4','title':'M16 INSPECTION','detail':f"Due in {max(0,int(insp.get('days')))} day(s).",'priority':'HIGH' if insp.get('overdue') else 'WATCH','target':'my_soldier_record','anchor':'weapon'})
+        items.append({'section':'S-4','title':'M16 INSPECTION','detail':f"Due in {max(0,int(insp.get('days')))} day{'s' if max(0,int(insp.get('days'))) != 1 else ''}.",'priority':'HIGH' if insp.get('overdue') else 'WATCH','target':'my_weapon_service_history','anchor':None})
     exp=fetch_one("""SELECT MIN(expires_at) due FROM qualifications WHERE personnel_id=%s AND expires_at BETWEEN CURRENT_DATE AND CURRENT_DATE+30""",(pid,))
     dexp=fetch_one("""SELECT MIN(expiration_date) due FROM personnel_duty_qualifications WHERE personnel_id=%s AND expiration_date BETWEEN CURRENT_DATE AND CURRENT_DATE+30""",(pid,))
     dates=[x.get('due') for x in [exp or {},dexp or {}] if x.get('due')]
     if dates:
-        due=min(dates); items.append({'section':'S-3','title':'QUALIFICATION EXPIRATION','detail':f'{(due-date.today()).days} days remaining.','priority':'WATCH','target':'my_soldier_record','anchor':'training'})
+        due=min(dates); items.append({'section':'S-3','title':'QUALIFICATION EXPIRATION','detail':f'{(due-date.today()).days} days remaining.','priority':'WATCH','target':'training','anchor':None})
     next_op=fetch_one("SELECT operation_number,title,start_at FROM operations WHERE start_at>NOW() AND UPPER(COALESCE(status,'')) NOT IN ('CANCELLED','CLOSED') ORDER BY start_at LIMIT 1")
     if next_op:
-        items.append({'section':'S-3','title':'UPCOMING OPERATION','detail':f"{next_op.get('operation_number') or ''} {next_op.get('title')} — {next_op.get('start_at')}",'priority':'ROUTINE','target':'my_soldier_record','anchor':'operations'})
+        items.append({'section':'S-3','title':'UPCOMING OPERATION','detail':f"{next_op.get('operation_number') or ''} {next_op.get('title')} — {next_op.get('start_at')}",'priority':'ROUTINE','target':'operations','anchor':None})
     tour=member_tour_phase(p)
     if tour.get('days_to_deros') is not None:
         items.append({'section':'S-1','title':'DEROS','detail':f"{tour.get('days_to_deros')} days remaining in current tour.",'priority':'WATCH' if tour.get('days_to_deros')<=60 else 'ROUTINE','target':'my_201_file','anchor':'tour'})
@@ -1318,6 +1451,64 @@ def member_personal_action_center(person):
 def next_recommended_action(person):
     items=member_personal_action_center(person)
     return items[0] if items else {'section':'HEADQUARTERS','title':'MAINTAIN READINESS','detail':'No immediate deficiency is on file. Continue unit participation and maintain current qualifications.','priority':'ROUTINE'}
+
+
+MEMBER_DUTY_ENDPOINTS = {
+    'my_soldier_record','welcome_packet','my_201_file','orders','training','operations',
+    'my_squad','my_unit','my_weapon_service_history','my_qualification_card','my_tour_book'
+}
+
+def member_duty_desk(person):
+    """Read-only attention layer for the Wall Locker.
+
+    This deliberately does not create or modify personnel, training, operations, weapon,
+    onboarding, or Discord records. It only points the Soldier at the existing
+    authoritative system that owns the action.
+    """
+    if not person:
+        return {'items': [], 'count': 0, 'all_clear': True}
+    p=soldier_view(person); pid=p['id']; items=[]; seen=set()
+    def add(title, detail, section, endpoint, anchor=None, priority='ROUTINE', kind='ACTION'):
+        key=(str(title or '').strip().upper(), str(endpoint or ''))
+        if not title or key in seen: return
+        seen.add(key)
+        endpoint=endpoint if endpoint in MEMBER_DUTY_ENDPOINTS else 'my_soldier_record'
+        items.append({'title':title,'detail':detail or '', 'section':section or 'HEADQUARTERS',
+                      'endpoint':endpoint,'anchor':anchor,'priority':priority or 'ROUTINE','kind':kind})
+    try:
+        wp=welcome_packet_context(pid)
+        packet=wp.get('packet') if isinstance(wp,dict) else None
+        if packet and str(packet.get('status') or '').upper()!='COMPLETE':
+            add('WELCOME PACKET — ACTION REQUIRED',f"{wp.get('percent',0)}% complete • {str(packet.get('status') or 'IN PROGRESS').replace('_',' ')}",
+                'S-1','welcome_packet',priority='HIGH',kind='ONBOARDING')
+    except Exception:
+        log.exception('Member Duty Desk welcome-packet read failed for %s',pid)
+    try:
+        for n in current_notifications(pid)[:3]:
+            endpoint=str(n.get('target_endpoint') or 'my_soldier_record')
+            add(n.get('title') or 'HEADQUARTERS NOTICE',n.get('message') or '',n.get('section') or 'HEADQUARTERS',
+                endpoint,n.get('target_anchor'),n.get('priority') or 'ROUTINE','NOTICE')
+    except Exception:
+        log.exception('Member Duty Desk notification read failed for %s',pid)
+    try:
+        for a in member_personal_action_center(p):
+            title=str(a.get('title') or '')
+            endpoint=a.get('target') or 'my_soldier_record'; anchor=a.get('anchor')
+            upper=title.upper()
+            if 'M16' in upper and 'CLEAN' in upper:
+                endpoint='my_weapon_service_history'; anchor=None
+            elif 'M16' in upper:
+                endpoint='my_weapon_service_history'; anchor=None
+            elif 'QUALIFICATION' in upper or 'TRAINING' in upper:
+                endpoint='training'; anchor=None
+            elif 'OPERATION' in upper:
+                endpoint='operations'; anchor=None
+            elif 'PROMOTION' in upper:
+                endpoint='my_201_file'; anchor='promotion-eligibility'
+            add(title,a.get('detail'),a.get('section'),endpoint,anchor,a.get('priority'),'ACTION')
+    except Exception:
+        log.exception('Member Duty Desk action read failed for %s',pid)
+    return {'items':items[:7],'count':len(items),'all_clear':not bool(items)}
 
 
 def appointment_for_node(appointment_code, node_id=None):
@@ -1359,6 +1550,22 @@ def chain_of_command_for(personnel):
     company = next((n for n in ancestry if n["unit_type"]=="Company"), None)
 
     chain = []
+    # Fire-team Soldiers report first to their Team Leader when one is formally appointed
+    # to the same squad and carries the same Alpha/Bravo fire-team assignment.
+    if squad and personnel.get("fire_team"):
+        team_leader = fetch_one(
+            """SELECT p.*,pa.organization,pa.effective_date AS appointment_effective_date
+               FROM personnel_appointments pa
+               JOIN personnel p ON p.id=pa.personnel_id
+               WHERE pa.appointment_code='FTL' AND pa.is_current=TRUE
+                 AND pa.unit_node_id=%s AND UPPER(COALESCE(p.fire_team,''))=UPPER(%s)
+                 AND p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE
+               ORDER BY pa.effective_date DESC LIMIT 1""",
+            (squad["id"], personnel.get("fire_team")),
+        )
+        if team_leader and str(team_leader["id"]) != str(personnel["id"]):
+            team_leader["chain_title"] = "Team Leader"
+            chain.append(team_leader)
     checks = [
         ("Squad Leader","SL", squad),
         ("Platoon Sergeant","PSG", platoon),
@@ -1368,7 +1575,7 @@ def chain_of_command_for(personnel):
         ("Battalion Sergeant Major","BN_SGM", None),
         ("Battalion Commander","BN_CO", None),
     ]
-    seen = set()
+    seen = {str(x["id"]) for x in chain}
     for title, code, node in checks:
         leader = appointment_for_node(code, node["id"] if node else None)
         if leader and str(leader["id"]) != str(personnel["id"]) and str(leader["id"]) not in seen:
@@ -1378,8 +1585,74 @@ def chain_of_command_for(personnel):
     return chain
 
 
+def _rank_order_sql(alias="p"):
+    """Canonical rank-precedence ordering for every personnel roster."""
+    return f"COALESCE(rc.precedence,0) DESC, {alias}.last_name, {alias}.first_name"
+
+
+def current_field_leadership_appointment(personnel):
+    """Return the Soldier's most relevant current field-leadership billet."""
+    if not personnel:
+        return None
+    rows=fetch_all(
+        """SELECT pa.*,ac.appointment_name,ac.echelon,ac.sort_order
+           FROM personnel_appointments pa
+           JOIN appointment_catalog ac ON ac.appointment_code=pa.appointment_code
+           WHERE pa.personnel_id=%s AND pa.is_current=TRUE
+             AND pa.appointment_code IN ('PSG','SL','ASST_SL','FTL')
+           ORDER BY CASE pa.appointment_code WHEN 'PSG' THEN 1 WHEN 'SL' THEN 2 WHEN 'ASST_SL' THEN 3 WHEN 'FTL' THEN 4 ELSE 9 END,
+                    pa.effective_date DESC,pa.created_at DESC""",
+        (personnel['id'],),
+    ) or []
+    return rows[0] if rows else None
+
+
+def member_squad_scope(personnel):
+    """Resolve what MY SQUAD should display from billet first, assignment second."""
+    if not personnel:
+        return None, None, None
+    appt=current_field_leadership_appointment(personnel)
+    if appt and appt.get('unit_node_id'):
+        node=unit_node(appt['unit_node_id'])
+        if node:
+            code=appt.get('appointment_code')
+            if code=='PSG':
+                platoon=node if str(node.get('unit_type') or '').lower()=='platoon' else next((n for n in unit_ancestry(node['id']) if str(n.get('unit_type') or '').lower()=='platoon'),None)
+                return platoon, None, appt
+            squad=node if str(node.get('unit_type') or '').lower()=='squad' else next((n for n in unit_ancestry(node['id']) if str(n.get('unit_type') or '').lower()=='squad'),None)
+            if squad:
+                team=(appt.get('fire_team') or personnel.get('fire_team') or '').upper().strip() if code=='FTL' else None
+                return squad, team or None, appt
+    if personnel.get('unit_node_id'):
+        ancestry=unit_ancestry(personnel['unit_node_id'])
+        squad=next((n for n in ancestry if str(n.get('unit_type') or '').lower()=='squad'),None)
+        if squad:
+            return squad, None, appt
+    return None, None, appt
+
+
+def squad_roster_for(personnel):
+    target, action_team, appt = member_squad_scope(personnel)
+    if not target:
+        return [], None, None, appt, set()
+    ids=unit_descendant_ids(target['id']) or [target['id']]
+    rows=fetch_all("""SELECT p.*,COALESCE(rc.precedence,0) AS rank_precedence
+                       FROM personnel p
+                       LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code
+                       WHERE p.unit_node_id=ANY(%s) AND p.separated_at IS NULL
+                         AND COALESCE(p.archived,FALSE)=FALSE
+                       ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name""",(ids,)) or []
+    actionable=set()
+    code=(appt or {}).get('appointment_code')
+    if code in {'SL','ASST_SL','PSG'}:
+        actionable={str(x.get('id')) for x in rows}
+    elif code=='FTL' and action_team:
+        actionable={str(x.get('id')) for x in rows if str(x.get('fire_team') or '').upper().strip()==action_team}
+    return rows,target,action_team,appt,actionable
+
+
 def scoped_personnel_for(personnel):
-    """Personnel a leader should see on the My Soldiers page."""
+    """Personnel a leader should see in the legacy leader scope helper."""
     if not personnel:
         return [], None
 
@@ -1416,18 +1689,37 @@ def scoped_personnel_for(personnel):
     ids = unit_descendant_ids(scope_node["id"])
     if not ids:
         return [], scope_node
-    soldiers = fetch_all(
-        """SELECT p.*,
-                  wi.serial_number AS weapon_serial,
-                  wi.condition_state AS weapon_condition,
-                  wi.condition_percent AS weapon_percent
-           FROM personnel p
-           LEFT JOIN weapon_issue_history wih ON wih.personnel_id=p.id AND wih.is_current=TRUE
-           LEFT JOIN weapon_inventory wi ON wi.id=wih.weapon_id
-           WHERE p.unit_node_id = ANY(%s)
-           ORDER BY p.platoon NULLS FIRST,p.squad NULLS FIRST,p.last_name""",
-        (ids,),
-    )
+    # A Team Leader owns only his Alpha/Bravo team. Other NCO leadership appointments
+    # retain their normal squad/platoon/company scope.
+    active_ftl = next((x for x in current_appts if x["appointment_code"]=="FTL" and x.get("unit_node_id") and str(x.get("unit_node_id"))==str(scope_node.get("id"))), None)
+    team_filter = (personnel.get("fire_team") or '').upper().strip() if active_ftl else ''
+    if team_filter:
+        soldiers = fetch_all(
+            """SELECT p.*,
+                      wi.serial_number AS weapon_serial,
+                      wi.condition_state AS weapon_condition,
+                      wi.condition_percent AS weapon_percent
+               FROM personnel p
+               LEFT JOIN weapon_issue_history wih ON wih.personnel_id=p.id AND wih.is_current=TRUE
+               LEFT JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+               WHERE p.unit_node_id = ANY(%s) AND UPPER(COALESCE(p.fire_team,''))=%s
+               ORDER BY COALESCE((SELECT precedence FROM rank_catalog rc WHERE rc.rank_code=p.rank_code),0) DESC,p.last_name,p.first_name""",
+            (ids,team_filter),
+        )
+        scope_node={**scope_node,'display_name':f"{scope_node.get('display_name')} — {team_filter}",'fire_team':team_filter}
+    else:
+        soldiers = fetch_all(
+            """SELECT p.*,
+                      wi.serial_number AS weapon_serial,
+                      wi.condition_state AS weapon_condition,
+                      wi.condition_percent AS weapon_percent
+               FROM personnel p
+               LEFT JOIN weapon_issue_history wih ON wih.personnel_id=p.id AND wih.is_current=TRUE
+               LEFT JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+               WHERE p.unit_node_id = ANY(%s)
+               ORDER BY COALESCE((SELECT precedence FROM rank_catalog rc WHERE rc.rank_code=p.rank_code),0) DESC,p.last_name,p.first_name""",
+            (ids,),
+        )
     return soldiers, scope_node
 
 
@@ -1557,7 +1849,7 @@ def readiness_score(person):
         elif inactive_days < t["property"]: activity_points=12
         elif inactive_days < t["command"]: activity_points=5
         else: activity_points=0
-        breakdown["activity"] = {"points":activity_points,"max":30,"detail":f"{inactive_days} day(s) since qualifying activity"}
+        breakdown["activity"] = {"points":activity_points,"max":30,"detail":f"{inactive_days} day{'s' if inactive_days != 1 else ''} since qualifying activity"}
 
     # 2. Training / qualifications. Initial processing is the foundation; current
     # qualifications add the remainder. Expired credentials immediately reduce readiness until renewed.
@@ -1580,7 +1872,7 @@ def readiness_score(person):
         expired_count=int(expired.get("total") or 0)
         if expired_count:
             training_points=max(0,training_points-min(15,expired_count*5))
-        breakdown["training"] = {"points":training_points,"max":25,"detail":f"{qual_count} current qualification(s) • {expired_count} expired"}
+        breakdown["training"] = {"points":training_points,"max":25,"detail":f"{qual_count} current qualification{'s' if qual_count != 1 else ''} • {expired_count} expired"}
     except Exception:
         log.exception("Readiness training score failed for %s", pid)
         breakdown["training"] = {"points":training_points,"max":25,"detail":"training data unavailable"}
@@ -1632,7 +1924,7 @@ def readiness_score(person):
                                AND UPPER(source) IN ('BATTALION DUTY','OPERATION','TRAINING')""", (pid,)) or {"total":0}
         duty_count = int(duty.get("total") or 0)
         duty_points = 10 if duty_count >= 2 else (5 if duty_count == 1 else 0)
-        breakdown["duty"] = {"points":duty_points,"max":10,"detail":f"{duty_count} credited official duty period(s) in last 30 days"}
+        breakdown["duty"] = {"points":duty_points,"max":10,"detail":f"{duty_count} credited official duty period{'s' if duty_count != 1 else ''} in the last 30 days"}
     except Exception:
         log.exception("Readiness duty score failed for %s", pid)
         breakdown["duty"] = {"points":0,"max":10,"detail":"official duty data unavailable"}
@@ -1689,7 +1981,7 @@ def soldier_readiness(person):
             deficiencies.append(("ADMIN",progress.get("promotion_hold_reason") or "PROMOTION / ADMINISTRATIVE HOLD"))
         expired=fetch_one("SELECT COUNT(*) total FROM qualifications WHERE personnel_id=%s AND expires_at<CURRENT_DATE",(person["id"],)) or {"total":0}
         if int(expired.get("total") or 0)>0:
-            deficiencies.append(("TRAINING",f"{expired['total']} EXPIRED QUALIFICATION(S)"))
+            deficiencies.append(("TRAINING",f"{expired['total']} EXPIRED QUALIFICATION{'S' if int(expired['total']) != 1 else ''}"))
     except Exception:
         log.exception("Readiness supplemental check failed for %s",person.get("id"))
 
@@ -1860,15 +2152,13 @@ def weapon_condition_from_rounds_and_time(weapon, person=None):
     # overwhelming real ammunition expenditure.
     neglect_equivalent=min(450,neglect_days*15)
     effective_fouling=since_clean+neglect_equivalent
-    fouling_penalty=min(70,(since_clean//10)+(neglect_equivalent//10))
+    fouling_penalty=min(85,(effective_fouling*85)//900)
     score=max(0,100-fouling_penalty)
     if str(weapon.get("status") or "").upper()=="MAINTENANCE":
         score=min(score,30)
-    if score<=15: state="UNSERVICEABLE"
-    elif score<=30: state="MAINTENANCE REQUIRED"
-    elif effective_fouling>=450: state="CLEANING REQUIRED"
-    elif effective_fouling>=250: state="HEAVY FOULING"
-    elif effective_fouling>=100: state="FOULED"
+    if effective_fouling>=900: state="UNSERVICEABLE"
+    elif effective_fouling>=600: state="HEAVILY FOULED"
+    elif effective_fouling>=300: state="LIGHT FOULING"
     else: state="SERVICEABLE"
     return state,score
 
@@ -1885,6 +2175,100 @@ def refresh_weapon_condition(weapon_id):
             (state,pct,weapon_id))
     weapon["condition_state"], weapon["condition_percent"] = state, pct
     return weapon
+
+
+def reconcile_weapon_rounds_since_cleaning(weapon_id):
+    """Rebuild the fouling counter from the authoritative round ledger.
+
+    Historical voice/operation reconciliation can arrive after a Soldier cleans the
+    rifle.  Those old rounds must increase lifetime rounds without making a freshly
+    cleaned rifle dirty again.  The maintenance timestamp is therefore the boundary
+    for the current fouling cycle.
+    """
+    weapon=fetch_one("SELECT id,last_cleaned_at FROM weapon_inventory WHERE id=%s",(weapon_id,))
+    if not weapon:
+        return 0
+    if not weapon.get("last_cleaned_at"):
+        return int((fetch_one("SELECT rounds_since_cleaning FROM weapon_inventory WHERE id=%s",(weapon_id,)) or {}).get("rounds_since_cleaning") or 0)
+    row=fetch_one("""SELECT COALESCE(SUM(rounds_fired),0)::int AS total
+                     FROM weapon_round_events
+                     WHERE weapon_id=%s AND recorded_at>%s""",(weapon_id,weapon["last_cleaned_at"])) or {"total":0}
+    total=max(0,int(row.get("total") or 0))
+    execute("UPDATE weapon_inventory SET rounds_since_cleaning=%s,updated_at=NOW() WHERE id=%s",(total,weapon_id))
+    return total
+
+
+def _round_event_time_from_source_key(source_key):
+    """Recover the real firing time from idempotent Discord voice source keys."""
+    key=str(source_key or "")
+    try:
+        if key.startswith("VOICE:"):
+            parts=key.split(":")
+            if len(parts)>=6:
+                start=datetime.fromtimestamp(int(parts[-2]),tz=timezone.utc)
+                return start+timedelta(seconds=max(0,int(parts[-1]))*300)
+        if key.startswith("VOICE-HIST:"):
+            # VOICE-HIST:guild:user:channel:<ISO8601>:block
+            m=re.match(r"^VOICE-HIST:[^:]+:[^:]+:[^:]+:(.+):(\d+)$",key)
+            if m:
+                start=datetime.fromisoformat(m.group(1).replace("Z","+00:00"))
+                if start.tzinfo is None: start=start.replace(tzinfo=timezone.utc)
+                return start+timedelta(seconds=max(0,int(m.group(2)))*300)
+    except Exception:
+        return None
+    return None
+
+
+def repair_weapon_round_ledger_integrity():
+    """Repair historical event timestamps, then rebuild post-clean fouling counters.
+
+    Safe and idempotent.  This specifically prevents delayed Clerk backfills from
+    making a rifle appear unclean immediately after the Soldier cleaned it.
+    """
+    timestamp_repairs=0
+    for row in fetch_all("""SELECT id,source_key,recorded_at FROM weapon_round_events
+                            WHERE source_key LIKE 'VOICE:%%' OR source_key LIKE 'VOICE-HIST:%%'"""):
+        actual=_round_event_time_from_source_key(row.get("source_key"))
+        if actual and row.get("recorded_at") and abs((row["recorded_at"]-actual).total_seconds())>60:
+            execute("UPDATE weapon_round_events SET recorded_at=%s WHERE id=%s",(actual,row["id"]))
+            timestamp_repairs+=1
+    # Completed operation reconciliations belong to the operation, not the later
+    # maintenance job that happened to discover them.
+    execute("""UPDATE weapon_round_events wre SET recorded_at=COALESCE(o.completed_at,o.start_at,wre.recorded_at)
+               FROM operations o
+               WHERE wre.operation_id=o.id AND UPPER(COALESCE(wre.source_type,''))='OPERATION RECORD'
+                 AND UPPER(COALESCE(o.status,'')) IN ('CLOSED','COMPLETE','COMPLETED','ARCHIVED')
+                 AND COALESCE(o.completed_at,o.start_at) IS NOT NULL
+                 AND wre.recorded_at>COALESCE(o.completed_at,o.start_at)+INTERVAL '5 minutes'""")
+    counters=0
+    for row in fetch_all("SELECT id FROM weapon_inventory WHERE last_cleaned_at IS NOT NULL"):
+        reconcile_weapon_rounds_since_cleaning(row["id"]); refresh_weapon_condition(row["id"]); counters+=1
+    return {"timestamp_repairs":timestamp_repairs,"counters_rebuilt":counters}
+
+
+def file_weapon_cleaning(weapon_id,personnel_id=None,performed_by=None,remarks=None):
+    """Atomically reset the rifle and file its maintenance record."""
+    row=fetch_one("""WITH prior AS (
+                       SELECT id,condition_state,total_rounds FROM weapon_inventory WHERE id=%s FOR UPDATE
+                     ), updated AS (
+                       UPDATE weapon_inventory wi SET rounds_since_cleaning=0,last_cleaned_at=NOW(),
+                         condition_percent=100,condition_state='SERVICEABLE',updated_at=NOW()
+                       FROM prior WHERE wi.id=prior.id
+                       RETURNING wi.id,wi.serial_number,wi.total_rounds,wi.last_cleaned_at,wi.condition_state,wi.condition_percent,prior.condition_state AS condition_before
+                     ), logged AS (
+                       INSERT INTO weapon_maintenance_log
+                         (weapon_id,personnel_id,action_type,condition_before,condition_after,rounds_at_action,performed_by,remarks)
+                       SELECT id,%s,'CLEANED',condition_before,'SERVICEABLE',total_rounds,%s,%s FROM updated
+                       RETURNING id AS maintenance_log_id
+                     )
+                     SELECT updated.*,logged.maintenance_log_id FROM updated CROSS JOIN logged""",
+                  (weapon_id,personnel_id,performed_by,remarks))
+    if not row:
+        raise ValueError("Weapon cleaning could not be filed")
+    reconcile_weapon_rounds_since_cleaning(weapon_id)
+    refreshed=refresh_weapon_condition(weapon_id) or {}
+    row.update(refreshed)
+    return row
 
 
 def current_equipment_for(personnel_id):
@@ -1946,7 +2330,7 @@ def ensure_standard_uniform(personnel_id, authority="S-4 SUPPLY"):
             personnel_id,
             "AG44",
             authority,
-            "Standard service uniform issue upon entry on battalion rolls.",
+            "Standard service uniform issue upon entry on the Battle Roster.",
         )
     except ValueError:
         return None
@@ -1986,13 +2370,12 @@ def weapon_maintenance_action(weapon_id,action_type,personnel_id=None,performed_
         raise ValueError("Weapon not found")
     before = weapon.get("condition_state")
     action = action_type.upper()
+    already_logged=False
     if action == "CLEANED":
-        execute("""UPDATE weapon_inventory SET rounds_since_cleaning=0,last_cleaned_at=NOW(),
-                   condition_percent=100,condition_state='SERVICEABLE',updated_at=NOW() WHERE id=%s""",
-                (weapon_id,))
-        refreshed = refresh_weapon_condition(weapon_id) or {}
-        new_state = refreshed.get("condition_state") or "SERVICEABLE"
-        new_pct = int(refreshed.get("condition_percent") or 100)
+        refreshed=file_weapon_cleaning(weapon_id,personnel_id,performed_by,remarks)
+        new_state=refreshed.get("condition_state") or "SERVICEABLE"
+        new_pct=int(refreshed.get("condition_percent") or 100)
+        already_logged=True
     elif action == "INSPECTED":
         new_state,new_pct = weapon_condition_from_rounds_and_time({**weapon,"condition_percent":max(int(weapon.get("condition_percent") or 0),85)}, None)
         if new_state in {"FIELD WORN","FOULED"}:
@@ -2002,9 +2385,12 @@ def weapon_maintenance_action(weapon_id,action_type,personnel_id=None,performed_
                    condition_state=%s,updated_at=NOW() WHERE id=%s""",(new_pct,new_state,weapon_id))
     elif action == "MAINTENANCE COMPLETED":
         new_state,new_pct="SERVICEABLE",100
-        execute("""UPDATE weapon_inventory SET condition_state=%s,condition_percent=%s,
+        current_issue=fetch_one("SELECT 1 FROM weapon_issue_history WHERE weapon_id=%s AND is_current=TRUE",(weapon_id,))
+        inventory_status="ISSUED" if current_issue else "AVAILABLE FOR ISSUE"
+        execute("""UPDATE weapon_inventory SET condition_state=%s,condition_percent=%s,status=%s,
                    last_inspected_at=NOW(),last_cleaned_at=NOW(),rounds_since_cleaning=0,
-                   updated_at=NOW() WHERE id=%s""",(new_state,new_pct,weapon_id))
+                   updated_at=NOW() WHERE id=%s""",(new_state,new_pct,inventory_status,weapon_id))
+        reconcile_weapon_rounds_since_cleaning(weapon_id)
     elif action == "PLACED IN MAINTENANCE":
         new_state,new_pct="MAINTENANCE REQUIRED",min(int(weapon.get("condition_percent") or 100),30)
         execute("""UPDATE weapon_inventory SET condition_state=%s,condition_percent=%s,
@@ -2012,34 +2398,65 @@ def weapon_maintenance_action(weapon_id,action_type,personnel_id=None,performed_
     else:
         raise ValueError("Unsupported maintenance action")
 
-    execute("""INSERT INTO weapon_maintenance_log
-               (weapon_id,personnel_id,action_type,condition_before,condition_after,
-                rounds_at_action,performed_by,remarks)
-               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (weapon_id,personnel_id,action,before,new_state,int(weapon.get("total_rounds") or 0),performed_by,remarks))
+    if not already_logged:
+        execute("""INSERT INTO weapon_maintenance_log
+                   (weapon_id,personnel_id,action_type,condition_before,condition_after,
+                    rounds_at_action,performed_by,remarks)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (weapon_id,personnel_id,action,before,new_state,int(weapon.get("total_rounds") or 0),performed_by,remarks))
     if personnel_id:
         write_service_entry(personnel_id,"ARMS",action,
                             f"M16 serial {weapon.get('serial_number')} — {action.lower()}.",
                             performed_by,None,date.today())
+    return refresh_weapon_condition(weapon_id) or fetch_one("SELECT * FROM weapon_inventory WHERE id=%s",(weapon_id,))
 
 
-def record_weapon_rounds(weapon_id,rounds,personnel_id=None,operation_id=None,source_type="MANUAL ENTRY",recorded_by=None,remarks=None):
+def record_weapon_rounds(weapon_id,rounds,personnel_id=None,operation_id=None,source_type="MANUAL ENTRY",recorded_by=None,remarks=None,occurred_at=None):
     rounds=max(0,int(rounds))
+    occurred_at=occurred_at or datetime.now(timezone.utc)
     execute("""INSERT INTO weapon_round_events
-               (weapon_id,personnel_id,operation_id,rounds_fired,source_type,recorded_by,remarks)
-               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-            (weapon_id,personnel_id,operation_id,rounds,source_type,recorded_by,remarks))
+               (weapon_id,personnel_id,operation_id,rounds_fired,source_type,recorded_at,recorded_by,remarks)
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (weapon_id,personnel_id,operation_id,rounds,source_type,occurred_at,recorded_by,remarks))
     execute("""UPDATE weapon_inventory SET total_rounds=COALESCE(total_rounds,0)+%s,
-               rounds_since_cleaning=COALESCE(rounds_since_cleaning,0)+%s,
-               last_fired_at=NOW(),updated_at=NOW() WHERE id=%s""",(rounds,rounds,weapon_id))
+               rounds_since_cleaning=COALESCE(rounds_since_cleaning,0)+CASE WHEN last_cleaned_at IS NULL OR %s>last_cleaned_at THEN %s ELSE 0 END,
+               last_fired_at=GREATEST(COALESCE(last_fired_at,%s),%s),updated_at=NOW() WHERE id=%s""",
+            (rounds,occurred_at,rounds,occurred_at,occurred_at,weapon_id))
+    reconcile_weapon_rounds_since_cleaning(weapon_id)
     refresh_weapon_condition(weapon_id)
     if personnel_id:
         op=operation_record(operation_id) if operation_id else None
         emit_state_event('WEAPON_ROUNDS_FIRED',personnel_id=personnel_id,operation_id=operation_id,weapon_id=weapon_id,
-                         effective_date=date.today(),title='M16 AMMUNITION EXPENDITURE',
+                         effective_date=occurred_at.date(),title='M16 AMMUNITION EXPENDITURE',
                          narrative=f"{rounds} rounds recorded" + (f" for {op.get('operation_number') or op.get('title')}" if op else '') + '.',
-                         source_key=f"ROUND:{weapon_id}:{personnel_id}:{operation_id}:{source_type}:{rounds}:{datetime.now(timezone.utc).isoformat()}",
+                         source_key=f"ROUND:{weapon_id}:{personnel_id}:{operation_id}:{source_type}:{rounds}:{occurred_at.isoformat()}",
                          details={'rounds':rounds,'source_type':source_type,'recorded_by':recorded_by})
+
+
+def record_voice_weapon_rounds(personnel_id, rounds, source_key, source_type="DISCORD ACTIVITY VOICE", recorded_by="BATTALION CLERK", remarks=None, occurred_at=None):
+    """Idempotently file a verified Discord voice ammunition segment at its real time."""
+    rounds=max(0,int(rounds or 0))
+    if rounds<=0 or not source_key:
+        return {"applied":0,"reason":"no completed ammunition block"}
+    weapon=fetch_one("""SELECT wi.* FROM weapon_issue_history wih JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+                        WHERE wih.personnel_id=%s AND wih.is_current=TRUE ORDER BY wih.issued_at DESC LIMIT 1""",(personnel_id,))
+    if not weapon:
+        return {"applied":0,"reason":"no current M16 issued"}
+    occurred_at=occurred_at or _round_event_time_from_source_key(source_key) or datetime.now(timezone.utc)
+    inserted=fetch_one("""INSERT INTO weapon_round_events
+        (weapon_id,personnel_id,rounds_fired,source_type,recorded_at,recorded_by,remarks,source_key)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(source_key) DO NOTHING RETURNING id""",
+        (weapon["id"],personnel_id,rounds,source_type,occurred_at,recorded_by,remarks,source_key))
+    if not inserted:
+        return {"applied":0,"duplicate":True,"weapon_id":str(weapon["id"])}
+    execute("""UPDATE weapon_inventory SET total_rounds=COALESCE(total_rounds,0)+%s,
+               rounds_since_cleaning=COALESCE(rounds_since_cleaning,0)+CASE WHEN last_cleaned_at IS NULL OR %s>last_cleaned_at THEN %s ELSE 0 END,
+               last_fired_at=GREATEST(COALESCE(last_fired_at,%s),%s),updated_at=NOW() WHERE id=%s""",
+            (rounds,occurred_at,rounds,occurred_at,occurred_at,weapon["id"]))
+    current_since=reconcile_weapon_rounds_since_cleaning(weapon["id"])
+    refreshed=refresh_weapon_condition(weapon["id"]) or {}
+    return {"applied":rounds,"weapon_id":str(weapon["id"]),"serial_number":weapon.get("serial_number"),
+            "condition":refreshed.get("condition_state"),"rounds_since_cleaning":current_since,"occurred_at":occurred_at.isoformat()}
 
 
 def operation_weapon_rounds_applied(operation_id, personnel_id, weapon_id=None):
@@ -2055,40 +2472,53 @@ def operation_weapon_rounds_applied(operation_id, personnel_id, weapon_id=None):
 
 
 def reconcile_operation_weapon_rounds(operation_id, personnel_id, expected_rounds,
-                                      recorded_by="BATTALION CLERK", remarks=None):
+                                      recorded_by="BATTALION CLERK", remarks=None, occurred_at=None):
     expected=max(0,int(expected_rounds or 0))
+    if expected<=0:
+        return 0
+    op=operation_record(operation_id) or {}
+    op_date=(op.get("start_at").date() if op.get("start_at") else op.get("operation_date")) or date.today()
+    # Historical reconciliation must credit the rifle that was actually issued on the
+    # operation date when issue history is available, not blindly today's current rifle.
     weapon=fetch_one("""SELECT wi.id,wi.serial_number FROM weapon_issue_history wih
                         JOIN weapon_inventory wi ON wi.id=wih.weapon_id
-                        WHERE wih.personnel_id=%s AND wih.is_current=TRUE
-                        ORDER BY wih.issued_at DESC LIMIT 1""",(personnel_id,))
-    if not weapon or expected<=0:
+                        WHERE wih.personnel_id=%s AND wih.issued_at<=%s
+                          AND (wih.turned_in_at IS NULL OR wih.turned_in_at>=%s)
+                        ORDER BY CASE WHEN wih.is_current THEN 0 ELSE 1 END,wih.issued_at DESC LIMIT 1""",
+                     (personnel_id,op_date,op_date))
+    if not weapon:
+        weapon=fetch_one("""SELECT wi.id,wi.serial_number FROM weapon_issue_history wih
+                            JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+                            WHERE wih.personnel_id=%s AND wih.is_current=TRUE
+                            ORDER BY wih.issued_at DESC LIMIT 1""",(personnel_id,))
+    if not weapon:
         return 0
     applied=operation_weapon_rounds_applied(operation_id,personnel_id,weapon["id"])
     delta=max(0,expected-applied)
     if delta:
+        inferred_time=occurred_at or op.get("completed_at") or op.get("start_at") or datetime.now(timezone.utc)
+        if isinstance(inferred_time,date) and not isinstance(inferred_time,datetime):
+            inferred_time=datetime.combine(inferred_time,time.min,tzinfo=timezone.utc)
+        elif getattr(inferred_time,"tzinfo",None) is None:
+            inferred_time=inferred_time.replace(tzinfo=timezone.utc)
         record_weapon_rounds(weapon["id"],delta,personnel_id,operation_id,
                              "OPERATION RECORD",recorded_by,
-                             remarks or f"Automatic operation ammunition reconciliation; {delta} previously unapplied rounds filed.")
+                             remarks or f"Automatic operation ammunition reconciliation; {delta} previously unapplied rounds filed.",
+                             occurred_at=inferred_time)
     return delta
 
 
 
 def operation_round_target_for_time(event, qualifying_seconds):
-    """Rounds that should exist in the weapon ledger for verified time already served.
+    """Return the cumulative M16 expenditure target from verified voice time.
 
-    S-3's rounds_per_soldier is treated as the expected expenditure for the full
-    scheduled operation. Battalion Clerk attendance chunks accrue toward it linearly.
+    Weapon expenditure is time based at 300 rounds/hour (5 rounds/minute).
+    The same rule is used for scheduled Operation voice and the configured
+    community Activity voice channel, eliminating the older lump-sum mismatch.
     """
-    total_rounds=max(0,int((event or {}).get("rounds_per_soldier") or 0))
-    if total_rounds<=0:
-        return 0
-    start=(event or {}).get("starts_at"); end=(event or {}).get("ends_at")
-    if start and end and end>start:
-        duration=max(300,int((end-start).total_seconds()))
-    else:
-        duration=max(300,int((event or {}).get("credit_threshold_minutes") or 45)*60)
-    served=max(0,min(int(qualifying_seconds or 0),duration))
-    return min(total_rounds,int(round(total_rounds*(served/duration))))
+    served=max(0,int(qualifying_seconds or 0))
+    # Credit only complete five-minute blocks: 25 rounds per block.
+    return (served // 300) * 25
 
 
 def accrue_live_operation_weapon_rounds(event, personnel_id, qualifying_seconds, authority="BATTALION CLERK"):
@@ -2100,7 +2530,8 @@ def accrue_live_operation_weapon_rounds(event, personnel_id, qualifying_seconds,
         return {"target":0,"applied":0}
     applied=reconcile_operation_weapon_rounds(
         event["operation_id"],personnel_id,target,authority,
-        f"Live operation ammunition accrual at {int(qualifying_seconds or 0)//60} verified minutes."
+        f"Live operation ammunition accrual at {int(qualifying_seconds or 0)//60} verified minutes.",
+        occurred_at=datetime.now(timezone.utc)
     )
     # If official participation already exists, keep its displayed expenditure in sync
     # with the actual weapon ledger as additional verified minutes accrue.
@@ -2108,6 +2539,170 @@ def accrue_live_operation_weapon_rounds(event, personnel_id, qualifying_seconds,
                WHERE operation_id=%s AND personnel_id=%s""",
             (target,event["operation_id"],personnel_id))
     return {"target":target,"applied":applied}
+
+
+
+def operation_presence_status(event, qualifying_seconds):
+    """Map verified Clerk voice presence to a non-inflating operation status."""
+    seconds=max(0,int(qualifying_seconds or 0))
+    threshold=max(300,int((event or {}).get("credit_threshold_minutes") or 45)*60)
+    partial_threshold=min(1200,max(300,threshold//2))
+    if seconds>=threshold:
+        return "FULL CREDIT",100
+    percent=min(99,round((seconds/threshold)*100)) if threshold else 0
+    if seconds>=partial_threshold:
+        return "PARTIAL / LATE",percent
+    if seconds>0:
+        return "TRACKED PRESENCE",percent
+    return "NO CREDIT",0
+
+
+def sync_operation_presence_from_attendance(event, personnel_id, qualifying_seconds,
+                                            authority="BATTALION CLERK", historical=False):
+    """Mirror verified voice attendance into the Soldier's operation history and M16 ledger.
+
+    This is deliberately idempotent: the participation row is upserted, its status can
+    only advance, and weapon rounds are reconciled by delta against weapon_round_events.
+    """
+    if str((event or {}).get("event_type") or "").upper()!="OPERATION" or not (event or {}).get("operation_id"):
+        return {"status":"IGNORED","rounds_target":0,"rounds_applied":0,"full_credit":False}
+    seconds=max(0,int(qualifying_seconds or 0))
+    if seconds<=0:
+        return {"status":"NO CREDIT","rounds_target":0,"rounds_applied":0,"full_credit":False}
+    personnel=fetch_one("SELECT * FROM personnel WHERE id=%s",(personnel_id,))
+    if not personnel:
+        return {"status":"NO PERSONNEL","rounds_target":0,"rounds_applied":0,"full_credit":False}
+    status,percent=operation_presence_status(event,seconds)
+    target=operation_round_target_for_time(event,seconds)
+    operation_id=event["operation_id"]
+    existing=fetch_one("SELECT * FROM operation_participation WHERE operation_id=%s AND personnel_id=%s",(operation_id,personnel_id))
+    prior_status=str((existing or {}).get("attendance_status") or "").upper()
+    rank={"":0,"NO CREDIT":0,"TRACKED PRESENCE":1,"PARTIAL / LATE":2,"PARTICIPATED":2,"PRESENT":2,"FULL CREDIT":3,"CREDITED":3,"COMPLETE":3,"COMPLETED":3}
+    final_status=status if rank.get(status,0)>=rank.get(prior_status,0) else (existing.get("attendance_status") if existing else status)
+    final_rounds=max(target,int((existing or {}).get("rounds_expended") or 0))
+    note=("Historical Battalion Clerk reconciliation" if historical else "Automatic Battalion Clerk attendance") + f": {seconds//60} verified minutes ({percent}%)."
+    execute("""INSERT INTO operation_participation
+               (operation_id,personnel_id,unit_node_id,duty_role,attendance_status,rounds_expended,remarks,credited_by)
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT(operation_id,personnel_id) DO UPDATE SET
+                 unit_node_id=COALESCE(EXCLUDED.unit_node_id,operation_participation.unit_node_id),
+                 duty_role=COALESCE(operation_participation.duty_role,EXCLUDED.duty_role),
+                 attendance_status=%s,
+                 rounds_expended=GREATEST(COALESCE(operation_participation.rounds_expended,0),EXCLUDED.rounds_expended),
+                 remarks=EXCLUDED.remarks,
+                 credited_by=EXCLUDED.credited_by""",
+            (operation_id,personnel_id,personnel.get("unit_node_id"),personnel.get("duty_position"),status,
+             final_rounds,note,authority,final_status))
+    firing_time=(event.get("ends_at") or event.get("starts_at") or datetime.now(timezone.utc)) if historical else datetime.now(timezone.utc)
+    rounds_applied=reconcile_operation_weapon_rounds(operation_id,personnel_id,final_rounds,authority,note,occurred_at=firing_time)
+    full=(str(final_status).upper()=="FULL CREDIT")
+    newly_full=full and prior_status not in {"FULL CREDIT","CREDITED","COMPLETE","COMPLETED"}
+    if full:
+        execute("""INSERT INTO personnel_activity_credit
+                   (personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited)
+                   SELECT %s,'BATTALION DUTY',%s,'OPERATION',COALESCE(%s::date,CURRENT_DATE),%s,TRUE
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM personnel_activity_credit
+                     WHERE personnel_id=%s AND source='BATTALION DUTY' AND source_reference=%s AND activity_type='OPERATION'
+                   )""",
+                (personnel_id,str(event["id"]),event.get("starts_at").date() if event.get("starts_at") else None,
+                 seconds,personnel_id,str(event["id"])))
+        if newly_full:
+            try:
+                operation_credit_cascade(operation_id,personnel_id,final_rounds,authority)
+            except NameError:
+                # During module import the cascade is defined later; runtime reconciliation will call it again.
+                pass
+    return {"status":final_status,"rounds_target":final_rounds,"rounds_applied":rounds_applied,"full_credit":full,"newly_full":newly_full}
+
+
+def repair_historical_operation_attendance(authority="SYSTEM RECONCILIATION"):
+    """Backfill operation history and M16 rounds from every existing verified attendance row."""
+    if not database_ready():
+        return {"attendance_rows":0,"participation_rows":0,"full_credit":0,"rounds_applied":0}
+    rows=fetch_all("""SELECT a.event_id,a.personnel_id,a.qualifying_seconds,a.credited_at,
+                             e.operation_id,e.event_type,e.title,e.starts_at,e.ends_at,e.rounds_per_soldier,e.credit_threshold_minutes
+                      FROM battalion_event_attendance a
+                      JOIN battalion_events e ON e.id=a.event_id
+                      WHERE UPPER(COALESCE(e.event_type,''))='OPERATION'
+                        AND e.operation_id IS NOT NULL AND COALESCE(a.qualifying_seconds,0)>0
+                      ORDER BY e.starts_at,a.updated_at""")
+    repaired={"attendance_rows":len(rows),"participation_rows":0,"full_credit":0,"rounds_applied":0}
+    for row in rows:
+        status,percent=operation_presence_status(row,row.get("qualifying_seconds") or 0)
+        if status=="FULL CREDIT" and not row.get("credited_at"):
+            execute("""UPDATE battalion_event_attendance SET credited_at=NOW(),attendance_grade='FULL CREDIT',attendance_percent=100,updated_at=NOW()
+                       WHERE event_id=%s AND personnel_id=%s""",(row["event_id"],row["personnel_id"]))
+        else:
+            execute("""UPDATE battalion_event_attendance SET attendance_grade=%s,attendance_percent=%s,updated_at=NOW()
+                       WHERE event_id=%s AND personnel_id=%s""",(status,percent,row["event_id"],row["personnel_id"]))
+        result=sync_operation_presence_from_attendance(row,row["personnel_id"],row.get("qualifying_seconds") or 0,authority,True)
+        repaired["participation_rows"]+=1
+        repaired["rounds_applied"]+=int(result.get("rounds_applied") or 0)
+        if result.get("full_credit"):
+            repaired["full_credit"]+=1
+    return repaired
+
+
+def close_ended_operation_events(authority="SYSTEM RECONCILIATION"):
+    """Stop stale Clerk tracking at scheduled end time and mark the operation completed.
+
+    This does not fabricate an AAR. It only freezes verified attendance/rounds and
+    removes the operation from the live/scheduled state. S-3 may file the AAR later.
+    """
+    if not database_ready():
+        return 0
+    events=fetch_all("""SELECT * FROM battalion_events
+                        WHERE UPPER(COALESCE(event_type,''))='OPERATION'
+                          AND operation_id IS NOT NULL
+                          AND UPPER(COALESCE(status,'')) IN ('SCHEDULED','ACTIVE')
+                          AND ends_at<=NOW()""")
+    for event in events:
+        attendance=fetch_all("SELECT * FROM battalion_event_attendance WHERE event_id=%s",(event["id"],))
+        for a in attendance:
+            secs=int(a.get("qualifying_seconds") or 0)
+            if secs<=0: continue
+            status,percent=operation_presence_status(event,secs)
+            sync_operation_presence_from_attendance(event,a["personnel_id"],secs,authority)
+            execute("""UPDATE battalion_event_attendance SET attendance_grade=%s,attendance_percent=%s,
+                       credited_at=CASE WHEN %s='FULL CREDIT' THEN COALESCE(credited_at,NOW()) ELSE credited_at END,
+                       updated_at=NOW() WHERE event_id=%s AND personnel_id=%s""",
+                    (status,percent,status,event["id"],a["personnel_id"]))
+        execute("UPDATE battalion_events SET status='CLOSED' WHERE id=%s",(event["id"],))
+        execute("""UPDATE operations SET status='COMPLETED',lifecycle_status='CLOSED',publish_status='CLOSED',
+                   completed_at=COALESCE(completed_at,%s),updated_at=NOW()
+                   WHERE id=%s AND UPPER(COALESCE(status,'')) NOT IN ('ARCHIVED','CANCELLED','CANCELED')""",
+                (event.get("ends_at"),event["operation_id"]))
+    return len(events)
+
+
+def archive_expired_operations():
+    """Archive operations on the calendar day after their scheduled operation date."""
+    if not database_ready():
+        return 0
+    stale=fetch_all("""SELECT id,start_at,operation_date,duration_minutes,status FROM operations
+                       WHERE COALESCE(operation_date,start_at::date) < CURRENT_DATE
+                         AND UPPER(COALESCE(status,'')) NOT IN ('ARCHIVED','CANCELLED','CANCELED')""")
+    for op in stale:
+        end_at=(op.get("start_at")+timedelta(minutes=max(1,int(op.get("duration_minutes") or 90)))) if op.get("start_at") else datetime.now(timezone.utc)
+        execute("""UPDATE operations SET status='ARCHIVED',lifecycle_status='CLOSED',publish_status='CLOSED',
+                   completed_at=COALESCE(completed_at,%s),updated_at=NOW() WHERE id=%s""",(end_at,op["id"]))
+        execute("""UPDATE battalion_events SET status='CLOSED',ends_at=LEAST(ends_at,%s)
+                   WHERE operation_id=%s AND UPPER(COALESCE(status,'')) IN ('SCHEDULED','ACTIVE')""",(end_at,op["id"]))
+    return len(stale)
+
+
+def run_operation_maintenance(authority="SYSTEM RECONCILIATION"):
+    """Single maintenance transaction used by startup, S-3 pages, and Battalion Clerk."""
+    repaired=repair_historical_operation_attendance(authority)
+    completed=close_ended_operation_events(authority)
+    archived=archive_expired_operations()
+    weapon_integrity=repair_weapon_round_ledger_integrity()
+    repaired["completed_operations"]=completed
+    repaired["archived_operations"]=archived
+    repaired["weapon_timestamp_repairs"]=weapon_integrity.get("timestamp_repairs",0)
+    repaired["weapon_counters_rebuilt"]=weapon_integrity.get("counters_rebuilt",0)
+    return repaired
 
 
 def company_supply_readiness(unit_node_id):
@@ -2352,7 +2947,7 @@ def member_operation_credit_ledger(personnel_id):
           ORDER BY bea.credited_at DESC NULLS LAST,bea.updated_at DESC LIMIT 1
       ) a ON TRUE
       LEFT JOIN battalion_events e ON e.id=a.matched_event_id
-      WHERE op.personnel_id=%s AND UPPER(COALESCE(op.attendance_status,'')) NOT IN ('ABSENT','NO CREDIT','PARTIAL / LATE')
+      WHERE op.personnel_id=%s AND UPPER(COALESCE(op.attendance_status,'')) NOT IN ('ABSENT','NO CREDIT')
       ORDER BY COALESCE(o.start_at,op.credited_at) DESC""",(personnel_id,))
 
 def personal_operations(personnel_id):
@@ -2506,6 +3101,92 @@ def ribbon_progress_for(personnel_id, award_completed=True):
     return progress
 
 
+
+def _award_device_label(award_count):
+    """1965 Army-style subsequent-award device wording.
+
+    One award carries no device.  Each additional award is represented by an oak
+    leaf cluster; one silver oak leaf cluster represents five bronze clusters.
+    """
+    count=max(0,int(award_count or 0))
+    additional=max(0,count-1)
+    if additional == 0:
+        return "NO DEVICE — FIRST AWARD"
+    silver, bronze = divmod(additional,5)
+    parts=[]
+    if silver:
+        parts.append(f"{silver} SILVER OAK LEAF CLUSTER" + ("S" if silver != 1 else ""))
+    if bronze:
+        parts.append(f"{bronze} BRONZE OAK LEAF CLUSTER" + ("S" if bronze != 1 else ""))
+    return " • ".join(parts)
+
+
+def ribbon_details_for_member(personnel_id):
+    """One read-only source for clickable member ribbon cards/rack details."""
+    catalog=fetch_all("""SELECT ribbon_code,ribbon_name,automation_mode,requirement_text,
+                              description_text,earning_text,award_type_label,sort_order,image_filename
+                       FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name""")
+    progress_map={r['code']:r for r in ribbon_progress_for(personnel_id,award_completed=False)}
+    earned_map={r['ribbon_code']:r for r in fetch_all("SELECT * FROM personnel_ribbons WHERE personnel_id=%s",(personnel_id,))}
+    award_rows=fetch_all("""SELECT pa.award_name,pa.award_date,pa.order_number,pa.citation,
+                                   rc.ribbon_code
+                            FROM personnel_awards pa
+                            LEFT JOIN ribbon_catalog rc ON LOWER(TRIM(rc.ribbon_name))=LOWER(TRIM(pa.award_name))
+                            WHERE pa.personnel_id=%s
+                            ORDER BY pa.award_date DESC,pa.id DESC""",(personnel_id,))
+    history_by={}
+    for a in award_rows:
+        code=a.get('ribbon_code')
+        if not code: continue
+        history_by.setdefault(code,[]).append({
+            'award_date': a.get('award_date').isoformat() if hasattr(a.get('award_date'),'isoformat') else str(a.get('award_date') or ''),
+            'order_number': a.get('order_number') or 'ORDER NUMBER NOT ENTERED',
+            'citation': a.get('citation') or '',
+        })
+    details=[]
+    for c in catalog:
+        code=c['ribbon_code']; earned=earned_map.get(code); prog=progress_map.get(code) or {}
+        history=history_by.get(code,[])
+        # Automatic ribbons may have been filed directly into personnel_ribbons before a
+        # personnel_awards row existed.  Count the authorization itself as award #1.
+        award_count=max(len(history),1 if earned else 0)
+        details.append({
+            **c,
+            'earned': bool(earned),
+            'earned_at': (earned.get('earned_at').isoformat() if earned and hasattr(earned.get('earned_at'),'isoformat') else str((earned or {}).get('earned_at') or '')),
+            'is_worn': bool((earned or {}).get('is_worn')),
+            'award_count': award_count,
+            'device_label': _award_device_label(award_count),
+            'history': history,
+            'progress': prog,
+            'progress_percent': int(prog.get('percent') or (100 if earned else 0)),
+            'progress_detail': prog.get('detail') or ('COMMAND RECOMMENDATION / HEADQUARTERS APPROVAL REQUIRED.' if c.get('automation_mode')=='RECOMMENDATION' else c.get('requirement_text')),
+        })
+    return details
+
+
+def award_eligibility_board(personnel_rows):
+    """S-1 read-only eligibility board.  It never awards or changes personnel."""
+    eligible=[]; nearing=[]
+    for person in personnel_rows:
+        pid=person.get('id')
+        if not pid: continue
+        try:
+            progress=ribbon_progress_for(pid,award_completed=False)
+        except Exception as exc:
+            log.warning('Award eligibility read failed for %s: %s',pid,exc)
+            continue
+        for row in progress:
+            if row.get('earned') or row.get('pending_system'): continue
+            entry={'person':person,'ribbon':row}
+            if row.get('complete'):
+                eligible.append(entry)
+            elif int(row.get('percent') or 0) >= 70:
+                nearing.append(entry)
+    eligible.sort(key=lambda x:(str(x['ribbon'].get('name') or ''),str(x['person'].get('last_name') or '')))
+    nearing.sort(key=lambda x:(-int(x['ribbon'].get('percent') or 0),str(x['person'].get('last_name') or '')))
+    return {'eligible':eligible[:40],'nearing':nearing[:40]}
+
 def automatic_ribbon_recheck(personnel_ids):
     for pid in {str(x) for x in personnel_ids if x}:
         try:
@@ -2607,7 +3288,7 @@ def time_in_grade_days(personnel):
 
 
 def initial_entry_rank(personnel_id):
-    """Return the rank the Soldier held when first entered on the battalion rolls."""
+    """Return the rank the Soldier held when first entered on the Battle Roster."""
     row = fetch_one(
         """SELECT new_rank_code,effective_date FROM promotion_history
            WHERE personnel_id=%s AND old_rank_code IS NULL
@@ -3207,7 +3888,7 @@ def member_formation_snapshot(person,unit_type):
     if not target: return None
     ids=unit_descendant_ids(target["id"]) or [target["id"]]
     roster=fetch_all("""SELECT id,rank_code,first_name,last_name,mos_code,duty_position,unit_code,platoon,squad,readiness_percent
-      FROM personnel WHERE unit_node_id=ANY(%s) AND separated_at IS NULL AND archived=FALSE ORDER BY last_name,first_name""",(ids,))
+      FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code WHERE p.unit_node_id=ANY(%s) AND p.separated_at IS NULL AND p.archived=FALSE ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name""",(ids,))
     leaders=fetch_all("""SELECT pa.appointment_code,ac.appointment_name,p.rank_code,p.first_name,p.last_name FROM personnel_appointments pa
       JOIN appointment_catalog ac ON ac.appointment_code=pa.appointment_code JOIN personnel p ON p.id=pa.personnel_id
       WHERE pa.unit_node_id=%s AND pa.is_current=TRUE ORDER BY ac.sort_order""",(target["id"],))
@@ -3226,7 +3907,7 @@ def member_career_milestones(person):
             detail=" • ".join(str(x.get("label") or x.get("detail") or "") for x in unmet[:2]) or e.get("status","UNDER REVIEW")
             out.append({"title":f"Promotion consideration — {e.get('target')}","detail":detail,"section":"CAREER"})
     insp=weapon_inspection_status(pid)
-    if insp: out.append({"title":"M16 inspection overdue" if insp.get("overdue") else "Next M16 inspection","detail":"Report to S-4 for inspection." if insp.get("overdue") else f"{insp.get('days')} day(s) • due {insp.get('due')}","section":"S-4"})
+    if insp: out.append({"title":"M16 inspection overdue" if insp.get("overdue") else "Next M16 inspection","detail":"Report to S-4 for inspection." if insp.get("overdue") else f"{insp.get('days')} day{'s' if int(insp.get('days') or 0) != 1 else ''} • due {insp.get('due')}","section":"S-4"})
     return out[:5]
 
 
@@ -3493,59 +4174,139 @@ def voice_record_for(personnel: dict | None):
     return discord, voice
 
 
+OPERATION_SITE_TIMEZONE = ZoneInfo(os.getenv("SITE_TIMEZONE", "America/New_York"))
+
+
+def parse_operation_local_datetime(value):
+    """Interpret datetime-local staff input in the battalion site timezone and store UTC."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=OPERATION_SITE_TIMEZONE)
+    return dt.astimezone(timezone.utc)
+
+
+def operation_local_datetime(value):
+    if not value:
+        return None
+    dt = value
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(OPERATION_SITE_TIMEZONE)
+
+
+def safe_public_operation_number(value):
+    """Only expose human S-3 operation numbers; never internal/Discord/UUID identifiers."""
+    text = str(value or "").strip().upper()
+    if re.fullmatch(r"OP-\\d{2,4}-\\d{4}", text):
+        return text
+    return "OPERATION"
+
+
+def reconcile_operation_schedule_states():
+    """Make website Operation status derive deterministically from its published schedule."""
+    if not database_ready():
+        return {"scheduled": 0, "active": 0, "completed": 0}
+    rows = fetch_all("""SELECT id,start_at,duration_minutes,status,lifecycle_status,publish_status,completed_at,clerk_event_id
+                        FROM operations
+                        WHERE start_at IS NOT NULL
+                          AND UPPER(COALESCE(publish_status,'DRAFT'))='PUBLISHED'
+                          AND UPPER(COALESCE(status,'')) NOT IN ('CANCELLED','CANCELED','ARCHIVED')
+                          AND UPPER(COALESCE(lifecycle_status,'')) NOT IN ('CANCELLED','CANCELED','ARCHIVED')""")
+    now = datetime.now(timezone.utc)
+    counts = {"scheduled": 0, "active": 0, "completed": 0}
+    for op in rows:
+        start = op.get("start_at")
+        if not start:
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        end = start + timedelta(minutes=max(1, int(op.get("duration_minutes") or 90)))
+        if now < start:
+            status, lifecycle = "SCHEDULED", "PUBLISHED"
+            counts["scheduled"] += 1
+        elif now < end:
+            status, lifecycle = "ACTIVE", "ACTIVE"
+            counts["active"] += 1
+        else:
+            status, lifecycle = "COMPLETED", "COMPLETED"
+            counts["completed"] += 1
+        execute("""UPDATE operations
+                   SET status=%s,lifecycle_status=%s,
+                       completed_at=CASE WHEN %s='COMPLETED' THEN COALESCE(completed_at,%s) ELSE completed_at END,
+                       updated_at=CASE WHEN UPPER(COALESCE(status,''))<>%s OR UPPER(COALESCE(lifecycle_status,''))<>%s THEN NOW() ELSE updated_at END
+                   WHERE id=%s""", (status,lifecycle,status,end,status,lifecycle,op["id"]))
+    return counts
+
+
+def decorate_operation_times(rows):
+    for row in rows or []:
+        row["local_start_at"] = operation_local_datetime(row.get("start_at") or row.get("starts_at"))
+        end = row.get("ends_at")
+        if not end and row.get("start_at"):
+            end = row["start_at"] + timedelta(minutes=max(1,int(row.get("duration_minutes") or 90)))
+        row["local_end_at"] = operation_local_datetime(end)
+        row["public_operation_number"] = safe_public_operation_number(row.get("operation_number"))
+    return rows
+
+
+def ensure_published_operation_events(authority="SYSTEM RECONCILIATION"):
+    """Repair a missing/stale Battalion Clerk mirror for every live published Operation."""
+    if not database_ready():
+        return 0
+    execute("""UPDATE operations SET publish_status='PUBLISHED',updated_at=NOW()
+               WHERE clerk_event_id IS NOT NULL
+                 AND UPPER(COALESCE(status,'')) IN ('SCHEDULED','ACTIVE')
+                 AND UPPER(COALESCE(publish_status,'DRAFT'))='DRAFT'""")
+    rows=fetch_all("""SELECT o.* FROM operations o
+                       LEFT JOIN battalion_events e ON e.operation_id=o.id
+                         AND UPPER(COALESCE(e.status,'')) IN ('SCHEDULED','ACTIVE')
+                       WHERE o.start_at IS NOT NULL
+                         AND UPPER(COALESCE(o.publish_status,'DRAFT'))='PUBLISHED'
+                         AND UPPER(COALESCE(o.status,'')) IN ('SCHEDULED','ACTIVE')
+                         AND (o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90)))>NOW()
+                         AND e.id IS NULL""")
+    repaired=0
+    for op in rows:
+        try:
+            schedule_operation_event(op,authority)
+            repaired += 1
+        except Exception:
+            log.exception("Failed to repair Clerk event mirror for Operation %s",op.get("id"))
+    return repaired
+
+
 def public_scheduled_operations(limit=5):
-    """Authoritative public schedule with legacy-schema fallback.
-
-    Website S-3 operations are primary. The Clerk event mirror is supplemental.
-    This helper is deliberately defensive because the public homepage must survive
-    partially migrated/older Railway databases.
-    """
+    """Published website Operations are the sole public schedule source."""
     try:
-        return fetch_all("""
-            WITH website_schedule AS (
-              SELECT o.id::text AS source_id,o.id AS operation_id,o.title,
-                     COALESCE(o.operation_type,'OFFICIAL OPERATION') AS event_type,
-                     o.start_at AS starts_at,
-                     (o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90))) AS ends_at,
-                     'WEBSITE' AS schedule_source,COALESCE(o.area_of_operations,o.location) AS area_of_operations,
-                     o.operation_number
-              FROM operations o
-              WHERE o.start_at IS NOT NULL
-                AND UPPER(COALESCE(o.status,'')) IN ('SCHEDULED','ACTIVE')
-                AND UPPER(COALESCE(o.lifecycle_status,'PUBLISHED')) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','ARCHIVED')
-                AND (o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90))) > NOW()
-            ), clerk_only AS (
-              SELECT e.id::text AS source_id,e.operation_id,e.title,
-                     COALESCE(e.event_type,'BATTALION DUTY') AS event_type,e.starts_at,e.ends_at,
-                     'CLERK' AS schedule_source,NULL::text AS area_of_operations,NULL::text AS operation_number
-              FROM battalion_events e
-              WHERE UPPER(COALESCE(e.status,'')) IN ('SCHEDULED','ACTIVE') AND e.ends_at>NOW()
-                AND (e.operation_id IS NULL OR NOT EXISTS (SELECT 1 FROM website_schedule w WHERE w.operation_id=e.operation_id))
-            )
-            SELECT source_id,operation_id,title,event_type,starts_at,ends_at,schedule_source,area_of_operations,operation_number
-            FROM (SELECT * FROM website_schedule UNION ALL SELECT * FROM clerk_only) schedule
-            ORDER BY starts_at ASC LIMIT %s
-        """,(int(limit),))
-    except Exception:
-        log.exception("Full public schedule query failed; using compatibility schedule query")
-
-    # Compatibility path uses only long-established operation columns. It intentionally
-    # avoids newer lifecycle/AO/Clerk-link fields and still keeps website scheduling visible.
-    try:
-        return fetch_all("""
+        reconcile_operation_schedule_states()
+        ensure_published_operation_events("PUBLIC SCHEDULE RECONCILIATION")
+        rows = fetch_all("""
             SELECT o.id::text AS source_id,o.id AS operation_id,o.title,
-                   'OFFICIAL OPERATION'::text AS event_type,o.start_at AS starts_at,
-                   (o.start_at + INTERVAL '90 minutes') AS ends_at,
-                   'WEBSITE'::text AS schedule_source,NULL::text AS area_of_operations,
-                   NULL::text AS operation_number
+                   COALESCE(o.operation_type,'OFFICIAL OPERATION') AS event_type,
+                   o.start_at AS starts_at,
+                   (o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90))) AS ends_at,
+                   'WEBSITE' AS schedule_source,COALESCE(o.area_of_operations,o.location) AS area_of_operations,
+                   o.operation_number,o.status,o.duration_minutes
             FROM operations o
             WHERE o.start_at IS NOT NULL
+              AND UPPER(COALESCE(o.publish_status,'DRAFT'))='PUBLISHED'
               AND UPPER(COALESCE(o.status,'')) IN ('SCHEDULED','ACTIVE')
-              AND (o.start_at + INTERVAL '90 minutes') > NOW()
+              AND (o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90))) > NOW()
             ORDER BY o.start_at ASC LIMIT %s
         """,(int(limit),))
+        return decorate_operation_times(rows)
     except Exception:
-        log.exception("Compatibility public schedule query also failed")
+        log.exception("Public Operation schedule query failed")
         return []
 
 
@@ -3575,10 +4336,16 @@ def public_recruiting_snapshot():
         ready = sum(1 for x in rows if str(x.get("replacement_stage") or "").upper() == "READY FOR ASSIGNMENT")
     except Exception:
         log.exception("Public ready-for-assignment count unavailable")
+    try:
+        detachment_rows = replacement_detachment_rows()
+        processing = len(detachment_rows)
+    except Exception:
+        log.exception("Public Replacement Detachment count unavailable")
+        processing = int(row.get("processing") or 0)
     return {
         "applications_pending": int(row.get("applications_pending") or 0),
         "command_review": int(row.get("command_review") or 0),
-        "processing": int(row.get("processing") or 0),
+        "processing": int(processing or 0),
         "ready_assignment": int(ready or 0),
     }
 
@@ -3715,7 +4482,7 @@ def public_recent_achievements():
 
 def public_award_preview(limit=4):
     return _public_home_safe("award preview", lambda: fetch_all("""
-        SELECT ribbon_code,ribbon_name,image_filename,requirement_text
+        SELECT ribbon_code,ribbon_name,image_filename,requirement_text,description_text,earning_text,award_type_label
         FROM ribbon_catalog WHERE is_active=TRUE
         ORDER BY sort_order LIMIT %s
     """, (int(limit),)), [])
@@ -3891,56 +4658,19 @@ def public_operations():
         return render_template("setup.html")
     upcoming = _public_home_safe("public operations", lambda: public_scheduled_operations(12), [])
     def _completed_public_operations():
-        # S-3 history spans both website Operations and older Clerk battalion_events.
-        try:
-            rows = fetch_all("""
-                SELECT o.id,o.operation_number,o.operation_code,o.title,o.operation_type,
-                       COALESCE(o.completed_at,o.operation_date::timestamptz,o.start_at,o.created_at) completed_at,
-                       o.result,o.status,o.lifecycle_status
-                FROM operations o
-                WHERE o.completed_at IS NOT NULL
-                   OR UPPER(COALESCE(o.status,'')) IN ('CLOSED','COMPLETE','COMPLETED','AAR FILED')
-                   OR UPPER(COALESCE(o.lifecycle_status,'')) IN ('CLOSED','COMPLETE','COMPLETED','AAR FILED')
-                   OR UPPER(COALESCE(o.publish_status,''))='CLOSED'
-                ORDER BY COALESCE(o.completed_at,o.operation_date::timestamptz,o.start_at,o.created_at) DESC NULLS LAST
-                LIMIT 40
-            """)
-        except Exception:
-            log.exception("Public completed Operations extended query failed; using compatibility history query.")
-            rows = fetch_all("""
-                SELECT id,operation_number,operation_code,title,operation_type,
-                       COALESCE(completed_at,operation_date::timestamptz,created_at) completed_at,result,status
-                FROM operations
-                WHERE completed_at IS NOT NULL
-                   OR UPPER(COALESCE(status,'')) IN ('CLOSED','COMPLETE','COMPLETED')
-                ORDER BY COALESCE(completed_at,operation_date::timestamptz,created_at) DESC NULLS LAST LIMIT 40
-            """)
-        try:
-            event_rows = fetch_all("""
-                SELECT be.id,be.operation_id,be.external_event_id,be.title,be.event_type,
-                       be.ends_at AS completed_at,be.status
-                FROM battalion_events be
-                WHERE be.event_type='OPERATION'
-                  AND (UPPER(COALESCE(be.status,''))='CLOSED' OR be.ends_at < NOW())
-                ORDER BY be.ends_at DESC LIMIT 40
-            """)
-            linked={str(r.get('id')) for r in rows if r.get('id')}
-            for e in event_rows:
-                if e.get('operation_id') and str(e.get('operation_id')) in linked:
-                    continue
-                rows.append({
-                    'operation_number': e.get('external_event_id') or 'OPERATION',
-                    'operation_code': e.get('external_event_id'),
-                    'title': e.get('title') or 'Official Operation',
-                    'operation_type': e.get('event_type') or 'OPERATION',
-                    'completed_at': e.get('completed_at'),
-                    'result': None,
-                    'status': e.get('status') or 'CLOSED',
-                })
-        except Exception:
-            log.exception("Legacy Battalion Event history could not be added to public Operations history.")
-        rows.sort(key=lambda r: r.get('completed_at') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-        return rows[:24]
+        reconcile_operation_schedule_states()
+        rows = fetch_all("""
+            SELECT o.id,o.operation_number,o.title,o.operation_type,
+                   COALESCE(o.completed_at,o.start_at,o.created_at) completed_at,
+                   o.result,o.status,o.lifecycle_status,o.duration_minutes
+            FROM operations o
+            WHERE UPPER(COALESCE(o.publish_status,'DRAFT')) IN ('PUBLISHED','CLOSED')
+              AND (UPPER(COALESCE(o.status,'')) IN ('COMPLETED','CLOSED','ARCHIVED')
+                   OR UPPER(COALESCE(o.lifecycle_status,'')) IN ('COMPLETED','CLOSED','ARCHIVED','AAR FILED'))
+            ORDER BY COALESCE(o.completed_at,o.start_at,o.created_at) DESC NULLS LAST
+            LIMIT 24
+        """)
+        return decorate_operation_times(rows)
     completed = _public_home_safe("completed operations public", _completed_public_operations, [])
     return render_template("public_operations.html", upcoming=upcoming, completed=completed)
 
@@ -3974,6 +4704,8 @@ def login():
                 write_service_entry(p["id"], "ADMIN", "BATTALION STANDING ORDERS ACKNOWLEDGED",
                                     "Soldier acknowledged that the battalion community rules and standing orders were read and understood.",
                                     f"{p.get('rank_code') or ''} {p.get('last_name') or ''}".strip())
+                try: welcome_complete_task(p["id"],"STANDING_ORDERS","SOLDIER")
+                except Exception: log.exception("Welcome Packet Standing Orders milestone failed")
                 flash("BATTALION STANDING ORDERS ACKNOWLEDGED AND FILED IN YOUR 201 RECORD.", "success")
             replacement_training_status(soldier_view(p))
             if 'finalize_replacement_release' in globals():
@@ -4009,8 +4741,13 @@ def login():
                 session["username"] = card["roster_number"]
                 session["access_role"] = "member"
                 execute("UPDATE battle_roster_cards SET last_used_at=NOW() WHERE id=%s", (card["id"],))
+                try:
+                    welcome_complete_task(card["personnel_id"],"WEBSITE_LOGIN","SOLDIER")
+                except Exception:
+                    log.exception("Welcome Packet first-login milestone failed for %s",card["personnel_id"])
                 flash(f"DUTY STATUS CONFIRMED — {card['rank_code']} {card['last_name'].upper()}.", "success")
-                return redirect(url_for("my_soldier_record"))
+                wp=fetch_one("SELECT status FROM welcome_packets WHERE personnel_id=%s",(card["personnel_id"],))
+                return redirect(url_for("welcome_packet") if wp and wp.get("status")!='COMPLETE' else url_for("my_soldier_record"))
             except Exception:
                 log.exception("Member Access session provisioning failed for roster %s", roster_number)
                 session.clear()
@@ -4026,14 +4763,337 @@ def safe_member_panel(label, default, func, *args, **kwargs):
         log.exception("MEMBER PANEL FAILURE [%s] %s",ref,label)
         return default
 
+
+def safe_member_fetch_one(label, sql, params=()):
+    """Run an optional Wall Locker query without allowing one module to take down the record."""
+    return safe_member_panel(label, None, fetch_one, sql, params)
+
+
+def safe_member_fetch_all(label, sql, params=()):
+    """Run an optional Wall Locker list query with an empty-list fallback on schema/data drift."""
+    return safe_member_panel(label, [], fetch_all, sql, params)
+
+
+def _json_safe_value(value):
+    """Convert PostgreSQL/native Python values into browser-safe JSON primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", "replace")
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(v) for v in value]
+    return str(value)
+
+
+def member_json_payload(value):
+    """Never allow a member page to fail while serializing optional interactive data."""
+    try:
+        return json.dumps(_json_safe_value(value), ensure_ascii=False).replace("</", "<\\/")
+    except Exception:
+        ref=secrets.token_hex(4).upper()
+        log.exception("MEMBER JSON SERIALIZATION FAILURE [%s]", ref)
+        return "[]"
+
+
+def _safe_member_endpoint(endpoint, fallback="my_action_center"):
+    endpoint=str(endpoint or "").strip()
+    return endpoint if endpoint in app.view_functions else fallback
+
+
+def sanitize_member_nav_rows(rows, fallback="my_action_center"):
+    out=[]
+    for row in rows or []:
+        item=dict(row or {})
+        item["endpoint"]=_safe_member_endpoint(item.get("endpoint"), fallback)
+        out.append(item)
+    return out
+
+def clean_gamertag(value):
+    """Display-safe gamertag formatting: battalion style omits commas and periods."""
+    return str(value or "").replace(",", "").replace(".", "").strip()
+
+app.jinja_env.filters["gamertag"] = clean_gamertag
+app.jinja_env.globals["member_json_payload"] = member_json_payload
+
 def current_mos_proficiency(person):
     if not person or not person.get("id") or not person.get("mos_code"):
         return None
-    return fetch_one("""SELECT pmp.*,bmc.mos_title
+    row = fetch_one("""SELECT pmp.*,bmc.mos_title
                         FROM personnel_mos_proficiency pmp
                         LEFT JOIN battalion_mos_catalog bmc ON bmc.mos_code=pmp.mos_code
                         WHERE pmp.personnel_id=%s AND pmp.mos_code=%s AND pmp.is_current=TRUE
                         LIMIT 1""",(person["id"],person["mos_code"]))
+    if not row:
+        return None
+    row = dict(row)
+    order = int(row.get("proficiency_order") or 1)
+    pid = person["id"]
+    try:
+        ops = credited_operation_count(pid)
+    except Exception:
+        ops = 0
+    try:
+        training = _completed_training_count(pid)
+    except Exception:
+        training = 0
+    try:
+        qrow = fetch_one("""SELECT COUNT(*) total FROM personnel_duty_qualifications
+                            WHERE personnel_id=%s AND UPPER(status)='QUALIFIED'
+                              AND (expiration_date IS NULL OR expiration_date>=CURRENT_DATE)""",(pid,)) or {'total':0}
+        quals = int(qrow.get('total') or 0)
+    except Exception:
+        quals = 0
+    row["level"] = row.get("proficiency_level") or "NOT RATED"
+    row["operations"] = ops
+    row["training"] = training
+    row["qualifications"] = quals
+    row["next_requirement"] = (
+        "MAXIMUM PROFICIENCY — NO HIGHER MOS PROFICIENCY LEVEL" if order >= 4 else
+        "20 OFFICIAL OPERATIONS • 3 COMPLETED TRAINING PROGRAMS • 3 CURRENT DUTY QUALIFICATIONS" if order == 3 else
+        "10 OFFICIAL OPERATIONS • 2 COMPLETED TRAINING PROGRAMS • 2 CURRENT DUTY QUALIFICATIONS" if order == 2 else
+        "5 OFFICIAL OPERATIONS • 1 COMPLETED TRAINING PROGRAM • 1 CURRENT DUTY QUALIFICATION"
+    )
+    return row
+
+
+
+def _hll_json_dict(value):
+    """Normalize JSON/JSONB read values without allowing telemetry display to break a member page."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed=json.loads(value)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _hll_mode_from_layer(map_id):
+    raw=str(map_id or '').lower()
+    if 'offensivenva' in raw: return 'NVA Offensive'
+    if 'offensiveus' in raw: return 'US Offensive'
+    if 'warfare' in raw: return 'Warfare'
+    if 'domination' in raw: return 'Domination'
+    if 'conquest' in raw: return 'Conquest'
+    return ''
+
+
+def hll_service_statistics(personnel_id):
+    """Fault-isolated HLL: Vietnam telemetry summary for one Soldier.
+
+    Battalion Clerk owns collection/storage. The website only reads those tables.
+    Missing RCON tables or collector downtime must never affect personnel pages.
+    """
+    empty={
+        "available":False,"linked":False,"steam_id":None,"player_name":None,
+        "totals":{"matches":0,"connected_seconds":0,"distance_meters":0.0,"altitude_gain_meters":0.0,
+                  "infantry_kills":0,"deaths":0,"team_kills":0,"vehicle_kills":0,"vehicles_destroyed":0,
+                  "combat_score":0,"defense_score":0,"offense_score":0,"support_score":0,
+                  "max_observed_speed_mps":0.0,"high_speed_seconds":0},
+        "recent":[],"live":None,"server":None,"role_seconds":{},"role_distance_meters":{},
+        "role_max_speed_mps":{},"role_high_speed_seconds":{},"map_ledger":[],
+    }
+    if personnel_id in (None, ""):
+        return empty
+    try:
+        link=fetch_one("SELECT steam_id,hll_player_name,verified,linked_at FROM hll_personnel_links WHERE personnel_id=%s LIMIT 1",(str(personnel_id),))
+        empty["available"]=True
+        if not link:
+            return empty
+        empty["linked"]=True
+        empty["steam_id"]=link.get("steam_id")
+        empty["player_name"]=link.get("hll_player_name")
+        total=fetch_one("""SELECT COUNT(*) AS matches,
+                    COALESCE(SUM(connected_seconds),0) AS connected_seconds,
+                    COALESCE(SUM(distance_meters),0) AS distance_meters,
+                    COALESCE(SUM(altitude_gain_meters),0) AS altitude_gain_meters,
+                    COALESCE(SUM(infantry_kills),0) AS infantry_kills,
+                    COALESCE(SUM(deaths),0) AS deaths,
+                    COALESCE(SUM(team_kills),0) AS team_kills,
+                    COALESCE(SUM(vehicle_kills),0) AS vehicle_kills,
+                    COALESCE(SUM(vehicles_destroyed),0) AS vehicles_destroyed,
+                    COALESCE(SUM(combat_score),0) AS combat_score,
+                    COALESCE(SUM(defense_score),0) AS defense_score,
+                    COALESCE(SUM(offense_score),0) AS offense_score,
+                    COALESCE(SUM(support_score),0) AS support_score,
+                    COALESCE(MAX(max_observed_speed_mps),0) AS max_observed_speed_mps,
+                    COALESCE(SUM(high_speed_seconds),0) AS high_speed_seconds,
+                    MAX(last_seen_at) AS last_seen_at
+                FROM hll_player_match_stats WHERE personnel_id=%s""",(str(personnel_id),)) or {}
+        t=empty["totals"]
+        for k in list(t):
+            v=total.get(k)
+            if k in {"distance_meters","altitude_gain_meters","max_observed_speed_mps"}: t[k]=float(v or 0)
+            else: t[k]=int(v or 0)
+        rows=fetch_all("""SELECT ps.*,ms.server_name,ms.map_id,ms.map_name,ms.game_mode,ms.started_at,ms.ended_at,ms.last_seen_at AS match_last_seen
+                          FROM hll_player_match_stats ps
+                          JOIN hll_match_sessions ms ON ms.id=ps.match_id
+                          WHERE ps.personnel_id=%s
+                          ORDER BY ps.last_seen_at DESC LIMIT 12""",(str(personnel_id),)) or []
+        recent=[]; roles={}; role_dist={}; role_max_speed={}; role_high_speed={}; maps={}
+        for raw in rows:
+            r=dict(raw)
+            recent.append(r)
+            if not r.get("game_mode"):
+                r["game_mode"]=_hll_mode_from_layer(r.get("map_id"))
+            for k,v in _hll_json_dict(r.get("role_seconds")).items(): roles[str(k)]=roles.get(str(k),0)+int(v or 0)
+            for k,v in _hll_json_dict(r.get("role_distance_meters")).items(): role_dist[str(k)]=role_dist.get(str(k),0.0)+float(v or 0)
+            for k,v in _hll_json_dict(r.get("role_max_speed_mps")).items(): role_max_speed[str(k)]=max(role_max_speed.get(str(k),0.0),float(v or 0))
+            for k,v in _hll_json_dict(r.get("role_high_speed_seconds")).items(): role_high_speed[str(k)]=role_high_speed.get(str(k),0)+int(v or 0)
+            mk=str(r.get("map_name") or r.get("map_id") or "UNKNOWN")
+            m=maps.setdefault(mk,{"map_name":mk,"matches":0,"seconds":0,"distance_meters":0.0,"kills":0,"deaths":0})
+            m["matches"]+=1; m["seconds"]+=int(r.get("connected_seconds") or 0); m["distance_meters"]+=float(r.get("distance_meters") or 0); m["kills"]+=int(r.get("infantry_kills") or 0); m["deaths"]+=int(r.get("deaths") or 0)
+        empty["recent"]=recent
+        empty["role_seconds"]=roles
+        empty["role_distance_meters"]=role_dist
+        empty["role_max_speed_mps"]=role_max_speed
+        empty["role_high_speed_seconds"]=role_high_speed
+        empty["map_ledger"]=sorted(maps.values(),key=lambda m:(m["seconds"],m["matches"]),reverse=True)
+        role_ledger=[]
+        for role_id, seconds in sorted(roles.items(), key=lambda item: int(item[1] or 0), reverse=True):
+            role_ledger.append({
+                "role_id": str(role_id),
+                "seconds": int(seconds or 0),
+                "distance_meters": float(role_dist.get(str(role_id),0.0) or 0.0),
+                "max_speed_mps": float(role_max_speed.get(str(role_id),0.0) or 0.0),
+                "high_speed_seconds": int(role_high_speed.get(str(role_id),0) or 0),
+            })
+        empty["role_ledger"]=role_ledger
+        empty["primary_role"]=(role_ledger[0] if role_ledger else None)
+        empty["mobility_observation"]={
+            "max_speed_mps":float(t.get("max_observed_speed_mps") or 0),
+            "high_speed_seconds":int(t.get("high_speed_seconds") or 0),
+            "altitude_gain_meters":float(t.get("altitude_gain_meters") or 0),
+            "note":"OBSERVATION ONLY — high-speed movement may be vehicle or aircraft travel and is not yet filed as flight time."
+        }
+        service_hours=float(t.get("connected_seconds") or 0)/3600.0
+        match_count=int(t.get("matches") or 0)
+        if service_hours >= 40 or match_count >= 25:
+            field_level="VETERAN"
+            field_note="Extensive RCON-verified field service on the battalion server."
+        elif service_hours >= 15 or match_count >= 10:
+            field_level="COMBAT TESTED"
+            field_note="Sustained RCON-verified field service across multiple rounds."
+        elif service_hours >= 5 or match_count >= 3:
+            field_level="FIELD EXPERIENCED"
+            field_note="Established RCON-verified field service beyond initial orientation."
+        else:
+            field_level="NEWLY ARRIVED"
+            field_note="Early RCON-verified field service; experience develops through continued battalion play."
+        empty["field_experience"]={"level":field_level,"hours":round(service_hours,2),"matches":match_count,"note":field_note}
+        deaths=max(0,int(t.get("deaths") or 0))
+        kills=max(0,int(t.get("infantry_kills") or 0))
+        t["kd_ratio"]=round(kills / deaths, 2) if deaths else float(kills)
+        t["score_total"]=int(t.get("combat_score") or 0)+int(t.get("offense_score") or 0)+int(t.get("defense_score") or 0)+int(t.get("support_score") or 0)
+        t["avg_distance_per_match_meters"]=(float(t.get("distance_meters") or 0)/int(t.get("matches") or 1)) if int(t.get("matches") or 0) else 0.0
+        if rows:
+            newest=dict(rows[0])
+            if not newest.get("game_mode"):
+                newest["game_mode"]=_hll_mode_from_layer(newest.get("map_id"))
+            # A sample is considered live only when the collector saw it very recently.
+            try:
+                seen=newest.get("last_seen_at")
+                if seen and (datetime.now(timezone.utc)-seen).total_seconds() <= max(30, int(os.getenv("HLL_RCON_POLL_SECONDS","5") or 5)*4):
+                    empty["live"]=newest
+            except Exception:
+                pass
+        try:
+            lead=fetch_one("""SELECT COUNT(DISTINCT o.id) AS operations,COALESCE(SUM(ps.connected_seconds),0) AS seconds
+                              FROM operation_participation op
+                              JOIN operations o ON o.id=op.operation_id
+                              JOIN hll_match_sessions ms ON ms.started_at <= o.start_at + make_interval(mins => COALESCE(o.duration_minutes,90)+30)
+                                                        AND COALESCE(ms.ended_at,ms.last_seen_at) >= o.start_at - INTERVAL '30 minutes'
+                              JOIN hll_player_match_stats ps ON ps.match_id=ms.id AND ps.personnel_id=%s
+                              WHERE op.personnel_id=%s
+                                AND (UPPER(COALESCE(op.duty_role,'')) LIKE '%%LEADER%%' OR UPPER(COALESCE(op.duty_role,'')) LIKE '%%SERGEANT%%'
+                                  OR UPPER(COALESCE(op.duty_role,'')) LIKE '%%COMMAND%%' OR UPPER(COALESCE(op.duty_role,'')) LIKE '%%PLATOON%%')
+                                AND COALESCE(ps.connected_seconds,0)>=300""",(str(personnel_id),str(personnel_id))) or {}
+            empty["leadership_evidence"]={"operations":int(lead.get("operations") or 0),"seconds":int(lead.get("seconds") or 0),
+                "note":"Verified server presence while officially assigned to a leadership duty. Evidence only; it does not grant appointment or promotion."}
+        except Exception:
+            empty["leadership_evidence"]={"operations":0,"seconds":0,"note":"Leadership evidence unavailable."}
+        health=fetch_one("SELECT * FROM hll_rcon_health WHERE id=1")
+        empty["server"]=dict(health) if health else None
+        if empty["server"] and not empty["server"].get("last_game_mode"):
+            if recent:
+                empty["server"]["last_game_mode"]=recent[0].get("game_mode") or _hll_mode_from_layer(recent[0].get("map_id"))
+        return empty
+    except Exception:
+        log.exception("HLL telemetry read unavailable for personnel %s",personnel_id)
+        return empty
+
+
+def hll_live_server_snapshot():
+    try:
+        row=fetch_one("SELECT * FROM hll_rcon_health WHERE id=1")
+        return dict(row) if row else {"enabled":False,"connected":False}
+    except Exception:
+        return {"enabled":False,"connected":False}
+
+
+def hll_operation_telemetry(operation, personnel_id=None):
+    """Match telemetry overlapping a scheduled Operation window.
+
+    Uses time overlap rather than inventing a second operation-match mapping table.
+    This is deterministic and remains read-only. A future explicit match binding can
+    replace it without changing the display contract.
+    """
+    result={"available":False,"matches":[],"players":[],"totals":{},"viewer":None}
+    if not operation or not operation.get("start_at"):
+        return result
+    try:
+        start=operation.get("start_at")
+        end=start+timedelta(minutes=int(operation.get("duration_minutes") or 90))
+        matches=fetch_all("""SELECT * FROM hll_match_sessions
+                             WHERE started_at <= %s + INTERVAL '30 minutes'
+                               AND COALESCE(ended_at,last_seen_at) >= %s - INTERVAL '30 minutes'
+                             ORDER BY started_at""",(end,start)) or []
+        result["available"]=True
+        result["matches"]=[dict(x) for x in matches]
+        if not matches:
+            return result
+        ids=[m["id"] for m in matches]
+        rows=fetch_all("""SELECT ps.*,p.rank_code,p.first_name,p.last_name
+                          FROM hll_player_match_stats ps
+                          LEFT JOIN personnel p ON p.id::text=ps.personnel_id
+                          WHERE ps.match_id = ANY(%s::bigint[])
+                          ORDER BY ps.connected_seconds DESC,ps.player_name""",(ids,)) or []
+        # Collapse multiple game rounds into one Operation row per Soldier/Steam identity.
+        grouped={}
+        numeric=("connected_seconds","distance_meters","altitude_gain_meters","infantry_kills","deaths","team_kills","vehicle_kills","vehicles_destroyed","combat_score","defense_score","offense_score","support_score")
+        for raw in rows:
+            r=dict(raw); key=str(r.get("personnel_id") or r.get("steam_id"))
+            g=grouped.setdefault(key,{"personnel_id":r.get("personnel_id"),"steam_id":r.get("steam_id"),"player_name":r.get("player_name"),"rank_code":r.get("rank_code"),"first_name":r.get("first_name"),"last_name":r.get("last_name"),"matches":0})
+            g["matches"]+=1
+            for f in numeric: g[f]=float(g.get(f,0) or 0)+float(r.get(f,0) or 0)
+            rr=g.setdefault("role_seconds",{})
+            for role_id,seconds in _hll_json_dict(r.get("role_seconds")).items(): rr[str(role_id)]=int(rr.get(str(role_id),0) or 0)+int(seconds or 0)
+        players=list(grouped.values())
+        for p in players:
+            roles=p.get("role_seconds") or {}
+            p["primary_role_id"]=max(roles,key=lambda k:int(roles.get(k) or 0)) if roles else None
+            p["verified_contact"]=int(p.get("connected_seconds") or 0)>=300
+        result["players"]=players
+        totals={f:sum(float(p.get(f,0) or 0) for p in players) for f in numeric}
+        totals["players"]=len(players); totals["matches"]=len(matches)
+        result["totals"]=totals
+        if personnel_id is not None:
+            result["viewer"]=next((p for p in players if str(p.get("personnel_id"))==str(personnel_id)),None)
+        return result
+    except Exception:
+        log.exception("HLL operation telemetry unavailable operation=%s",(operation or {}).get("id"))
+        return result
+
 
 def member_record_context(personnel):
     if not personnel:
@@ -4043,7 +5103,7 @@ def member_record_context(personnel):
             "duty_quals": [], "personal_ops": [], "operation_credit_ledger": [], "service_history": [], "current_orders": [],
             "chain_of_command": [], "replacement_training": {"complete":False,"requirements":[]},
             "promotion_eligibility": [], "training_programs": [], "progress_control": {},
-            "can_recommend_awards": False, "award_candidates": [], "award_recommendations": [], "documents": [], "action_items": [], "notifications": [], "next_step": "Report to S-1.", "weapon_inspection": None, "mos_records": [], "timeline": [], "current_story": {}, "mos_proficiency": [], "instructor_quals": [], "leadership_records": [], "acting_appointments": [], "tour_book_preview": [], "recognitions": [], "ribbon_progress": [], "earned_ribbons": [], "uniform_ribbon_rows": [], "career_stats": {}, "combat_experience": {}, "career_tour": {}, "career_milestones": [], "assignment_history_full": [], "buddy_history": [], "weekly_report": {}, "squad_snapshot": None, "where_you_stand": {}, "record_warning": None, "record_error_reference": None,
+            "can_recommend_awards": False, "award_candidates": [], "award_recommendations": [], "documents": [], "action_items": [], "notifications": [], "next_step": "Report to S-1.", "weapon_inspection": None, "mos_records": [], "timeline": [], "current_story": {}, "mos_proficiency": [], "instructor_quals": [], "leadership_records": [], "acting_appointments": [], "tour_book_preview": [], "recognitions": [], "ribbon_progress": [], "ribbon_details": [], "earned_ribbons": [], "uniform_ribbon_rows": [], "career_stats": {}, "combat_experience": {}, "career_tour": {}, "career_milestones": [], "assignment_history_full": [], "buddy_history": [], "weekly_report": {}, "squad_snapshot": None, "where_you_stand": {}, "record_warning": None, "record_error_reference": None, "hll_stats": hll_service_statistics(None),
         }
     personnel = soldier_view(personnel)
     pid = personnel["id"]
@@ -4062,83 +5122,88 @@ def member_record_context(personnel):
     )
     mos_proficiency = safe_member_panel("MOS PROFICIENCY", None, current_mos_proficiency, personnel)
     weapon = safe_member_panel("CURRENT WEAPON", None, current_weapon_for, personnel)
+    weapon_last_maintenance = safe_member_panel("WEAPON LAST MAINTENANCE", None,
+        lambda: fetch_one("SELECT * FROM weapon_maintenance_log WHERE weapon_id=%s ORDER BY performed_at DESC LIMIT 1",(weapon["id"],)) if weapon else None)
 
     return {
         "personnel": personnel,
-        "roster_card": battle_roster_for(personnel),
+        "roster_card": safe_member_panel("BATTLE ROSTER CARD", None, battle_roster_for, personnel),
         "weapon": weapon,
-        "uniform_issue": fetch_one(
+        "weapon_last_maintenance": weapon_last_maintenance,
+        "uniform_issue": safe_member_fetch_one("UNIFORM ISSUE",
             """SELECT eih.issued_at,ei.condition_state,sic.item_name
                FROM equipment_issue_history eih
                JOIN equipment_inventory ei ON ei.id=eih.equipment_id
                JOIN supply_item_catalog sic ON sic.item_code=ei.item_code
                WHERE eih.personnel_id=%s AND eih.is_current=TRUE AND ei.item_code='AG44' LIMIT 1""",
-            (pid,),
-        ),
-        "awards": fetch_all(
+            (pid,)),
+        "awards": safe_member_fetch_all("AWARDS",
             """SELECT pa.*, pr.id AS ribbon_id, pr.is_worn, rc.ribbon_code, rc.ribbon_name
                FROM personnel_awards pa
                LEFT JOIN ribbon_catalog rc ON LOWER(TRIM(rc.ribbon_name))=LOWER(TRIM(pa.award_name))
                LEFT JOIN personnel_ribbons pr ON pr.personnel_id=pa.personnel_id AND pr.ribbon_code=rc.ribbon_code
                WHERE pa.personnel_id=%s
                ORDER BY pa.award_date DESC
-               LIMIT 20""", (pid,)
-        ),
-        "assignments": fetch_all("SELECT * FROM assignment_history WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 20", (pid,)),
-        "appointments": fetch_all(
+               LIMIT 20""", (pid,)),
+        "assignments": safe_member_fetch_all("ASSIGNMENT HISTORY", "SELECT * FROM assignment_history WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 20", (pid,)),
+        "appointments": safe_member_fetch_all("APPOINTMENTS",
             """SELECT pa.*,ac.appointment_name FROM personnel_appointments pa
                JOIN appointment_catalog ac ON ac.appointment_code=pa.appointment_code
                WHERE pa.personnel_id=%s ORDER BY pa.effective_date DESC,pa.created_at DESC LIMIT 20""",
-            (pid,),
-        ),
-        "qualifications": fetch_all("SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY expires_at NULLS LAST,qualification_name LIMIT 20", (pid,)),
-        "duty_quals": personnel_duty_qualifications(pid),
-        "personal_ops": personal_operations(pid),
-        "operation_credit_ledger": member_operation_credit_ledger(pid),
-        "service_history": fetch_all("SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 30", (pid,)),
-        "documents": fetch_all("SELECT * FROM personnel_documents WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 40", (pid,)),
-        "current_orders": fetch_all(
+            (pid,)),
+        "qualifications": safe_member_fetch_all("QUALIFICATIONS", "SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY expires_at NULLS LAST,qualification_name LIMIT 20", (pid,)),
+        "duty_quals": safe_member_panel("DUTY QUALIFICATIONS", [], personnel_duty_qualifications, pid),
+        "personal_ops": safe_member_panel("PERSONAL OPERATIONS", [], personal_operations, pid),
+        "operation_credit_ledger": safe_member_panel("OPERATION CREDIT LEDGER", [], member_operation_credit_ledger, pid),
+        "service_history": safe_member_fetch_all("SERVICE HISTORY", "SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 30", (pid,)),
+        "documents": safe_member_fetch_all("PERSONNEL DOCUMENTS", "SELECT * FROM personnel_documents WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 40", (pid,)),
+        "current_orders": safe_member_fetch_all("CURRENT OPERATIONS",
             """SELECT * FROM operations
-               WHERE status NOT IN ('CLOSED','COMPLETE','COMPLETED','CANCELLED')
-               ORDER BY operation_date NULLS LAST, created_at DESC LIMIT 8"""
-        ),
+               WHERE UPPER(COALESCE(status,'')) NOT IN ('CLOSED','COMPLETE','COMPLETED','CANCELLED','CANCELED','ARCHIVED')
+                 AND UPPER(COALESCE(lifecycle_status,'PLANNING')) NOT IN ('CLOSED','COMPLETE','COMPLETED','CANCELLED','CANCELED','ARCHIVED','AAR FILED')
+                 AND (start_at IS NULL OR (start_at + make_interval(mins => COALESCE(duration_minutes,90))) > NOW())
+               ORDER BY CASE WHEN start_at IS NULL THEN 1 ELSE 0 END,start_at ASC,created_at DESC LIMIT 8"""),
         "chain_of_command": safe_member_panel("CHAIN OF COMMAND", [], chain_of_command_for, personnel),
         "replacement_training": safe_member_panel("REPLACEMENT TRAINING", {"complete":False,"requirements":[]}, replacement_training_status, personnel),
         "promotion_eligibility": safe_member_panel("PROMOTION ELIGIBILITY", [], promotion_eligibility, personnel),
-        "training_programs": fetch_all("SELECT * FROM training_program_catalog WHERE is_active=TRUE ORDER BY sort_order"),
+        "training_programs": safe_member_fetch_all("TRAINING PROGRAMS", "SELECT * FROM training_program_catalog WHERE is_active=TRUE ORDER BY sort_order"),
         "progress_control": safe_member_panel("PROGRESS CONTROL", {}, personnel_progress, pid),
         "can_recommend_awards": member_is_nco(personnel),
-        "award_candidates": fetch_all("SELECT id,rank_code,last_name,first_name,unit_code,platoon,squad FROM personnel ORDER BY unit_code,last_name,first_name") if member_is_nco(personnel) else [],
-        "award_recommendations": fetch_all(
+        "award_candidates": safe_member_fetch_all("AWARD CANDIDATES", "SELECT id,rank_code,last_name,first_name,unit_code,platoon,squad FROM personnel ORDER BY unit_code,last_name,first_name") if member_is_nco(personnel) else [],
+        "award_recommendations": safe_member_fetch_all("AWARD RECOMMENDATIONS",
             """SELECT pr.*,p.rank_code,p.last_name,p.first_name FROM personnel_recommendations pr
                JOIN personnel p ON p.id=pr.personnel_id
                WHERE pr.recommending_personnel_id=%s AND UPPER(pr.recommendation_type)='AWARD'
-               ORDER BY pr.created_at DESC LIMIT 12""", (pid,)
-        ) if member_is_nco(personnel) else [],
+               ORDER BY pr.created_at DESC LIMIT 12""", (pid,)) if member_is_nco(personnel) else [],
         "action_items": safe_member_panel("ACTION ITEMS", [], soldier_action_items, personnel),
         "notifications": safe_member_panel("NOTIFICATIONS", [], current_notifications, pid),
         "next_step": safe_member_panel("NEXT STEP", "Report to S-1.", soldier_next_step, personnel),
         "weapon_inspection": safe_member_panel("WEAPON INSPECTION", None, weapon_inspection_status, pid),
         "mos_records": safe_member_panel("MOS RECORDS", [], personnel_mos_for, pid),
-        "timeline": fetch_all("SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 80", (pid,)),
+        "timeline": safe_member_fetch_all("SOLDIER TIMELINE", "SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 80", (pid,)),
         "current_story": safe_member_panel("CURRENT STORY", {}, soldier_current_story, personnel),
-        "mos_proficiency": fetch_all("SELECT pmp.*,bmc.mos_title FROM personnel_mos_proficiency pmp JOIN battalion_mos_catalog bmc ON bmc.mos_code=pmp.mos_code WHERE pmp.personnel_id=%s AND pmp.is_current=TRUE ORDER BY pmp.proficiency_order DESC,bmc.sort_order",(pid,)),
-        "instructor_quals": fetch_all("SELECT * FROM instructor_qualifications WHERE personnel_id=%s AND status='CURRENT' ORDER BY effective_date DESC",(pid,)),
+        "mos_proficiency": safe_member_fetch_all("MOS PROFICIENCY HISTORY", "SELECT pmp.*,bmc.mos_title FROM personnel_mos_proficiency pmp JOIN battalion_mos_catalog bmc ON bmc.mos_code=pmp.mos_code WHERE pmp.personnel_id=%s AND pmp.is_current=TRUE ORDER BY pmp.proficiency_order DESC,bmc.sort_order",(pid,)),
+        "instructor_quals": safe_member_fetch_all("INSTRUCTOR QUALIFICATIONS", "SELECT * FROM instructor_qualifications WHERE personnel_id=%s AND status='CURRENT' ORDER BY effective_date DESC",(pid,)),
         "leadership_score": leadership_score,
-        "leadership_records": fetch_all("SELECT * FROM leadership_performance_records WHERE personnel_id=%s ORDER BY record_date DESC,created_at DESC LIMIT 12",(pid,)),
-        "acting_appointments": fetch_all("SELECT * FROM acting_appointments WHERE personnel_id=%s AND is_current=TRUE ORDER BY effective_date DESC",(pid,)),
-        "tour_book_preview": fetch_all("SELECT * FROM soldier_tour_book WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 8",(pid,)),
-        "recognitions": fetch_all("SELECT * FROM soldier_recognitions WHERE personnel_id=%s ORDER BY effective_date DESC",(pid,)),
+        "leadership_records": safe_member_fetch_all("LEADERSHIP RECORDS", "SELECT * FROM leadership_performance_records WHERE personnel_id=%s ORDER BY record_date DESC,created_at DESC LIMIT 12",(pid,)),
+        "acting_appointments": safe_member_fetch_all("ACTING APPOINTMENTS", "SELECT * FROM acting_appointments WHERE personnel_id=%s AND is_current=TRUE ORDER BY effective_date DESC",(pid,)),
+        "tour_book_preview": safe_member_fetch_all("TOUR BOOK", "SELECT * FROM soldier_tour_book WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 8",(pid,)),
+        "recognitions": safe_member_fetch_all("RECOGNITIONS", "SELECT * FROM soldier_recognitions WHERE personnel_id=%s ORDER BY effective_date DESC",(pid,)),
         "ribbon_progress": safe_member_panel("RIBBON PROGRESS", [], ribbon_progress_for, pid, award_completed=False),
+        "ribbon_details": safe_member_panel("RIBBON DETAILS", [], ribbon_details_for_member, pid),
         "earned_ribbons": safe_member_panel("EARNED RIBBONS", [], lambda: worn_ribbon_rows(pid)[1]),
         "uniform_ribbon_rows": safe_member_panel("UNIFORM RIBBONS", [], lambda: worn_ribbon_rows(pid)[0]),
         "current_situation": safe_member_panel("CURRENT SITUATION", {}, current_situation_snapshot, personnel),
         "field_reputation": safe_member_panel("FIELD REPUTATION", [], field_reputation, personnel),
         "personal_action_center": safe_member_panel("PERSONAL ACTION CENTER", [], member_personal_action_center, personnel),
+        "duty_desk": (lambda d: {**(d or {}), "items": sanitize_member_nav_rows((d or {}).get("items"), "my_action_center")})(safe_member_panel("DUTY DESK", {"items":[],"count":0,"all_clear":True}, member_duty_desk, personnel)),
+        "next_milestones": sanitize_member_nav_rows(safe_member_panel("NEXT MILESTONES", [], member_next_milestones, personnel), "my_soldier_record"),
         "recommended_action": safe_member_panel("NEXT RECOMMENDED ACTION", {"title":"MAINTAIN READINESS","detail":"No immediate deficiency on file."}, next_recommended_action, personnel),
         "most_served_with": safe_member_panel("MOST SERVED WITH", [], most_served_with, pid, 5),
         **career_context,
         "where_you_stand": where_you_stand,
+        "welcome_packet": safe_member_panel("WELCOME PACKET", {"packet":None,"percent":0,"phases":[]}, welcome_packet_context, pid),
+        "hll_stats": hll_service_statistics(pid),
     }
 
 
@@ -4175,6 +5240,8 @@ def member_record_fallback_context(personnel, error_reference=None):
                             JOIN weapon_inventory wi ON wi.id=wih.weapon_id
                             WHERE wih.personnel_id=%s AND wih.is_current=TRUE
                             ORDER BY wih.issued_at DESC LIMIT 1""",(p.get("id"),))
+        if weapon:
+            weapon=derive_weapon_state(weapon,p)
     except Exception:
         log.exception("MEMBER RECORD FALLBACK WEAPON LOOKUP FAILED [%s]",error_reference)
 
@@ -4184,6 +5251,7 @@ def member_record_fallback_context(personnel, error_reference=None):
         "weapon":weapon,
         "record_error_reference":error_reference,
         "record_warning":"The extended Soldier Record encountered a server-side data error. Your core personnel record is available below while Headquarters logs the failing module.",
+        "hll_stats": hll_service_statistics(p.get("id")),
     }
 
 
@@ -4201,6 +5269,8 @@ def my_soldier_record():
                 authority = f"{p.get('rank_code') or ''} {p.get('last_name') or ''}".strip()
                 execute("UPDATE personnel_progress_control SET rules_acknowledged_at=NOW(),rules_acknowledged_by=%s,updated_at=NOW() WHERE personnel_id=%s", (authority,p["id"]))
                 write_service_entry(p["id"],"ADMIN","BATTALION STANDING ORDERS ACKNOWLEDGED","Soldier acknowledged that the battalion community rules and standing orders were read and understood.",authority)
+                try: welcome_complete_task(p["id"],"STANDING_ORDERS","SOLDIER")
+                except Exception: log.exception("Welcome Packet Standing Orders milestone failed")
                 flash("BATTALION STANDING ORDERS ACKNOWLEDGED AND FILED IN YOUR 201 RECORD.", "success")
             replacement_training_status(soldier_view(p))
             if 'finalize_replacement_release' in globals():
@@ -4227,10 +5297,15 @@ def my_soldier_record():
         session["username"] = card["roster_number"]
         session["access_role"] = "member"
         execute("UPDATE battle_roster_cards SET last_used_at=NOW() WHERE id=%s", (card["id"],))
+        try:
+            welcome_complete_task(card["personnel_id"],"WEBSITE_LOGIN","SOLDIER")
+        except Exception:
+            log.exception("Welcome Packet first-login milestone failed for %s",card["personnel_id"])
         flash(f"SOLDIER RECORD OPENED — {card['rank_code']} {card['last_name'].upper()}.", "success")
-        return redirect(url_for("my_soldier_record"))
+        wp=fetch_one("SELECT status FROM welcome_packets WHERE personnel_id=%s",(card["personnel_id"],))
+        return redirect(url_for("welcome_packet") if wp and wp.get("status")!='COMPLETE' else url_for("my_soldier_record"))
 
-    if session.get("access_role") == "member" and session.get("user_id"):
+    if session.get("access_role") in {"member","nco","company_hq"} and session.get("user_id"):
         error_reference=None
         try:
             personnel=linked_personnel()
@@ -4242,6 +5317,13 @@ def my_soldier_record():
                                    record_warning="Your login was accepted, but the personnel-link lookup failed. Headquarters has logged this reference.")
 
         if personnel:
+            # Wall Locker access is authoritative; onboarding visit bookkeeping is optional.
+            # A stale/missing Welcome Packet table or column must never lock a Soldier out.
+            try:
+                welcome_visit(personnel["id"],"VIEW_WALL_LOCKER")
+            except Exception:
+                visit_ref=secrets.token_hex(4).upper()
+                log.exception("WALL LOCKER OPTIONAL VISIT TRACKING FAILURE [%s] personnel=%s",visit_ref,personnel.get("id"))
             try:
                 context=member_record_context(personnel)
                 return render_template("member_record.html", **context)
@@ -4293,10 +5375,13 @@ def staff_login():
 
 @app.route("/staff-access", methods=["GET", "POST"])
 def staff_access():
-    """Legacy staff-access URL retained for bookmarks and older templates."""
-    if request.method == "POST":
-        return _staff_login_response()
-    return redirect(url_for("staff_login"))
+    """Compatibility staff URL. Always render the dedicated staff portal directly.
+
+    Keeping this independent of the member-login route prevents old bookmarks,
+    cached public pages, or reverse-proxy redirect handling from ever falling
+    through to Soldier Record authentication.
+    """
+    return _staff_login_response()
 
 
 @app.get("/logout")
@@ -4346,10 +5431,10 @@ def _replacement_date(value):
 def permanent_formation_state(person):
     """Resolve whether a Soldier has a real permanent formation assignment.
 
-    A battalion/root placeholder is never enough. Line Soldiers must resolve to a
-    Squad. Headquarters/Section nodes are valid permanent assignments because
-    those billets do not belong to a rifle squad. Legacy company/platoon/squad
-    fields remain supported when no structured node exists.
+    A battalion/root placeholder is never enough. A real Company assignment (or
+    Headquarters/Section destination) ends Replacement status immediately.
+    Platoon and Squad remain separate assignment-detail fields that may be filed
+    after the Soldier has joined the Company. Legacy fields remain supported.
     """
     person=dict(person or {})
     node_id=person.get('unit_node_id')
@@ -4383,8 +5468,9 @@ def permanent_formation_state(person):
 
     # A structured HQ/Section assignment is a valid permanent destination.
     special_ok=bool(assigned_node and assigned_type in {'HEADQUARTERS','SECTION'})
-    # A line assignment is complete only when the hierarchy reaches a squad.
-    line_ok=bool(squad) or bool(company_ok and platoon_ok and squad_ok)
+    # Replacement status ends at Company assignment. Platoon/Squad are still
+    # tracked independently for formation completeness and roster placement.
+    line_ok=bool(company_ok)
     field_assigned=str(person.get('field_status') or '').upper()=='ASSIGNED'
     complete=bool(field_assigned and (special_ok or line_ok))
     return {
@@ -4435,6 +5521,53 @@ def _replacement_release_requirements(personnel_id):
         ('Permanent formation assigned',bool(formation.get('complete'))),
     ]
     return {'person':person,'progress':progress,'formation':formation,'profile':profile,'training_row':training_row,'weapon':weapon,'link':link,'mos_ok':mos_ok},requirements
+
+
+
+def release_replacement_on_company_assignment(personnel_id, authority='BATTALION S-1'):
+    """End Replacement status as soon as a real Company/HQ destination is filed.
+
+    This is intentionally independent of training, MOS, property, and other
+    in-processing gates. Those items remain open as normal personnel suspense.
+    """
+    person=fetch_one("SELECT * FROM personnel WHERE id=%s AND archived=FALSE AND separated_at IS NULL",(personnel_id,))
+    if not person:
+        return False
+    formation=permanent_formation_state(person)
+    if not (formation.get('company_ok') or formation.get('special_assignment')):
+        return False
+
+    duty=str(person.get('duty_status') or '').upper()
+    next_duty='PRESENT FOR DUTY' if duty in {'','REPLACEMENT — UNASSIGNED','REPLACEMENT - UNASSIGNED','IN PROCESSING','REPLACEMENT'} else person.get('duty_status')
+    execute("UPDATE personnel SET field_status='Assigned',duty_status=COALESCE(%s,duty_status),updated_at=NOW() WHERE id=%s",(next_duty,personnel_id))
+
+    case=fetch_one("""SELECT * FROM recruiting_cases
+                       WHERE personnel_id=%s
+                         AND status IN ('APPROVED_AWAITING_DISCORD','REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING')
+                       ORDER BY approved_at DESC NULLS LAST,created_at DESC LIMIT 1""",(personnel_id,))
+    movement_number=None
+    if case:
+        refreshed=fetch_one("SELECT * FROM personnel WHERE id=%s",(personnel_id,)) or person
+        destination=' / '.join(x for x in [refreshed.get('unit_code'),refreshed.get('platoon'),refreshed.get('squad')] if x)
+        doc=create_personnel_order(
+            personnel_id,'REPLACEMENT','MOVEMENT ORDERS — REPLACEMENT DETACHMENT',
+            f"The Soldier named herein is released from the 1/5 Cavalry Replacement Detachment and assigned to {destination}.",
+            effective_date=date.today(),authority=authority,
+            details={'recruiting_case':case.get('case_number'),'destination':destination,'release_basis':'COMPANY ASSIGNMENT'},
+            source_key=f"REPLACEMENT-COMPANY-RELEASE:{case['id']}"
+        )
+        movement_number=(doc or {}).get('document_number') if doc else None
+        execute("""UPDATE recruiting_cases SET status='ENLISTED',movement_order_number=COALESCE(%s,movement_order_number),
+                   movement_order_filed_at=CASE WHEN %s IS NOT NULL THEN NOW() ELSE movement_order_filed_at END,
+                   movement_unit_code=COALESCE(%s,movement_unit_code),updated_at=NOW()
+                   WHERE id=%s""",(movement_number,movement_number,refreshed.get('unit_code'),case['id']))
+        write_service_entry(
+            personnel_id,'ADMIN','RELEASED FROM REPLACEMENT DETACHMENT',
+            f"Company assignment filed. Soldier released from Replacement Detachment to {destination}. Remaining onboarding or training requirements continue as normal personnel suspense.",
+            authority,movement_number,date.today()
+        )
+    enqueue_discord_role_sync(personnel_id,'COMPANY ASSIGNMENT — REMOVE REPLACEMENT STATUS')
+    return True
 
 
 def finalize_replacement_release(personnel_id, authority='BATTALION S-1'):
@@ -4545,12 +5678,10 @@ def replacement_detachment_rows():
         assignment_pending=next((a for a in open_actions if str(a.get('action_type') or '').upper() in {'ASSIGNMENT','TRANSFER'}),None)
         inprocess_action=next((a for a in open_actions if 'IN-PROCESS' in str(a.get('subject') or '').upper() or str(a.get('source_key') or '').startswith('REPLACEMENT-INPROCESS:')),None)
         hold=next((a for a in open_actions if 'HOLD' in str(a.get('subject') or '').upper() or str(a.get('action_type') or '').upper()=='ADMIN HOLD'),None)
-        # Replacement Detachment is an UNASSIGNED holding roster.  The moment a
-        # Soldier has a real permanent Company/HQ destination, remove them from
-        # this roster even if onboarding, Standing Orders, training, or lower-
-        # echelon assignment follow-up is still outstanding.  Those remaining
-        # items continue through normal S-1/Training suspense and the 201 File.
-        permanent_destination=bool(formation.get('company_ok') or formation.get('special_assignment'))
+        # Replacement Detachment is an UNASSIGNED holding roster. The moment a
+        # Soldier receives a real Company assignment (or HQ/Section destination),
+        # they leave Replacement Detachment. Platoon/Squad details may follow later.
+        permanent_destination=bool(formation.get('special_assignment') or formation.get('company_ok'))
         if permanent_destination:
             continue
         candidate=replacement_status or lifecycle_replacement or not permanent_destination or bool(inprocess_action) or active_initial_training
@@ -4563,7 +5694,7 @@ def replacement_detachment_rows():
             {'code':'MOS','label':'MOS assigned','complete':mos_ok,'detail':person.get('mos_code') or 'MOS REQUIRED'},
             {'code':'M16','label':'M16 issued','complete':bool(weapon),'detail':f"M16 {weapon.get('serial_number')}" if weapon else 'ISSUE REQUIRED'},
             {'code':'ORDERS','label':'Standing orders acknowledged','complete':rules_ok,'detail':pr.get('rules_acknowledged_at') or 'SOLDIER ACKNOWLEDGMENT REQUIRED'},
-            {'code':'FORMATION','label':'Permanent formation assigned','complete':formation_complete,'detail':' / '.join(x for x in [person.get('unit_code'),person.get('platoon'),person.get('squad')] if x) if formation_complete else 'COMPANY / PLATOON / SQUAD REQUIRED'},
+            {'code':'FORMATION','label':'Permanent formation assigned','complete':formation_complete,'detail':' / '.join(x for x in [person.get('unit_code'),person.get('platoon'),person.get('squad')] if x) if formation_complete else 'COMPANY ASSIGNMENT REQUIRED'},
             {'code':'TRAINING','label':'Initial processing / Replacement Training complete','complete':training_ok,'detail':str(tr.get('completed_at')) if training_ok else f'{program.replace("_"," ")} INCOMPLETE'},
         ]
         completed=sum(1 for x in checklist if x['complete']); total=len(checklist)
@@ -4626,9 +5757,9 @@ def personnel_exception_rows(limit=100):
         pid=str(p['id']); name=f"{p.get('rank_code') or ''} {p.get('last_name') or ''}".strip()
         if p.get('squad') and not p.get('platoon'):
             rows.append({'person':p,'type':'ASSIGNMENT EXCEPTION','severity':'red','detail':'Squad is filed but platoon is blank.'})
-        # Once a Soldier is assigned to a Company they leave Replacement Detachment.
-        # Surface any unfinished lower-echelon placement here instead of keeping
-        # them on the Replacement roster.
+        # Company assignment ends Replacement status. Missing Platoon/Squad detail
+        # may still be surfaced as an assignment-completeness issue where appropriate,
+        # but it does not return the Soldier to Replacement Detachment.
         try:
             _formation=permanent_formation_state(p)
         except Exception:
@@ -4637,7 +5768,7 @@ def personnel_exception_rows(limit=100):
             missing=[]
             if not _formation.get('platoon_ok'): missing.append('platoon')
             if not _formation.get('squad_ok'): missing.append('squad')
-            rows.append({'person':p,'type':'ASSIGNMENT FOLLOW-UP','severity':'amber','detail':'Company assignment filed; '+ ' and '.join(missing) +' assignment still requires S-1 action.'})
+            rows.append({'person':p,'type':'INCOMPLETE LINE ASSIGNMENT','severity':'amber','detail':'Permanent line assignment incomplete; '+ ' and '.join(missing) +' assignment still requires S-1 action. Company assignment has already released the Soldier from Replacement Detachment.'})
         if pid in team_leaders and not p.get('squad'):
             rows.append({'person':p,'type':'ROLE EXCEPTION','severity':'red','detail':'Active Team Leader / assistant leadership appointment has no squad assignment.'})
         if str(p.get('field_status') or '').upper()=='ASSIGNED' and pid not in current_weapons:
@@ -4742,6 +5873,146 @@ def staff_suspense_summary():
     }
 
 
+
+
+def battalion_integrity_scan(limit=200):
+    """Read-only cross-system consistency scan. Never mutates authoritative records."""
+    issues=[]
+    checks=[]
+    def add(code,severity,title,detail,endpoint='battalion_control',personnel_id=None,reference=None):
+        issues.append({'code':code,'severity':severity,'title':title,'detail':detail,'endpoint':endpoint,
+                       'personnel_id':personnel_id,'reference':reference})
+    def qcount(label,sql,params=()):
+        try:
+            n=int((fetch_one(sql,params) or {'total':0}).get('total') or 0)
+            checks.append({'label':label,'state':'CURRENT' if n==0 else 'ACTION REQUIRED','count':n})
+            return n
+        except Exception as exc:
+            log.exception('Integrity check failed: %s',label)
+            checks.append({'label':label,'state':'CHECK FAILED','count':0})
+            add('CHECK_FAILED','red',label,'Integrity query could not complete. Review Railway/database logs.','battalion_control')
+            return None
+    try:
+        people=fetch_all("""SELECT p.* FROM personnel p WHERE p.archived=FALSE AND p.separated_at IS NULL ORDER BY p.last_name,p.first_name""")
+        linked={str(r['personnel_id']) for r in fetch_all("SELECT personnel_id FROM website_member_links")}
+        weapons={str(r['personnel_id']) for r in fetch_all("SELECT personnel_id FROM weapon_issue_history WHERE is_current=TRUE")}
+        failed_sync={str(r['personnel_id']):r for r in fetch_all("""SELECT DISTINCT ON (personnel_id) personnel_id,status,error_text FROM discord_role_sync_queue ORDER BY personnel_id,requested_at DESC""")}
+        packets={str(r['personnel_id']):r for r in fetch_all("SELECT personnel_id,status,current_phase,updated_at FROM welcome_packets")}
+        for row in people:
+            pid=str(row['id']); company=(row.get('unit_code') or '').strip(); platoon=(row.get('platoon') or '').strip(); squad=(row.get('squad') or '').strip()
+            if squad and not platoon:
+                add('FORMATION_SQUAD_WITHOUT_PLATOON','red','FORMATION CONFLICT',f"{row.get('rank_code','')} {row.get('last_name','')} has a Squad but no Platoon.",'personnel_office',pid)
+            if company and company.upper() not in {'REPLACEMENT','REPLACEMENT DETACHMENT','REPLACEMENT DEPOT'} and str(row.get('field_status') or '').upper() in {'REPLACEMENT','REPLACEMENT DETACHMENT','REPLACEMENT DEPOT'}:
+                add('ASSIGNED_STILL_REPLACEMENT','red','REPLACEMENT STATUS CONFLICT',f"{row.get('rank_code','')} {row.get('last_name','')} has a permanent unit but still carries Replacement field status.",'personnel_office',pid)
+            if str(row.get('field_status') or '').upper()=='ASSIGNED' and pid not in weapons:
+                add('ASSIGNED_NO_M16','amber','PROPERTY EXCEPTION',f"{row.get('rank_code','')} {row.get('last_name','')} is assigned but has no current M16 issue.",'arms_room',pid)
+            if pid not in linked:
+                add('NO_DISCORD_LINK','amber','DISCORD LINK MISSING',f"{row.get('rank_code','')} {row.get('last_name','')} has no Website↔Discord member link.",'personnel_office',pid)
+            sync=failed_sync.get(pid)
+            if sync and str(sync.get('status') or '').upper()=='FAILED':
+                add('DISCORD_SYNC_FAILED','red','DISCORD ROLE SYNC FAILED',sync.get('error_text') or f"Role synchronization failed for {row.get('last_name','')}.",'personnel_office',pid)
+            packet=packets.get(pid)
+            if packet and str(packet.get('status') or '').upper() not in {'COMPLETE','CLOSED'} and company and company.upper() not in {'REPLACEMENT','REPLACEMENT DETACHMENT','REPLACEMENT DEPOT'}:
+                # Active packet is valid after company assignment while later phases are unfinished; only flag impossible replacement-orientation state.
+                if str(packet.get('current_phase') or '').upper()=='REPLACEMENT_ORIENTATION':
+                    add('PACKET_PHASE_STALE','amber','WELCOME PACKET PHASE STALE',f"{row.get('rank_code','')} {row.get('last_name','')} is permanently assigned but the packet is still in Replacement Orientation.",'staff_onboarding',pid)
+    except Exception:
+        log.exception('Personnel integrity scan failed')
+        add('PERSONNEL_SCAN_FAILED','red','PERSONNEL INTEGRITY SCAN FAILED','The personnel consistency scan could not complete.','battalion_control')
+
+    qcount('AWARD ORDERS',"SELECT COUNT(*) total FROM personnel_awards WHERE COALESCE(BTRIM(order_number),'')='' OR COALESCE(BTRIM(citation),'')=''")
+    qcount('DISCORD ROLE QUEUE',"SELECT COUNT(*) total FROM discord_role_sync_queue WHERE UPPER(COALESCE(status,''))='FAILED'")
+    qcount('OPERATION / CLERK LINK',"""SELECT COUNT(*) total FROM operations WHERE UPPER(COALESCE(status,'')) NOT IN ('CANCELLED','CANCELED','CLOSED','COMPLETE','COMPLETED','ARCHIVED','DELETED') AND UPPER(COALESCE(publish_status,'DRAFT'))='PUBLISHED' AND clerk_event_id IS NULL""")
+    qcount('WELCOME PACKET STALL',"SELECT COUNT(*) total FROM welcome_packets WHERE status NOT IN ('COMPLETE','CLOSED') AND updated_at<NOW()-INTERVAL '24 hours'")
+    qcount('DUPLICATE CURRENT M16 ISSUE',"SELECT COUNT(*) total FROM (SELECT personnel_id FROM weapon_issue_history WHERE is_current=TRUE GROUP BY personnel_id HAVING COUNT(*)>1) x")
+    qcount('DUPLICATE PENDING DISCORD SYNC',"SELECT COUNT(*) total FROM (SELECT personnel_id FROM discord_role_sync_queue WHERE status='PENDING' GROUP BY personnel_id HAVING COUNT(*)>1) x")
+    qcount('TRAINING RECORD EXPIRATIONS',"SELECT COUNT(*) total FROM qualifications WHERE status='CURRENT' AND expires_at<CURRENT_DATE")
+
+    # M16 counter integrity: compare stored post-cleaning counter with ledger events after last cleaning.
+    try:
+        rows=fetch_all("""SELECT wi.id,wi.serial_number,wi.rounds_since_cleaning,wi.total_rounds,
+                     COALESCE((SELECT MAX(wml.performed_at) FROM weapon_maintenance_log wml WHERE wml.weapon_id=wi.id AND UPPER(COALESCE(wml.action_type,'')) LIKE '%%CLEAN%%'),wi.last_cleaned_at,(SELECT MIN(wih.issued_at)::timestamptz FROM weapon_issue_history wih WHERE wih.weapon_id=wi.id AND wih.is_current=TRUE)) AS cleaned_at,
+                     COALESCE((SELECT SUM(wre.rounds_fired) FROM weapon_round_events wre WHERE wre.weapon_id=wi.id),0) AS ledger_total
+                     FROM weapon_inventory wi
+                     WHERE EXISTS(SELECT 1 FROM weapon_issue_history wih WHERE wih.weapon_id=wi.id AND wih.is_current=TRUE)""")
+        bad=0
+        for w in rows:
+            after=fetch_one("SELECT COALESCE(SUM(rounds_fired),0) total FROM weapon_round_events WHERE weapon_id=%s AND recorded_at>=COALESCE(%s::timestamptz,'epoch'::timestamptz)",(w['id'],w.get('cleaned_at'))) or {'total':0}
+            expected=int(after.get('total') or 0); stored=int(w.get('rounds_since_cleaning') or 0)
+            if expected!=stored:
+                bad+=1; add('M16_COUNTER_DRIFT','red','M16 CLEANING / ROUND COUNTER DRIFT',f"M16 {w.get('serial_number')} shows {stored} rounds since cleaning; ledger evidence shows {expected}.",'arms_room',reference=w.get('serial_number'))
+        checks.append({'label':'M16 CLEANING LEDGER','state':'CURRENT' if bad==0 else 'ACTION REQUIRED','count':bad})
+    except Exception:
+        log.exception('M16 integrity scan failed')
+        checks.append({'label':'M16 CLEANING LEDGER','state':'CHECK FAILED','count':0})
+        add('M16_SCAN_FAILED','red','M16 INTEGRITY CHECK FAILED','Weapon ledger comparison could not complete.','arms_room')
+
+    red=sum(1 for i in issues if i['severity']=='red'); amber=sum(1 for i in issues if i['severity']=='amber')
+    return {'issues':issues[:limit],'checks':checks,'red':red,'amber':amber,'total':len(issues),'all_clear':not issues}
+
+
+def staff_change_feed(role,limit=12):
+    """Meaningful battalion changes; read-only and role-aware."""
+    section=_staff_section(role)
+    try:
+        if section:
+            rows=fetch_all("""SELECT created_at,section,action_type AS category,summary AS title,actor,reference_number,personnel_id
+                              FROM staff_duty_log WHERE section=%s ORDER BY created_at DESC LIMIT %s""",(section,limit))
+        else:
+            rows=fetch_all("""SELECT created_at,section,action_type AS category,summary AS title,actor,reference_number,personnel_id
+                              FROM staff_duty_log ORDER BY created_at DESC LIMIT %s""",(limit,))
+        return rows
+    except Exception:
+        log.exception('Staff change feed failed')
+        return []
+
+
+def member_next_milestones(person):
+    """Compact member progress board sourced only from existing authoritative systems."""
+    if not person: return []
+    pid=person['id']; out=[]
+    try:
+        for row in ribbon_progress_for(pid,award_completed=False):
+            if row.get('earned') or row.get('pending_system'): continue
+            remaining=max(0,int(row.get('target') or 0)-int(row.get('current') or 0))
+            detail=row.get('detail') or ''
+            if row.get('secondary_target'):
+                detail=f"{detail} • {max(0,int(row.get('secondary_target') or 0)-int(row.get('secondary_current') or 0))} secondary requirement remaining"
+            out.append({'section':'NEXT RIBBON','title':row.get('name'),'detail':detail,'percent':row.get('percent',0),'endpoint':'my_201_file','anchor':'awards'})
+            break
+    except Exception: log.exception('Member next-ribbon milestone failed')
+    try:
+        for m in member_career_milestones(person)[:3]:
+            out.append({'section':m.get('section') or 'CAREER','title':m.get('title'),'detail':m.get('detail'),'percent':None,'endpoint':'my_201_file','anchor':'promotion-eligibility'})
+    except Exception: log.exception('Member career milestone build failed')
+    return out[:4]
+
+def _staff_automation_health(role):
+    """Compact exception-only health readout; automation stays invisible when healthy."""
+    health=[]
+    def count(sql,params=()):
+        try:
+            return int((fetch_one(sql,params) or {'total':0}).get('total') or 0)
+        except Exception:
+            log.exception('Staff automation health check failed')
+            return None
+    if role in {'s1','battalion_hq','commander','admin'}:
+        failed=count("SELECT COUNT(*) total FROM discord_role_sync_queue WHERE UPPER(COALESCE(status,''))='FAILED'")
+        pending=count("SELECT COUNT(*) total FROM discord_role_sync_queue WHERE UPPER(COALESCE(status,'')) IN ('PENDING','QUEUED')")
+        health.append({'label':'DISCORD PERSONNEL SYNC','state':'ERROR' if failed else ('PENDING' if pending else 'CURRENT'),'count':failed or pending or 0,
+                       'endpoint':'personnel_office' if failed else 'staff_action_center'})
+        intake_errors=count("""SELECT COUNT(*) total FROM recruiting_cases WHERE status IN ('SUBMITTED','DISCORD_VERIFIED','PENDING_COMMAND','MORE_INFO_REQUIRED','REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING') AND discord_join_error IS NOT NULL""")
+        health.append({'label':'RECRUIT DISCORD INTAKE','state':'ERROR' if intake_errors else 'CURRENT','count':intake_errors or 0,'endpoint':'recruiting_control'})
+        stalled=count("""SELECT COUNT(*) total FROM welcome_packets WHERE status NOT IN ('COMPLETE','CLOSED') AND updated_at < NOW()-INTERVAL '24 hours'""")
+        health.append({'label':'WELCOME PACKETS','state':'WATCH' if stalled else 'CURRENT','count':stalled or 0,'endpoint':'staff_onboarding'})
+    if role in {'s3','training','battalion_hq','commander','admin'}:
+        unsynced=count("""SELECT COUNT(*) total FROM operations WHERE UPPER(COALESCE(status,'')) NOT IN ('CANCELLED','CANCELED','CLOSED','COMPLETE','COMPLETED','ARCHIVED','DELETED') AND UPPER(COALESCE(publish_status,'DRAFT'))='PUBLISHED' AND clerk_event_id IS NULL""")
+        health.append({'label':'OPERATION / CLERK LINK','state':'ERROR' if unsynced else 'CURRENT','count':unsynced or 0,'endpoint':'operations'})
+    if role in {'s4','battalion_hq','commander','admin'}:
+        health.append({'label':'M16 VOICE LEDGER','state':'CURRENT','count':0,'endpoint':'arms_room'})
+    return health
+
+
 @app.get('/staff')
 @login_required
 def staff_action_center():
@@ -4777,11 +6048,21 @@ def staff_action_center():
             personnel_exceptions=personnel_exception_rows(20)
         except Exception:
             log.exception('Personnel exception scan failed; Action Center will remain available.')
+    role_focus={
+        's1':'PERSONNEL / REPLACEMENTS / ONBOARDING',
+        's2':'INTELLIGENCE / STAFF SUSPENSE',
+        's3':'OPERATIONS / ATTENDANCE / READINESS',
+        'training':'TRAINING / QUALIFICATIONS / READINESS',
+        's4':'M16 / INSPECTIONS / LOGISTICS',
+        'battalion_hq':'BATTALION-WIDE ACTION REQUIRED',
+        'commander':'BATTALION-WIDE ACTION REQUIRED',
+        'admin':'SYSTEM / BATTALION-WIDE CONTROL',
+    }.get(role,'STAFF ACTION REQUIRED')
     return render_template('staff_action_center.html',role=role,section=section,brief=brief,attention=attention,
                            search_query=q,search_rows=search_rows,recent_actions=recent,open_actions=open_rows,
                            personnel_choices=personnel_choices,command_watchlist=watchlist,suspense_summary=suspense_summary,
                            replacement_rows=replacement_rows,priority_work=s1_priority_work(replacement_rows) if replacement_rows else [],
-                           personnel_exceptions=personnel_exceptions)
+                           personnel_exceptions=personnel_exceptions,automation_health=_staff_automation_health(role),integrity=battalion_integrity_scan(40),change_feed=staff_change_feed(role,12),role_focus=role_focus)
 
 @app.get('/staff/personnel/<personnel_id>')
 @login_required
@@ -5033,7 +6314,7 @@ def replacement_batch_action():
             processed+=1
         else:
             abort(400)
-    staff_log('S-1','REPLACEMENT BATCH ACTION',f'{action} — {processed} Soldier(s)',authority,
+    staff_log('S-1','REPLACEMENT BATCH ACTION',f"{action} — {processed} Soldier{'s' if processed != 1 else ''}",authority,
               details={'processed':processed,'skipped':skipped,'action':action})
     flash(f'BATCH ACTION COMPLETE — {processed} PROCESSED'+(f'; {skipped} SKIPPED.' if skipped else '.'),'success')
     return redirect(url_for('replacement_detachment'))
@@ -5086,8 +6367,8 @@ def staff_batch_action():
         if not p: continue
         open_personnel_action(pid,kind,subject,section,'ROUTINE',authority,{'remarks':remarks,'batch':True})
         created+=1
-    staff_log(section,'BATCH ACTION',f'{subject} — {created} Soldier(s)',authority,details={'count':created,'action_type':kind})
-    flash(f'BATCH ACTION FILED FOR {created} SOLDIER(S).','success')
+    staff_log(section,'BATCH ACTION',f"{subject} — {created} Soldier{'s' if created != 1 else ''}",authority,details={'count':created,'action_type':kind})
+    flash(f"BATCH ACTION FILED FOR {created} SOLDIER{'S' if created != 1 else ''}.",'success')
     return redirect(request.referrer or url_for('staff_action_center'))
 
 
@@ -5134,10 +6415,36 @@ def leadership_lineage_page():
 @app.get('/my-action-center')
 @login_required
 def my_action_center():
-    person=linked_personnel()
-    if not person: return redirect(url_for('login'))
-    p=soldier_view(person)
-    return render_template('member_action_center.html',personnel=p,items=member_personal_action_center(p),recommended=next_recommended_action(p),situation=current_situation_snapshot(p),reputation=field_reputation(p))
+    # The Action Center is a member navigation hub. Optional subsystem failures
+    # must degrade individual cards, never make the tab appear dead.
+    try:
+        person=linked_personnel()
+        if not person:
+            return redirect(url_for('login'))
+        p=soldier_view(person)
+        items=safe_member_panel('My Actions list', [], member_personal_action_center, p)
+        recommended=safe_member_panel('My Actions recommendation',
+            {'section':'HEADQUARTERS','title':'MAINTAIN READINESS','detail':'No immediate deficiency is on file.','priority':'ROUTINE'},
+            next_recommended_action, p)
+        situation=safe_member_panel('My Actions situation', {}, current_situation_snapshot, p)
+        reputation=safe_member_panel('My Actions reputation', [], field_reputation, p)
+        return render_template('member_action_center.html',personnel=p,items=items,recommended=recommended,situation=situation,reputation=reputation)
+    except Exception:
+        error_reference=secrets.token_hex(4).upper()
+        log.exception('MY ACTIONS ROUTE FAILURE [%s]',error_reference)
+        # Preserve a usable member destination instead of sending the user to the
+        # global 500 screen. The Wall Locker remains the safe return point.
+        try:
+            person=linked_personnel()
+            if person:
+                p=soldier_view(person)
+                return render_template('member_action_center.html', personnel=p, items=[],
+                    recommended={'section':'HEADQUARTERS','title':'ACTION DATA TEMPORARILY LIMITED',
+                                 'detail':'Your Action Center is available, but one optional data source could not be read. Headquarters has logged reference '+error_reference+'.',
+                                 'priority':'WATCH'}, situation={}, reputation=[]), 200
+        except Exception:
+            log.exception('MY ACTIONS FALLBACK FAILURE [%s]',error_reference)
+        return redirect(url_for('my_soldier_record'))
 
 
 @app.route('/my-journal',methods=['GET','POST'])
@@ -5193,7 +6500,7 @@ def clerk_role_sync_pending():
     if guild_id:
         where += ' AND q.guild_id=%s'; params.append(guild_id)
     rows=fetch_all(f"""SELECT q.id,q.personnel_id,q.guild_id,q.discord_user_id,q.reason,q.requested_at,
-                        p.rank_code,p.mos_code,p.unit_code,p.platoon,p.squad
+                        p.rank_code,p.mos_code,p.unit_code,p.platoon,p.squad,p.fire_team
                         FROM discord_role_sync_queue q JOIN personnel p ON p.id=q.personnel_id
                         {where} ORDER BY q.requested_at LIMIT 50""",tuple(params))
     out=[]
@@ -5226,14 +6533,14 @@ def clerk_member_reminders():
     for p in rows:
         pid=p['id']; insp=weapon_inspection_status(pid)
         if insp and insp.get('days') is not None and int(insp.get('days')) in {3,1,0}:
-            reminders.append({'personnel_id':str(pid),'guild_id':p['guild_id'],'discord_user_id':p['discord_user_id'],'type':'M16_INSPECTION','stage':str(insp.get('days')),'reminder_key':f"M16:{insp.get('days')}",'message':f"**1/5 CAV — S-4 NOTICE**\nYour assigned M16 inspection is due in {max(0,int(insp.get('days')))} day(s)."})
+            reminders.append({'personnel_id':str(pid),'guild_id':p['guild_id'],'discord_user_id':p['discord_user_id'],'type':'M16_INSPECTION','stage':str(insp.get('days')),'reminder_key':f"M16:{insp.get('days')}",'message':f"**1/5 CAV — S-4 NOTICE**\nYour assigned M16 inspection is due in {max(0,int(insp.get('days')))} day{'s' if max(0,int(insp.get('days'))) != 1 else ''}."})
         q=fetch_one("""SELECT MIN(due) due FROM (
                          SELECT expires_at due FROM qualifications WHERE personnel_id=%s AND expires_at IS NOT NULL
                          UNION ALL SELECT expiration_date due FROM personnel_duty_qualifications WHERE personnel_id=%s AND expiration_date IS NOT NULL) x
                          WHERE due BETWEEN CURRENT_DATE AND CURRENT_DATE+INTERVAL '7 days'""",(pid,pid))
         if q and q.get('due'):
             days=(q['due']-date.today()).days
-            if days in {7,3,1,0}: reminders.append({'personnel_id':str(pid),'guild_id':p['guild_id'],'discord_user_id':p['discord_user_id'],'type':'QUALIFICATION_EXPIRATION','stage':str(days),'reminder_key':f"QUAL:{q.get('due')}:{days}",'message':f"**1/5 CAV — TRAINING NOTICE**\nA qualification on your Soldier Record expires in {days} day(s)."})
+            if days in {7,3,1,0}: reminders.append({'personnel_id':str(pid),'guild_id':p['guild_id'],'discord_user_id':p['discord_user_id'],'type':'QUALIFICATION_EXPIRATION','stage':str(days),'reminder_key':f"QUAL:{q.get('due')}:{days}",'message':f"**1/5 CAV — TRAINING NOTICE**\nA qualification on your Soldier Record expires in {days} day{'s' if days != 1 else ''}."})
     return {'ok':True,'reminders':reminders}
 
 @app.get("/dashboard")
@@ -5251,7 +6558,7 @@ def dashboard():
         equipment = fetch_all("SELECT * FROM equipment_issues WHERE personnel_id=%s ORDER BY item_type,nomenclature LIMIT 8", (personnel["id"],))
         service_history = fetch_all("SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC, created_at DESC LIMIT 8", (personnel["id"],))
         roster_card = battle_roster_for(personnel)
-        weapon = current_weapon_for(personnel)
+        weapon = safe_member_panel('201 weapon', None, current_weapon_for, personnel)
     return render_template("dashboard.html", personnel=personnel, upcoming=upcoming, qualifications=qualifications, equipment=equipment, service_history=service_history, roster_card=roster_card, weapon=weapon)
 
 
@@ -5260,7 +6567,7 @@ def personnel_record_context(personnel):
     """Build the complete read-only 201 File / Service Record view."""
     if not personnel:
         return {
-            "personnel": None, "qualifications": [], "equipment": [], "awards": [],
+            "personnel": None, "qualifications": [], "equipment": [], "awards": [], "award_catalog": [],
             "activity": [], "service_history": [], "assignments": [], "promotions": [],
             "appointments": [], "roster_card": None, "weapon": None,
             "chain_of_command": [], "readiness": {}, "tour_phase_record": ("NO RECORD", None),
@@ -5270,39 +6577,41 @@ def personnel_record_context(personnel):
             "current_situation": {}, "field_reputation": [], "service_timeline": [], "weapon_personality": None,
             "award_evidence": {}, "promotion_packet": {}, "most_served_with": [], "member_action_center": [],
             "next_recommended_action": {}, "journal_entries": [], "command_watchlist": [],
+            "uniform_issue": None, "earned_ribbons": [], "uniform_ribbon_rows": [], "personal_action_center": [],
+            "recommended_action": {}, "discord_sync": None, "welcome_packet": {"packet":None,"tasks":[],"percent":0}, "hll_stats": hll_service_statistics(None),
         }
 
     personnel = soldier_view(personnel)
     pid = personnel["id"]
     # 201 File GET is read-oriented. Background/event actions own synchronization;
     # opening a personnel jacket must not trigger a chain of database writes.
-    mos_proficiency = current_mos_proficiency(personnel)
-    leadership_service = leadership_service_summary(pid)
-    leadership_score = combat_leadership_score(pid)
-    weapon = current_weapon_for(personnel)
-    current_situation = current_situation_snapshot(personnel)
-    reputation = field_reputation(personnel)
-    service_timeline = active_service_timeline(pid)
-    weapon_story = weapon_personality(weapon["id"]) if weapon else None
-    award_evidence = award_recommendation_evidence(pid)
-    promotion_packet = promotion_board_packet(pid)
-    served_with = most_served_with(pid,5)
-    member_actions = member_personal_action_center(personnel)
-    recommended_action = next_recommended_action(personnel)
-    journal_entries = fetch_all("""SELECT sje.*,o.operation_number,o.title AS operation_title FROM soldier_journal_entries sje
+    mos_proficiency = safe_member_panel('201 MOS proficiency', None, current_mos_proficiency, personnel)
+    leadership_service = safe_member_panel('201 leadership service', {'history':[],'totals':[],'total_days':0}, leadership_service_summary, pid)
+    leadership_score = safe_member_panel('201 leadership score', {'score':0,'rating':'NOT RATED','breakdown':{}}, combat_leadership_score, pid)
+    weapon = safe_member_panel('201 weapon', None, current_weapon_for, personnel)
+    current_situation = safe_member_panel('201 current situation', {}, current_situation_snapshot, personnel)
+    reputation = safe_member_panel('201 field reputation', [], field_reputation, personnel)
+    service_timeline = safe_member_panel('201 service timeline', [], active_service_timeline, pid)
+    weapon_story = safe_member_panel('201 weapon story', None, weapon_personality, weapon["id"]) if weapon else None
+    award_evidence = safe_member_panel('201 award evidence', {}, award_recommendation_evidence, pid)
+    promotion_packet = safe_member_panel('201 promotion packet', {}, promotion_board_packet, pid)
+    served_with = safe_member_panel('201 most served with', [], most_served_with, pid, 5)
+    member_actions = safe_member_panel('201 member actions', [], member_personal_action_center, personnel)
+    recommended_action = safe_member_panel('201 recommended action', {'section':'HEADQUARTERS','title':'MAINTAIN READINESS','detail':'No immediate deficiency is on file.','priority':'ROUTINE'}, next_recommended_action, personnel)
+    journal_entries = safe_member_fetch_all('201 unit journal', """SELECT sje.*,o.operation_number,o.title AS operation_title FROM soldier_journal_entries sje
                                   LEFT JOIN operations o ON o.id=sje.operation_id
                                   WHERE sje.personnel_id=%s AND sje.visibility='UNIT'
                                   ORDER BY sje.entry_date DESC,sje.created_at DESC LIMIT 40""",(pid,))
-    watchlist = fetch_all("SELECT * FROM command_watchlist WHERE personnel_id=%s AND resolved_at IS NULL ORDER BY created_at DESC",(pid,))
+    watchlist = safe_member_fetch_all('201 command watchlist', "SELECT * FROM command_watchlist WHERE personnel_id=%s AND resolved_at IS NULL ORDER BY created_at DESC",(pid,))
 
-    promotions = fetch_all(
+    promotions = safe_member_fetch_all("201 promotions",
         """SELECT ph.*,rc.rank_name,rc.pay_grade
            FROM promotion_history ph
            LEFT JOIN rank_catalog rc ON rc.rank_code=ph.new_rank_code
            WHERE ph.personnel_id=%s
            ORDER BY ph.effective_date DESC,ph.created_at DESC""", (pid,)
     )
-    appointments = fetch_all(
+    appointments = safe_member_fetch_all("201 appointments",
         """SELECT pa.*,ac.appointment_name
            FROM personnel_appointments pa
            JOIN appointment_catalog ac ON ac.appointment_code=pa.appointment_code
@@ -5311,24 +6620,24 @@ def personnel_record_context(personnel):
     )
     return {
         "personnel": personnel,
-        "qualifications": fetch_all("SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY qualification_name", (pid,)),
-        "equipment": fetch_all("SELECT * FROM equipment_issues WHERE personnel_id=%s ORDER BY item_type,nomenclature", (pid,)),
-        "awards": fetch_all("SELECT * FROM personnel_awards WHERE personnel_id=%s ORDER BY award_date DESC", (pid,)),
-        "award_catalog": fetch_all("SELECT ribbon_code,ribbon_name FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name"),
-        "activity": fetch_all("SELECT * FROM personnel_activity_credit WHERE personnel_id=%s ORDER BY activity_date DESC,created_at DESC LIMIT 100", (pid,)),
-        "service_history": fetch_all("SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 150", (pid,)),
-        "documents": fetch_all("SELECT * FROM personnel_documents WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 100", (pid,)),
-        "assignments": fetch_all("SELECT * FROM assignment_history WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC", (pid,)),
+        "qualifications": safe_member_fetch_all("201 qualifications", "SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY qualification_name", (pid,)),
+        "equipment": safe_member_fetch_all("201 equipment", "SELECT * FROM equipment_issues WHERE personnel_id=%s ORDER BY item_type,nomenclature", (pid,)),
+        "awards": safe_member_fetch_all("201 awards", "SELECT * FROM personnel_awards WHERE personnel_id=%s ORDER BY award_date DESC", (pid,)),
+        "award_catalog": safe_member_fetch_all("201 award catalog", "SELECT ribbon_code,ribbon_name FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name"),
+        "activity": safe_member_fetch_all("201 activity", "SELECT * FROM personnel_activity_credit WHERE personnel_id=%s ORDER BY activity_date DESC,created_at DESC LIMIT 100", (pid,)),
+        "service_history": safe_member_fetch_all("201 service history", "SELECT * FROM personnel_service_history WHERE personnel_id=%s ORDER BY entry_date DESC,created_at DESC LIMIT 150", (pid,)),
+        "documents": safe_member_fetch_all("201 documents", "SELECT * FROM personnel_documents WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC LIMIT 100", (pid,)),
+        "assignments": safe_member_fetch_all("201 assignments", "SELECT * FROM assignment_history WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC", (pid,)),
         "promotions": promotions, "appointments": appointments,
-        "roster_card": battle_roster_for(personnel), "weapon": weapon,
-        "chain_of_command": chain_of_command_for(personnel),
-        "readiness": soldier_readiness(personnel), "tour_phase_record": tour_phase(personnel),
-        "inactivity": inactivity_snapshot(personnel),
-        "inactivity_contacts": fetch_all("SELECT * FROM inactivity_contact_log WHERE personnel_id=%s ORDER BY contacted_at DESC LIMIT 12", (pid,)),
-        "duty_quals": personnel_duty_qualifications(pid), "personal_ops": personal_operations(pid),
-        "issued_equipment": current_equipment_for(pid),
-        "replacement_training": replacement_training_status(personnel),
-        "promotion_eligibility": promotion_eligibility(personnel),
+        "roster_card": safe_member_panel("201 roster card", None, battle_roster_for, personnel), "weapon": weapon,
+        "chain_of_command": safe_member_panel("201 chain of command", [], chain_of_command_for, personnel),
+        "readiness": safe_member_panel("201 readiness", {}, soldier_readiness, personnel), "tour_phase_record": safe_member_panel("201 tour phase", ("NO RECORD",None), tour_phase, personnel),
+        "inactivity": safe_member_panel("201 inactivity", {}, inactivity_snapshot, personnel),
+        "inactivity_contacts": safe_member_fetch_all("201 inactivity contacts", "SELECT * FROM inactivity_contact_log WHERE personnel_id=%s ORDER BY contacted_at DESC LIMIT 12", (pid,)),
+        "duty_quals": safe_member_panel("201 duty qualifications", [], personnel_duty_qualifications, pid), "personal_ops": safe_member_panel("201 personal operations", [], personal_operations, pid),
+        "issued_equipment": safe_member_panel("201 issued equipment", [], current_equipment_for, pid),
+        "replacement_training": safe_member_panel("201 replacement training", {"complete":False,"requirements":[],"program_title":"IN-PROCESSING","initial_rank":personnel.get("rank_code") or "PVT","replacement_required":False,"record":None}, replacement_training_status, personnel),
+        "promotion_eligibility": safe_member_panel("201 promotion eligibility", [], promotion_eligibility, personnel),
         "leadership_service": leadership_service,
         "leadership_score": leadership_score,
         "mos_proficiency": mos_proficiency,
@@ -5343,7 +6652,7 @@ def personnel_record_context(personnel):
         "next_recommended_action": recommended_action,
         "journal_entries": journal_entries,
         "command_watchlist": watchlist,
-        "uniform_issue": fetch_one(
+        "uniform_issue": safe_member_fetch_one("201 uniform issue",
             """SELECT eih.issued_at,ei.condition_state,sic.item_name
                FROM equipment_issue_history eih
                JOIN equipment_inventory ei ON ei.id=eih.equipment_id
@@ -5352,13 +6661,20 @@ def personnel_record_context(personnel):
                LIMIT 1""",
             (pid,),
         ),
-        "earned_ribbons": worn_ribbon_rows(pid)[1],
-        "uniform_ribbon_rows": worn_ribbon_rows(pid)[0],
-        "personal_action_center": member_personal_action_center(personnel),
-        "recommended_action": next_recommended_action(personnel),
-        "field_reputation": field_reputation(personnel),
-        "current_situation": current_situation_snapshot(personnel),
-        "most_served_with": most_served_with(pid,5),
+        "earned_ribbons": (safe_member_panel("201 worn ribbons", ([],[]), worn_ribbon_rows, pid) or ([],[]))[1],
+        "uniform_ribbon_rows": (safe_member_panel("201 worn ribbon rows", ([],[]), worn_ribbon_rows, pid) or ([],[]))[0],
+        "personal_action_center": safe_member_panel("201 personal action center", [], member_personal_action_center, personnel),
+        # IMPORTANT: use the already fault-isolated recommendation computed above.
+        # Calling next_recommended_action() directly here can touch optional weapon,
+        # qualification, operation, tour, or promotion tables and must never be able
+        # to take down the entire 201 File.
+        "recommended_action": recommended_action,
+        "field_reputation": reputation,
+        "current_situation": current_situation,
+        "most_served_with": served_with,
+        "discord_sync": safe_member_fetch_one("201 Discord sync", "SELECT status,reason,requested_at,processed_at,error_text FROM discord_role_sync_queue WHERE personnel_id=%s ORDER BY requested_at DESC LIMIT 1", (pid,)),
+        "welcome_packet": safe_member_panel("201 Welcome Packet", {"packet":None,"tasks":[],"percent":0}, welcome_packet_context, pid),
+        "hll_stats": hll_service_statistics(pid),
     }
 
 
@@ -5373,7 +6689,46 @@ def personnel_service_record(personnel_id):
 @app.get("/my-201-file")
 @login_required
 def my_201_file():
-    return render_template("personnel_file.html", **personnel_record_context(linked_personnel()))
+    # Nothing in the member 201 route is allowed to escape to the global 500 page.
+    # This includes the shared personnel-link lookup itself.
+    person=None
+    try:
+        person=linked_personnel()
+        if not person:
+            return redirect(url_for("my_soldier_record"))
+        safe_member_panel("201 visit tracking", None, welcome_visit, person["id"], "VIEW_201")
+        context=personnel_record_context(person)
+        return render_template("personnel_file.html", **context)
+    except Exception:
+        error_reference=secrets.token_hex(4).upper()
+        log.exception("MEMBER 201 FILE TOP-LEVEL FAILURE [%s] personnel=%s session_user=%s",
+                      error_reference,(person or {}).get("id"),session.get("user_id"))
+        try:
+            if not person:
+                try:
+                    # Session personnel_id is the authoritative member-login link and avoids
+                    # depending on user_personnel_links when that optional linkage is stale.
+                    pid=session.get("personnel_id")
+                    if pid:
+                        person=fetch_one("SELECT * FROM personnel WHERE id=%s",(pid,))
+                except Exception:
+                    log.exception("MEMBER 201 DIRECT PERSONNEL RECOVERY FAILURE [%s]",error_reference)
+            if person:
+                context=member_record_fallback_context(person,error_reference)
+                context["record_warning"]="The extended 201 File could not load one data source. Your core personnel and issued-weapon record remains available while Headquarters logs the failing module."
+                return render_template("member_record_core.html",**context),200
+            return render_template("member_record_core.html",personnel=None,roster_card=None,weapon=None,
+                                   record_error_reference=error_reference,
+                                   record_warning="Your authenticated session is active, but Headquarters could not resolve the personnel link for this request."),200
+        except Exception:
+            # Last-resort response deliberately avoids the normal base template/context processor.
+            log.exception("MEMBER 201 ABSOLUTE FALLBACK FAILURE [%s]",error_reference)
+            return Response(
+                "<!doctype html><html><head><meta charset='utf-8'><title>201 File Recovery</title></head>"
+                "<body><main><h1>201 FILE — RECOVERY MODE</h1>"
+                f"<p>Headquarters logged diagnostic reference <b>{error_reference}</b>.</p>"
+                "<p><a href='/my-soldier-record'>Return to Wall Locker</a></p></main></body></html>",
+                status=200,mimetype="text/html")
 
 
 
@@ -5721,163 +7076,265 @@ def platoon(unit_code: str):
 @app.route("/my-soldiers", methods=["GET","POST"])
 @login_required
 def my_soldiers():
-    personnel = soldier_view(linked_personnel())
-    if not personnel or not member_is_nco(personnel): abort(403)
-    soldiers, scope = scoped_personnel_for(personnel)
-    if request.method=="POST":
-        target_id=request.form.get("personnel_id")
-        target=next((x for x in soldiers if str(x.get("id"))==str(target_id)),None)
-        if not target: abort(403)
-        target_rank=(request.form.get("target_rank") or "").upper()
-        justification=(request.form.get("justification") or "").strip()
-        if not target_rank or not justification: abort(400)
-        execute("""INSERT INTO personnel_recommendations(personnel_id,recommendation_type,recommended_action,justification,promotion_narrative,recommending_personnel_id,status)
-                   VALUES(%s,'PROMOTION',%s,%s,%s,%s,'PENDING')""",(target_id,f"PROMOTION TO {target_rank}",justification,justification,personnel["id"]))
-        open_personnel_action(target_id,"PROMOTION",f"Promotion recommendation — {target_rank}","S-1","HIGH",f"{personnel.get('rank_code','')} {personnel.get('last_name','')}",{"target_rank":target_rank,"justification":justification},source_key=f"PROMO-REC:{target_id}:{target_rank}:{date.today()}")
-        notify_soldier(target_id,"S-1 / HQ",f"Promotion recommendation submitted — {target_rank}","Your NCO has forwarded a promotion recommendation for staff review.",source_key=f"PROMO-REC-NOTICE:{target_id}:{target_rank}:{date.today()}",target_anchor="promotion")
-        staff_log("S-1","PROMOTION RECOMMENDATION",f"{personnel.get('rank_code','')} {personnel.get('last_name','')} recommended {target.get('rank_code','')} {target.get('last_name','')} for {target_rank}",f"{personnel.get('rank_code','')} {personnel.get('last_name','')}",target_id)
-        flash("PROMOTION RECOMMENDATION FORWARDED TO S-1.","success")
-        return redirect(url_for("my_soldiers"))
-    enriched=[]
-    for srow in soldiers:
-        sv=soldier_view(srow)
-        readiness=soldier_readiness(sv)
-        replacement=replacement_training_status(sv)
-        elig=promotion_eligibility(sv)
-        inspection=weapon_inspection_status(sv["id"])
-        enriched.append({"person":sv,"readiness":readiness,"replacement":replacement,"eligibility":elig,"inspection":inspection})
-    return render_template("my_soldiers.html", personnel=personnel, soldiers=enriched, scope=scope)
+    # Backward-compatible URL: the member workspace is now uniformly named MY SQUAD.
+    return redirect(url_for("my_squad"))
 
 
 
 
 @app.route("/operations", methods=["GET","POST"])
 def operations():
+    """Single-screen S-3 Operations Control.
+
+    The website is authoritative. Scheduling, editing, duty assignment, closeout,
+    cancel/delete, public display, Discord notices, attendance and M16 tracking all
+    originate from the same operations row.
+    """
+    # Members get a deliberately read-only, failure-isolated view.  Staff reconciliation
+    # jobs must never prevent a Soldier from opening the Operations tab.
+    if request.method == "GET" and session.get("access_role") in {"member","nco","company_hq"}:
+        viewer = linked_personnel() if session.get("user_id") else None
+        if not viewer:
+            return redirect(url_for("report_for_duty"))
+        try:
+            welcome_visit(viewer["id"], "VIEW_OPERATIONS")
+        except Exception:
+            log.exception("Welcome Packet Operations milestone failed for %s", viewer.get("id"))
+        try:
+            rows = fetch_all("""SELECT o.*,op.attendance_status AS my_attendance_status,op.duty_role AS my_duty_role,
+                                      op.rounds_expended AS my_rounds_expended,op.credited_at AS my_credited_at
+                               FROM operations o
+                               LEFT JOIN operation_participation op ON op.operation_id=o.id AND op.personnel_id=%s
+                               WHERE UPPER(COALESCE(o.status,'')) <> 'DELETED'
+                                 AND (UPPER(COALESCE(o.publish_status,''))='PUBLISHED' OR op.personnel_id IS NOT NULL)
+                               ORDER BY COALESCE(o.start_at,o.created_at) DESC
+                               LIMIT 100""", (viewer["id"],))
+        except Exception:
+            log.exception("MEMBER OPERATIONS READ FAILED personnel=%s", viewer.get("id"))
+            rows = []
+        now = datetime.now(timezone.utc)
+        upcoming=[]; completed=[]
+        for op in rows:
+            op=dict(op)
+            status=str(op.get("status") or op.get("lifecycle_status") or "SCHEDULED").upper()
+            start=op.get("start_at")
+            end=(start + timedelta(minutes=int(op.get("duration_minutes") or 90))) if start else None
+            if status in {"COMPLETED","CLOSED","ARCHIVED","CANCELLED","CANCELED"} or (end and end < now):
+                completed.append(op)
+            else:
+                upcoming.append(op)
+        decorate_operation_times(upcoming); decorate_operation_times(completed)
+        # Attach the viewer's RCON-verified field record to each visible operation.
+        # This is read-only evidence and never grants personnel credit by itself.
+        for op in upcoming + completed[:30]:
+            try:
+                tel=hll_operation_telemetry(op,viewer["id"])
+                op["hll_viewer"]=(tel or {}).get("viewer")
+                op["hll_match_count"]=len((tel or {}).get("matches") or [])
+            except Exception:
+                op["hll_viewer"]=None
+                op["hll_match_count"]=0
+        return render_template("member_operations.html", personnel=viewer, upcoming=upcoming, completed=completed[:30], hll_server=hll_live_server_snapshot(), hll_stats=hll_service_statistics(viewer["id"]))
+
+    staff_roles={"s3","training","battalion_hq","commander","admin"}
+    can_control=bool(session.get("user_id") and session.get("access_role") in staff_roles)
     if request.method == "POST":
         if not session.get("user_id"):
             return redirect(url_for("report_for_duty"))
-        role=session.get("access_role")
-        if role not in {"s3","company_hq","battalion_hq","commander","admin"}:
+        if not can_control:
             abort(403)
-        action=request.form.get("action")
+        action=(request.form.get("action") or "").strip().lower()
         authority=session.get("display_name") or session.get("username") or "S-3 OPERATIONS"
+
         if action=="create_operation":
-            opnum=(request.form.get("operation_number") or "").strip() or next_operation_number()
-            start_at=request.form.get("start_at") or None
-            duration=max(45,int(request.form.get("duration_minutes") or 90))
-            threshold=max(5,min(duration,int(request.form.get("credit_threshold_minutes") or 45)))
-            rounds=max(0,min(1000,int(request.form.get("rounds_per_soldier") or 180)))
+            title=(request.form.get("title") or "").strip()
+            start_at=parse_operation_local_datetime(request.form.get("start_at"))
             channel_id=(request.form.get("credit_channel_id") or "").strip() or None
-            channel_directory=fetch_one("SELECT channel_name FROM discord_channel_directory WHERE channel_id=%s AND active=TRUE",(channel_id,)) if channel_id else None
-            selected_channel_name=(channel_directory or {}).get("channel_name") or request.form.get("credit_channel_name") or "Operation Voice"
-            op=fetch_one(
-                """INSERT INTO operations
-                   (operation_code,title,operation_number,operation_type,area_of_operations,commander,h_hour,
-                    situation,mission,execution,service_support,command_signal,status,start_at,operation_date,
-                    duration_minutes,credit_threshold_minutes,rounds_per_soldier,credit_channel_id,credit_channel_name,
-                    reminder_minutes,formation_scope,formation_unit_node_id,publish_status)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PLANNING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'DRAFT') RETURNING *""",
-                (opnum,request.form.get("title"),opnum,request.form.get("operation_type") or "OFFICIAL OPERATION",
-                 request.form.get("area_of_operations"),request.form.get("commander"),request.form.get("h_hour"),
-                 request.form.get("situation"),request.form.get("mission"),request.form.get("execution"),
-                 request.form.get("service_support"),request.form.get("command_signal"),start_at,
-                 (start_at or "")[:10] or None,duration,threshold,rounds,channel_id,
-                 selected_channel_name,
-                 request.form.get("reminder_minutes") or "1440,120,30",request.form.get("formation_scope") or "BATTALION",
-                 request.form.get("formation_unit_node_id") or None),
-            )
-            if request.form.get("publish_now") == "YES":
-                schedule_operation_event(op,authority)
-                flash(f"{opnum} PUBLISHED. BATTALION CLERK CREDIT TRACKING IS SCHEDULED.","success")
+            if not title:
+                flash("OPERATION TITLE IS REQUIRED.","danger")
+                return redirect(url_for("operations"))
+            if not start_at:
+                flash("STEP-OFF DATE / TIME IS REQUIRED.","danger")
+                return redirect(url_for("operations"))
+            duration=max(45,min(720,int(request.form.get("duration_minutes") or 90)))
+            if start_at + timedelta(minutes=duration) <= datetime.now(timezone.utc):
+                flash("STEP-OFF / END TIME IS ALREADY IN THE PAST.","danger")
+                return redirect(url_for("operations"))
+            if not channel_id:
+                flash("SELECT A DISCORD OPERATION VOICE CHANNEL.","danger")
+                return redirect(url_for("operations"))
+            ch=fetch_one("SELECT channel_name FROM discord_channel_directory WHERE channel_id=%s AND active=TRUE",(channel_id,))
+            if not ch:
+                flash("THE SELECTED DISCORD VOICE CHANNEL IS NOT IN THE CURRENT BATTALION CLERK DIRECTORY. WAIT FOR CLERK SYNC OR SELECT ANOTHER CHANNEL.","danger")
+                return redirect(url_for("operations"))
+            opnum=(request.form.get("operation_number") or "").strip() or next_operation_number()
+            threshold=max(5,min(duration,int(request.form.get("credit_threshold_minutes") or 45)))
+            op=None
+            try:
+                op=fetch_one(
+                    """INSERT INTO operations
+                       (operation_code,title,operation_number,operation_type,area_of_operations,commander,h_hour,
+                        situation,mission,execution,service_support,command_signal,status,lifecycle_status,start_at,operation_date,
+                        duration_minutes,credit_threshold_minutes,rounds_per_soldier,credit_channel_id,credit_channel_name,
+                        reminder_minutes,formation_scope,formation_unit_node_id,publish_status)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PLANNING','PLANNING',%s,%s,%s,%s,300,%s,%s,%s,%s,%s,'DRAFT') RETURNING *""",
+                    (opnum,title,opnum,request.form.get("operation_type") or "OFFICIAL OPERATION",
+                     request.form.get("area_of_operations") or None,request.form.get("commander") or None,request.form.get("h_hour") or None,
+                     request.form.get("situation") or None,request.form.get("mission") or None,request.form.get("execution") or None,
+                     request.form.get("service_support") or None,request.form.get("command_signal") or None,start_at,start_at.date(),duration,threshold,
+                     channel_id,ch.get("channel_name"),request.form.get("reminder_minutes") or "1440,120,30",
+                     request.form.get("formation_scope") or "BATTALION",request.form.get("formation_unit_node_id") or None),
+                )
+                event=schedule_operation_event(op,authority)
+                staff_log("S-3","OPERATION SCHEDULED",f"{opnum} — {title}",authority,details={"event_id":str(event['id'])})
+                flash(f"{opnum} SCHEDULED. WEBSITE, DISCORD NOTICE, VOICE ATTENDANCE, AND M16 TRACKING ARE ACTIVE.","success")
+            except Exception as exc:
+                # A failed publish must never leave a half-created Operation visible.
+                if op:
+                    try: execute("DELETE FROM battalion_events WHERE operation_id=%s",(op["id"],))
+                    except Exception: pass
+                    try: execute("DELETE FROM operations WHERE id=%s",(op["id"],))
+                    except Exception: pass
+                log.exception("Operation scheduling failed")
+                flash(f"OPERATION WAS NOT SCHEDULED: {exc}","danger")
+            return redirect(url_for("operations"))
+
+        operation_id=request.form.get("operation_id")
+        op=operation_record(operation_id) if operation_id else None
+        if not op:
+            flash("OPERATION RECORD NOT FOUND.","danger")
+            return redirect(url_for("operations"))
+
+        if action=="update_operation":
+            start_at=parse_operation_local_datetime(request.form.get("start_at"))
+            channel_id=(request.form.get("credit_channel_id") or "").strip() or None
+            duration=max(45,min(720,int(request.form.get("duration_minutes") or op.get("duration_minutes") or 90)))
+            threshold=max(5,min(duration,int(request.form.get("credit_threshold_minutes") or op.get("credit_threshold_minutes") or 45)))
+            if not start_at or not channel_id:
+                flash("STEP-OFF AND DISCORD VOICE CHANNEL ARE REQUIRED.","danger")
+                return redirect(url_for("operations"))
+            ch=fetch_one("SELECT channel_name FROM discord_channel_directory WHERE channel_id=%s AND active=TRUE",(channel_id,))
+            if not ch:
+                flash("SELECTED DISCORD VOICE CHANNEL IS NOT AVAILABLE.","danger")
+                return redirect(url_for("operations"))
+            execute("""UPDATE operations SET title=%s,start_at=%s,operation_date=%s,duration_minutes=%s,
+                      credit_threshold_minutes=%s,rounds_per_soldier=300,credit_channel_id=%s,credit_channel_name=%s,
+                      formation_scope=%s,formation_unit_node_id=%s,area_of_operations=%s,commander=%s,
+                      reminder_minutes=%s,updated_at=NOW() WHERE id=%s""",
+                    ((request.form.get("title") or op.get("title") or "Operation").strip(),start_at,start_at.date(),duration,threshold,
+                     channel_id,ch.get("channel_name"),request.form.get("formation_scope") or op.get("formation_scope") or "BATTALION",
+                     request.form.get("formation_unit_node_id") or None,request.form.get("area_of_operations") or None,
+                     request.form.get("commander") or None,request.form.get("reminder_minutes") or op.get("reminder_minutes") or "1440,120,30",operation_id))
+            try:
+                schedule_operation_event(operation_record(operation_id),authority)
+                execute("UPDATE operation_duty_assignments SET discord_published_at=NULL WHERE operation_id=%s",(operation_id,))
+                flash("OPERATION UPDATED. DISCORD / VOICE / M16 AUTOMATION HAS BEEN RESYNCHRONIZED.","success")
+            except Exception as exc:
+                log.exception("Operation reschedule failed")
+                flash(f"OPERATION SAVED, BUT CLERK RESYNC FAILED: {exc}","danger")
+
+        elif action=="assign_duty":
+            pid=request.form.get("personnel_id")
+            duty=(request.form.get("duty_role") or "").strip()
+            if not pid or not duty:
+                flash("SELECT A SOLDIER AND DUTY ROLE.","danger")
             else:
-                flash(f"{opnum} FILED AS A DRAFT IN S-3 OPERATIONS.","success")
-        elif action=="assign_unit":
-            execute(
-                """INSERT INTO operation_units(operation_id,unit_node_id,task,is_primary)
-                   VALUES(%s,%s,%s,%s)
-                   ON CONFLICT(operation_id,unit_node_id) DO UPDATE SET
-                     task=EXCLUDED.task,is_primary=EXCLUDED.is_primary""",
-                (request.form.get("operation_id"),request.form.get("unit_node_id"),
-                 request.form.get("task"),bool(request.form.get("is_primary"))),
-            )
-            flash("UNIT TASKING ENTERED ON THE OPERATION ORDER.","success")
-        elif action=="credit_participant":
-            file_operation_participation(
-                request.form.get("operation_id"),request.form.get("personnel_id"),
-                request.form.get("duty_role") or None,request.form.get("attendance_status") or "PARTICIPATED",
-                request.form.get("rounds_expended") or 0,request.form.get("casualty_status") or None,
-                request.form.get("remarks") or None,authority,
-            )
-            flash("PARTICIPATION ENTERED IN THE SOLDIER'S COMBAT OPERATIONS JOURNAL.","success")
-        elif action=="file_aar":
-            complete_operation(
-                request.form.get("operation_id"),request.form.get("result") or None,
-                request.form.get("commander_remarks") or None,authority,
-            )
-            flash("AFTER ACTION REPORT FILED. OPERATION MOVED TO THE JOURNAL.","success")
-        elif action=="recommend":
-            recommendation_type = request.form.get("recommendation_type") or "PERSONNEL ACTION"
-            recommendation_status = "PENDING_S1" if recommendation_type.upper() == "AWARD" else "PENDING"
-            execute(
-                """INSERT INTO personnel_recommendations
-                   (personnel_id,operation_id,recommendation_type,recommended_action,justification,
-                    recommending_personnel_id,status)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
-                (request.form.get("personnel_id"),request.form.get("operation_id") or None,
-                 recommendation_type, request.form.get("recommended_action"),request.form.get("justification"),
-                 (linked_personnel() or {}).get("id"), recommendation_status),
-            )
-            flash("PERSONNEL ACTION RECOMMENDATION FORWARDED.","success")
+                person=canonical_personnel_snapshot(pid) or {}
+                execute("""INSERT INTO operation_duty_assignments(operation_id,personnel_id,duty_role,mos_code,element,assigned_by,remarks)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT(operation_id,personnel_id) DO UPDATE SET duty_role=EXCLUDED.duty_role,
+                           mos_code=EXCLUDED.mos_code,element=EXCLUDED.element,assigned_by=EXCLUDED.assigned_by,
+                           assigned_at=NOW(),discord_published_at=NULL,remarks=EXCLUDED.remarks""",
+                        (operation_id,pid,duty,person.get("mos_code"),request.form.get("element") or None,authority,request.form.get("remarks") or None))
+                execute("""INSERT INTO operation_participation(operation_id,personnel_id,unit_node_id,duty_role,attendance_status,rounds_expended,credited_by)
+                           VALUES(%s,%s,%s,%s,'ASSIGNED',0,%s)
+                           ON CONFLICT(operation_id,personnel_id) DO UPDATE SET duty_role=EXCLUDED.duty_role""",
+                        (operation_id,pid,person.get("unit_node_id"),duty,authority))
+                flash("OPERATION DUTY ASSIGNMENT SAVED. BATTALION CLERK WILL DISTRIBUTE THE UPDATED DUTY ROSTER IN DISCORD.","success")
+
+        elif action=="remove_duty":
+            pid=request.form.get("personnel_id")
+            execute("DELETE FROM operation_duty_assignments WHERE operation_id=%s AND personnel_id=%s",(operation_id,pid))
+            execute("DELETE FROM operation_participation WHERE operation_id=%s AND personnel_id=%s AND UPPER(COALESCE(attendance_status,''))='ASSIGNED' AND COALESCE(rounds_expended,0)=0",(operation_id,pid))
+            flash("OPERATION DUTY ASSIGNMENT REMOVED.","success")
+
+        elif action=="close_operation":
+            event=operation_live_event(operation_id)
+            if event:
+                result=finalize_operation_event(event["id"],authority,request.form.get("result") or "COMPLETED",request.form.get("commander_remarks") or None)
+                flash(f"OPERATION COMPLETED — {result['credited']} CREDITED; {result['weapon_rounds_applied']} M16 ROUNDS RECONCILED.","success")
+            else:
+                # Still allow S-3 to close a record when Clerk telemetry was unavailable.
+                complete_operation(operation_id,request.form.get("result") or "COMPLETED",request.form.get("commander_remarks") or None,authority)
+                execute("UPDATE operations SET status='COMPLETED',lifecycle_status='COMPLETED',publish_status='CLOSED',completed_at=COALESCE(completed_at,NOW()),updated_at=NOW() WHERE id=%s",(operation_id,))
+                flash("OPERATION COMPLETED. NO LIVE CLERK EVENT WAS AVAILABLE; THE WEBSITE RECORD WAS CLOSED.","warning")
+
+        elif action=="cancel_operation":
+            execute("UPDATE battalion_events SET status='CANCELLED',ends_at=LEAST(ends_at,NOW()) WHERE operation_id=%s",(operation_id,))
+            execute("UPDATE operations SET status='CANCELLED',lifecycle_status='CANCELLED',publish_status='CLOSED',completed_at=COALESCE(completed_at,NOW()),updated_at=NOW() WHERE id=%s",(operation_id,))
+            staff_log("S-3","OPERATION CANCELLED",f"{op.get('operation_number') or 'OPERATION'} — {op.get('title')}",authority)
+            flash("OPERATION CANCELLED. DISCORD TRACKING AND FUTURE VOICE CREDIT ARE STOPPED.","success")
+
         return redirect(url_for("operations"))
 
-    current=fetch_all(
-        """SELECT * FROM operations
-           WHERE UPPER(COALESCE(status,'')) NOT IN ('COMPLETED','CLOSED','CANCELLED','ARCHIVED')
-             AND UPPER(COALESCE(lifecycle_status,'PLANNING')) NOT IN ('CLOSED','COMPLETED','CANCELLED','ARCHIVED')
-           ORDER BY CASE WHEN start_at IS NULL THEN 1 ELSE 0 END,start_at ASC,created_at DESC"""
-    ) if database_ready() else []
-    completed=fetch_all(
-        """SELECT o.*,aar.ammunition_expended,aar.filed_at
-           FROM operations o LEFT JOIN after_action_reports aar ON aar.operation_id=o.id
-           WHERE UPPER(COALESCE(o.status,'')) IN ('COMPLETED','CLOSED')
-              OR UPPER(COALESCE(o.lifecycle_status,'')) IN ('COMPLETED','CLOSED')
-           ORDER BY COALESCE(o.completed_at,o.start_at,o.created_at) DESC LIMIT 100"""
-    ) if database_ready() else []
-    personnel_list=fetch_all("SELECT * FROM personnel ORDER BY last_name") if database_ready() else []
+    if database_ready():
+        reconcile_operation_schedule_states()
+        ensure_published_operation_events("S-3 SINGLE-SCREEN RECONCILIATION")
+        run_operation_maintenance("S-3 SINGLE-SCREEN RECONCILIATION")
+
+    current=fetch_all("""SELECT * FROM operations
+        WHERE UPPER(COALESCE(status,'')) NOT IN ('COMPLETED','CLOSED','CANCELLED','CANCELED','ARCHIVED','DELETED')
+          AND UPPER(COALESCE(lifecycle_status,'PLANNING')) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','ARCHIVED','AAR FILED','DELETED')
+          AND (start_at IS NULL OR (start_at + make_interval(mins => COALESCE(duration_minutes,90))) > NOW())
+        ORDER BY CASE WHEN start_at IS NULL THEN 1 ELSE 0 END,start_at ASC,created_at DESC""") if database_ready() else []
+    completed=fetch_all("""SELECT o.*,aar.ammunition_expended,aar.filed_at
+        FROM operations o LEFT JOIN after_action_reports aar ON aar.operation_id=o.id
+        WHERE (UPPER(COALESCE(o.status,'')) IN ('COMPLETED','CLOSED','ARCHIVED','CANCELLED','CANCELED')
+           OR UPPER(COALESCE(o.lifecycle_status,'')) IN ('COMPLETED','CLOSED','ARCHIVED','CANCELLED','CANCELED'))
+          AND UPPER(COALESCE(o.status,''))<>'DELETED'
+        ORDER BY COALESCE(o.completed_at,o.start_at,o.created_at) DESC LIMIT 50""") if database_ready() else []
+
+    viewer=linked_personnel() if session.get("user_id") else None
+    member_mode=bool(viewer and session.get("access_role") not in COMMAND_ROLES and session.get("access_role") not in {"s3","company_hq"})
+    if member_mode:
+        def _relevant(op):
+            if any(str(x.get("personnel_id"))==str(viewer["id"]) for x in operation_participants(op["id"])):
+                return True
+            try:
+                return any(str(x.get("id"))==str(viewer["id"]) for x in operation_expected_roster(op))
+            except Exception:
+                return str(op.get("publish_status") or "").upper()=="PUBLISHED"
+        current=[op for op in current if _relevant(op)]
+        completed=[op for op in completed if _relevant(op)]
+
+    decorate_operation_times(current); decorate_operation_times(completed)
+    personnel_list=[] if member_mode else (fetch_all("SELECT * FROM personnel WHERE separated_at IS NULL AND COALESCE(archived,FALSE)=FALSE ORDER BY last_name,first_name") if database_ready() else [])
     units=fetch_all("SELECT * FROM unit_nodes WHERE is_active=TRUE ORDER BY sort_order,display_name") if database_ready() else []
-    all_ops=current+completed
-    participants={str(o["id"]):operation_participants(o["id"]) for o in all_ops}
-    op_units={str(o["id"]):operation_units_for(o["id"]) for o in all_ops}
-    aars={}
-    for o in completed:
-        aars[str(o["id"])]=fetch_one("SELECT * FROM after_action_reports WHERE operation_id=%s",(o["id"],))
-    recommendations=fetch_all(
-        """SELECT pr.*,p.rank_code,p.last_name,p.first_name,o.title AS operation_title
-           FROM personnel_recommendations pr
-           JOIN personnel p ON p.id=pr.personnel_id
-           LEFT JOIN operations o ON o.id=pr.operation_id
-           ORDER BY pr.created_at DESC LIMIT 50"""
-    ) if database_ready() else []
-    operation_channel=fetch_one("SELECT * FROM clerk_duty_channels WHERE event_type='OPERATION' ORDER BY updated_at DESC LIMIT 1") if database_ready() else None
-    discord_voice_channels=fetch_all("SELECT * FROM discord_channel_directory WHERE active=TRUE AND channel_type='VOICE' ORDER BY category_name NULLS FIRST,channel_name") if database_ready() else []
+    assignments={}
     live_map={}
-    for o in current:
-        event,attendance=operation_live_attendance(o["id"])
-        expected=operation_expected_roster(o)
-        live_map[str(o["id"])]= {"event":event,"attendance":attendance,"expected":len(expected),
-                                 "ready":sum(1 for p in expected if int(p.get("readiness_percent") or 0)>=80)}
-    return render_template("operations.html",current=current,completed=completed,
-                           personnel_list=personnel_list,units=units,
-                           participants=participants,op_units=op_units,aars=aars,
-                           recommendations=recommendations,operation_channel=operation_channel,
-                           discord_voice_channels=discord_voice_channels,live_map=live_map,clerk_health=clerk_health_snapshot())
+    for op in current:
+        assignments[str(op["id"])]=fetch_all("""SELECT oda.*,p.rank_code,p.first_name,p.last_name,p.unit_code,p.platoon,p.squad
+            FROM operation_duty_assignments oda JOIN personnel p ON p.id=oda.personnel_id
+            WHERE oda.operation_id=%s ORDER BY oda.element NULLS LAST,p.last_name,p.first_name""",(op["id"],))
+        event,attendance=operation_live_attendance(op["id"])
+        expected=operation_expected_roster(op)
+        live_map[str(op["id"])]= {"event":event,"attendance":attendance,"expected":len(expected),
+                                   "ready":sum(1 for p in expected if int(p.get("readiness_percent") or 0)>=80),
+                                   "sync_state":"SYNCED" if event else "REPAIRING"}
+    return render_template("operations.html",current=current,completed=completed,personnel_list=personnel_list,units=units,
+                           duty_assignments=assignments,live_map=live_map,discord_voice_channels=(fetch_all("SELECT * FROM discord_channel_directory WHERE active=TRUE AND channel_type='VOICE' ORDER BY category_name NULLS FIRST,channel_name") if database_ready() else []),
+                           clerk_health=clerk_health_snapshot(),member_mode=member_mode,viewer=viewer,can_control=can_control,
+                           hll_server=hll_live_server_snapshot())
 
 
 @app.get("/operations/<operation_id>")
 def operation_detail(operation_id):
+    reconcile_operation_schedule_states()
+    ensure_published_operation_events("OPERATION CONTROL BOARD")
     op=operation_record(operation_id)
     if not op:
         abort(404)
+    decorate_operation_times([op])
     participants=operation_participants(operation_id)
     units=operation_units_for(operation_id)
     aar=fetch_one("SELECT * FROM after_action_reports WHERE operation_id=%s",(operation_id,))
@@ -5886,39 +7343,51 @@ def operation_detail(operation_id):
     live_event,live_attendance=operation_live_attendance(operation_id)
     expected=operation_expected_roster(op)
     discord_voice_channels=fetch_all("SELECT * FROM discord_channel_directory WHERE active=TRUE AND channel_type='VOICE' ORDER BY category_name NULLS FIRST,channel_name") if database_ready() else []
+    viewer=linked_personnel() if session.get("user_id") else None
+    hll_telemetry=hll_operation_telemetry(op,(viewer or {}).get("id"))
     return render_template("operation_detail.html",op=op,participants=participants,units=units,aar=aar,journal=journal,photos=photos,
                            live_event=live_event,live_attendance=live_attendance,expected_roster=expected,
                            duty_suggestions=operation_duty_suggestions(operation_id),discord_voice_channels=discord_voice_channels,
-                           clerk_health=clerk_health_snapshot())
+                           clerk_health=clerk_health_snapshot(),hll_telemetry=hll_telemetry)
 
 
 @app.post("/operations/<operation_id>/schedule")
 @login_required
 def operation_schedule_action(operation_id):
-    if session.get("access_role") not in {"s3","battalion_hq","commander","admin"}: abort(403)
+    if session.get("access_role") not in {"s3","company_hq","battalion_hq","commander","admin"}: abort(403)
     op=operation_record(operation_id)
     if not op: abort(404)
-    start_at=request.form.get("start_at") or op.get("start_at")
+    start_at=parse_operation_local_datetime(request.form.get("start_at")) if request.form.get("start_at") else op.get("start_at")
     duration=max(45,int(request.form.get("duration_minutes") or op.get("duration_minutes") or 90))
     threshold=max(5,min(duration,int(request.form.get("credit_threshold_minutes") or op.get("credit_threshold_minutes") or 45)))
-    rounds=max(0,min(1000,int(request.form.get("rounds_per_soldier") or op.get("rounds_per_soldier") or 180)))
+    rounds=300
     selected_channel_id=request.form.get("credit_channel_id") or op.get("credit_channel_id")
     channel_directory=fetch_one("SELECT channel_name FROM discord_channel_directory WHERE channel_id=%s AND active=TRUE",(selected_channel_id,)) if selected_channel_id else None
     selected_channel_name=(channel_directory or {}).get("channel_name") or request.form.get("credit_channel_name") or op.get("credit_channel_name") or "Operation Voice"
     execute("""UPDATE operations SET start_at=%s,operation_date=%s,duration_minutes=%s,credit_threshold_minutes=%s,
               rounds_per_soldier=%s,credit_channel_id=%s,credit_channel_name=%s,reminder_minutes=%s,
               formation_scope=%s,formation_unit_node_id=%s,updated_at=NOW() WHERE id=%s""",
-            (start_at,(str(start_at)[:10] if start_at else None),duration,threshold,rounds,
+            (start_at,(start_at.date() if start_at else None),duration,threshold,rounds,
              selected_channel_id,
              selected_channel_name,
              request.form.get("reminder_minutes") or op.get("reminder_minutes") or "1440,120,30",
              request.form.get("formation_scope") or op.get("formation_scope") or "BATTALION",
              request.form.get("formation_unit_node_id") or op.get("formation_unit_node_id"),operation_id))
     op=operation_record(operation_id)
-    event=schedule_operation_event(op,session.get("display_name") or session.get("username") or "S-3")
-    staff_log("S-3","OPERATION PUBLISHED",f"{op.get('operation_number')} — {op.get('title')}",session.get("display_name") or session.get("username"),details={"event_id":str(event['id'])})
-    flash("OPERATION PUBLISHED TO BATTALION CLERK. VOICE CREDIT TRACKING IS SCHEDULED.","success")
-    return redirect(url_for("operation_detail",operation_id=operation_id))
+    authority=session.get("display_name") or session.get("username") or "S-3"
+    try:
+        if not selected_channel_id:
+            raise ValueError("Select a Discord voice channel before publishing.")
+        if not start_at:
+            raise ValueError("Step-off date/time is required.")
+        if start_at + timedelta(minutes=duration) <= datetime.now(timezone.utc):
+            raise ValueError("The Operation end time is already in the past. Check the step-off date/time.")
+        event=schedule_operation_event(op,authority)
+        staff_log("S-3","OPERATION PUBLISHED",f"{op.get('operation_number')} — {op.get('title')}",authority,details={"event_id":str(event['id'])})
+        flash("OPERATION SCHEDULE UPDATED. DISCORD NOTIFICATION, VOICE CREDIT, AND M16 TRACKING ARE ARMED.","success")
+    except Exception as exc:
+        flash(f"OPERATION SCHEDULE UPDATE FAILED: {exc}","danger")
+    return redirect(url_for("operations"))
 
 
 @app.post("/operations/<operation_id>/attendance-action")
@@ -5998,33 +7467,26 @@ def finalize_operation_event(event_id, authority="BATTALION CLERK", result=None,
     threshold=int(event.get("credit_threshold_minutes") or 45)
     execute("UPDATE battalion_events SET status='CLOSED',ends_at=LEAST(ends_at,NOW()) WHERE id=%s",(event_id,))
     attendance=fetch_all("SELECT a.*,p.rank_code,p.first_name,p.last_name FROM battalion_event_attendance a JOIN personnel p ON p.id=a.personnel_id WHERE a.event_id=%s",(event_id,))
-    rounds=max(0,int(event.get("rounds_per_soldier") or 0)); repaired=0; credited=0
+    repaired=0; credited=0
     operation_id=event.get("operation_id")
     if str(event.get("event_type") or '').upper()=="OPERATION" and operation_id:
         for a in attendance:
             secs=int(a.get("qualifying_seconds") or 0)
-            if secs < threshold*60 and not a.get("credited_at"): continue
-            credited+=1
-            prior=fetch_one("SELECT id,rounds_expended FROM operation_participation WHERE operation_id=%s AND personnel_id=%s",(operation_id,a["personnel_id"]))
-            timed_rounds=operation_round_target_for_time(event,secs)
-            expected=max(timed_rounds,int((prior or {}).get("rounds_expended") or 0))
-            if prior:
-                execute("UPDATE operation_participation SET attendance_status='FULL CREDIT',rounds_expended=%s,remarks=%s,credited_by=%s,credited_at=NOW() WHERE operation_id=%s AND personnel_id=%s",
-                        (expected,f"Operation closeout: {secs//60} verified minutes.",authority,operation_id,a["personnel_id"]))
-                repaired += reconcile_operation_weapon_rounds(operation_id,a["personnel_id"],expected,authority,f"Operation closeout reconciliation for {event.get('title')}.")
+            if secs<=0:
+                continue
+            result_row=sync_operation_presence_from_attendance(event,a["personnel_id"],secs,authority)
+            repaired+=int(result_row.get("rounds_applied") or 0)
+            status,percent=operation_presence_status(event,secs)
+            if result_row.get("full_credit"):
+                credited+=1
+                execute("""UPDATE battalion_event_attendance SET credited_at=COALESCE(credited_at,NOW()),attendance_grade='FULL CREDIT',attendance_percent=100,updated_at=NOW()
+                           WHERE event_id=%s AND personnel_id=%s""",(event_id,a["personnel_id"]))
             else:
-                before=operation_weapon_rounds_applied(operation_id,a["personnel_id"])
-                file_operation_participation(operation_id,a["personnel_id"],attendance_status="FULL CREDIT",rounds_expended=expected,remarks=f"Operation closeout: {secs//60} verified minutes.",credited_by=authority)
-                after=operation_weapon_rounds_applied(operation_id,a["personnel_id"])
-                repaired += max(0,after-before)
-        # One closeout advances every dependent Soldier system exactly once through idempotent source keys.
-        credited_rows=fetch_all("""SELECT personnel_id,rounds_expended FROM operation_participation
-                                  WHERE operation_id=%s AND UPPER(COALESCE(attendance_status,''))='FULL CREDIT'""",(operation_id,))
-        for cr in credited_rows:
-            operation_credit_cascade(operation_id,cr['personnel_id'],cr.get('rounds_expended') or 0,authority)
+                execute("""UPDATE battalion_event_attendance SET attendance_grade=%s,attendance_percent=%s,updated_at=NOW()
+                           WHERE event_id=%s AND personnel_id=%s""",(status,percent,event_id,a["personnel_id"]))
         complete_operation(operation_id,result,remarks,authority)
-        execute("UPDATE operations SET lifecycle_status='CLOSED',publish_status='CLOSED',updated_at=NOW() WHERE id=%s",(operation_id,))
-    participated=sum(1 for row in attendance if int(row.get("qualifying_seconds") or 0)>=min(1200,max(300,threshold*30)))
+        execute("UPDATE operations SET lifecycle_status='CLOSED',publish_status='CLOSED',status='COMPLETED',updated_at=NOW() WHERE id=%s",(operation_id,))
+    participated=sum(1 for row in attendance if int(row.get("qualifying_seconds") or 0)>0)
     return {"tracked":len(attendance),"participated":participated,"credited":credited,"weapon_rounds_applied":repaired,"threshold":threshold}
 
 
@@ -6032,36 +7494,43 @@ def finalize_operation_event(event_id, authority="BATTALION CLERK", result=None,
 @login_required
 def operation_close_action(operation_id):
     if session.get("access_role") not in {"s3","battalion_hq","commander","admin"}: abort(403)
+    op=operation_record(operation_id)
+    if not op: abort(404)
+    if str(op.get('status') or '').upper() in {'COMPLETED','CLOSED','ARCHIVED'}:
+        flash("OPERATION CLOSEOUT BLOCKED — THIS OPERATION IS ALREADY A PERMANENT COMPLETED RECORD.","warning")
+        return redirect(url_for("operation_detail",operation_id=operation_id))
     event=operation_live_event(operation_id)
     if not event:
         flash("NO ACTIVE BATTALION CLERK EVENT IS LINKED TO THIS OPERATION.","danger")
         return redirect(url_for("operation_detail",operation_id=operation_id))
-    result=finalize_operation_event(event["id"],session.get("display_name") or session.get("username") or "S-3",request.form.get("result") or None,request.form.get("commander_remarks") or None)
-    flash(f"OPERATION CLOSED — {result['credited']} SOLDIER(S) CREDITED; {result['weapon_rounds_applied']} M16 ROUNDS RECONCILED.","success")
+    authority=session.get("display_name") or session.get("username") or "S-3"
+    result=finalize_operation_event(event["id"],authority,request.form.get("result") or None,request.form.get("commander_remarks") or None)
+    staff_log("S-3","OPERATION CLOSED",f"{op.get('operation_number') or op.get('operation_code')} — {op.get('title')}",authority,details={"operation_id":str(operation_id),"credited":result.get('credited'),"participants":result.get('participated'),"rounds":result.get('weapon_rounds_applied'),"result":request.form.get('result')})
+    flash(f"OPERATION CLOSED — {result['credited']} SOLDIER{'S' if int(result['credited']) != 1 else ''} CREDITED; {result['weapon_rounds_applied']} M16 ROUNDS RECONCILED.","success")
     return redirect(url_for("operation_detail",operation_id=operation_id))
 
 
 @app.post("/operations/<operation_id>/delete")
 @login_required
 def operation_delete_action(operation_id):
-    if session.get("access_role") not in {"s3","battalion_hq","commander","admin"}: abort(403)
+    if session.get("access_role") not in {"s3","company_hq","battalion_hq","commander","admin"}: abort(403)
     op=operation_record(operation_id)
     if not op: abort(404)
-    # Protect actual service history. A scheduled/planning operation can be removed;
-    # once official credit/rounds/AAR exist, S-3 must close or cancel instead.
     credited=int((fetch_one("""SELECT COUNT(*) AS total FROM operation_participation
-                              WHERE operation_id=%s AND (UPPER(COALESCE(attendance_status,''))='FULL CREDIT' OR COALESCE(rounds_expended,0)>0)""",(operation_id,)) or {'total':0})['total'] or 0)
+                              WHERE operation_id=%s AND (UPPER(COALESCE(attendance_status,'')) IN ('FULL CREDIT','CREDITED','PARTICIPATED','PRESENT') OR COALESCE(rounds_expended,0)>0)""",(operation_id,)) or {'total':0})['total'] or 0)
     aar=fetch_one("SELECT id FROM after_action_reports WHERE operation_id=%s",(operation_id,))
-    if credited or aar or str(op.get('status') or '').upper() in {'COMPLETED','CLOSED'}:
-        flash('THIS OPERATION HAS FILED SERVICE HISTORY AND CANNOT BE DELETED. USE CLOSE / CANCEL SO THE RECORD REMAINS AUDITABLE.','warning')
-        return redirect(url_for('operation_detail',operation_id=operation_id))
+    if credited or aar or str(op.get('status') or '').upper() in {'COMPLETED','CLOSED','ARCHIVED'}:
+        flash('THIS OPERATION ALREADY CONTAINS PERMANENT SERVICE HISTORY. USE COMPLETE / CANCEL INSTEAD OF DELETE.','warning')
+        return redirect(url_for('operations'))
     authority=session.get('display_name') or session.get('username') or 'S-3'
-    # Remove the linked Clerk event first so reminders/voice tracking stop immediately.
+    # Soft-delete the authoritative Website row so foreign-key/audit history can never make
+    # the user-facing DELETE button fail. Remove the Clerk event so reminders, Discord
+    # announcements, attendance, and M16 tracking stop immediately.
     execute("DELETE FROM battalion_events WHERE operation_id=%s OR id=%s",(operation_id,op.get('clerk_event_id')))
-    execute("DELETE FROM operations WHERE id=%s",(operation_id,))
+    execute("UPDATE operations SET status='DELETED',lifecycle_status='DELETED',publish_status='DRAFT',clerk_event_id=NULL,completed_at=COALESCE(completed_at,NOW()),updated_at=NOW() WHERE id=%s",(operation_id,))
     staff_log('S-3','OPERATION DELETED',f"{op.get('operation_number') or op.get('operation_code')} — {op.get('title')}",authority,
               details={'operation_id':str(operation_id),'reason':request.form.get('reason') or 'S-3 scheduled operation removed'})
-    flash('SCHEDULED OPERATION DELETED. CLERK TRACKING / REMINDERS REMOVED AND THE HOMEPAGE SCHEDULE UPDATED.','success')
+    flash('OPERATION DELETED FROM THE ACTIVE SYSTEM. DISCORD NOTICES, VOICE CREDIT, AND M16 TRACKING ARE STOPPED.','success')
     return redirect(url_for('operations'))
 
 
@@ -6212,10 +7681,10 @@ def supply():
             flash("REQUISITION STATUS UPDATED.","success")
         return redirect(url_for("supply"))
 
-    weapon = current_weapon_for(personnel) if personnel else None
+    weapon = safe_member_panel('201 weapon', None, current_weapon_for, personnel) if personnel else None
     if weapon:
         refresh_weapon_condition(weapon["id"])
-        weapon = current_weapon_for(personnel)
+        weapon = safe_member_panel('201 weapon', None, current_weapon_for, personnel)
     issued_equipment=current_equipment_for(personnel["id"]) if personnel else []
     catalog=fetch_all("SELECT * FROM supply_item_catalog WHERE is_active=TRUE ORDER BY category,sort_order") if database_ready() else []
     personnel_list=fetch_all("SELECT id,rank_code,last_name,first_name,unit_code,platoon,squad FROM personnel ORDER BY last_name") if database_ready() else []
@@ -6357,10 +7826,10 @@ def duty_status_action(personnel_id):
 def personnel_office():
     personnel = soldier_view(linked_personnel()) if database_ready() else None
     roster = fetch_all(
-        """SELECT id,rank_code,last_name,first_name,unit_code,platoon,squad,
-                  duty_position,field_status,readiness_status,readiness_percent,mos_code
-           FROM personnel WHERE archived=FALSE AND separated_at IS NULL
-           ORDER BY unit_code,platoon NULLS FIRST,squad NULLS FIRST,last_name,first_name
+        """SELECT p.id,p.rank_code,p.last_name,p.first_name,p.unit_code,p.platoon,p.squad,
+                  p.duty_position,p.field_status,p.readiness_status,p.readiness_percent,p.mos_code
+           FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code WHERE p.archived=FALSE AND p.separated_at IS NULL
+           ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name
            LIMIT 250"""
     ) if database_ready() else []
     return render_template("personnel.html", personnel=personnel, roster=roster)
@@ -6370,16 +7839,16 @@ def personnel_office():
 
 @app.get("/training")
 def training():
-    personnel = soldier_view(linked_personnel()) if database_ready() else None
+    raw_personnel = linked_personnel() if database_ready() else None
+    if raw_personnel:
+        safe_member_panel("Training visit tracking", None, welcome_visit, raw_personnel["id"], "VIEW_TRAINING")
+    personnel = soldier_view(raw_personnel) if raw_personnel else None
     qualifications = []
     duty_qualifications = []
-    catalog = duty_qualification_catalog() if database_ready() else []
+    catalog = safe_member_panel("Training catalog", [], duty_qualification_catalog) if database_ready() else []
     if personnel:
-        qualifications = fetch_all(
-            "SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY qualification_name",
-            (personnel["id"],),
-        )
-        duty_qualifications = personnel_duty_qualifications(personnel["id"])
+        qualifications = safe_member_fetch_all("Member training qualifications", "SELECT * FROM qualifications WHERE personnel_id=%s ORDER BY qualification_name", (personnel["id"],))
+        duty_qualifications = safe_member_panel("Member duty qualifications", [], personnel_duty_qualifications, personnel["id"])
     return render_template(
         "training.html", personnel=personnel, qualifications=qualifications,
         duty_qualifications=duty_qualifications, catalog=catalog,
@@ -6532,8 +8001,43 @@ def internal_clerk_order_posted(document_id):
 
 @app.get("/orders")
 def orders():
-    ops = fetch_all("SELECT * FROM operations ORDER BY operation_date DESC NULLS LAST, created_at DESC") if database_ready() else []
-    return render_template("orders.html", operations=ops)
+    personnel=linked_personnel() if session.get("user_id") else None
+    documents=[]; ops=[]
+    if personnel and session.get("access_role") in {"member","nco","company_hq"}:
+        try:
+            welcome_visit(personnel["id"],"VIEW_OPERATIONS")
+            pkt=fetch_one("SELECT current_phase FROM welcome_packets WHERE personnel_id=%s",(personnel["id"],))
+            if pkt and pkt.get("current_phase") in {"MOVEMENT_ASSIGNMENT","UNIT_ORIENTATION","COMPLETE"}:
+                welcome_visit(personnel["id"],"REVIEW_MOVEMENT_ORDERS")
+        except Exception:
+            log.exception("Welcome Packet Orders milestone failed for %s", personnel.get("id"))
+        try:
+            documents=fetch_all("SELECT * FROM personnel_documents WHERE personnel_id=%s ORDER BY effective_date DESC,created_at DESC",(personnel["id"],))
+        except Exception:
+            log.exception("MEMBER PERSONAL ORDERS READ FAILED personnel=%s",personnel.get("id"))
+            documents=[]
+        try:
+            ops=fetch_all("""SELECT DISTINCT o.* FROM operations o
+                              LEFT JOIN operation_participation op ON op.operation_id=o.id AND op.personnel_id=%s
+                              WHERE UPPER(COALESCE(o.status,'')) <> 'DELETED'
+                                AND (op.personnel_id IS NOT NULL OR UPPER(COALESCE(o.publish_status,''))='PUBLISHED')
+                              ORDER BY COALESCE(o.start_at,o.created_at) DESC LIMIT 100""",(personnel["id"],))
+        except Exception:
+            log.exception("MEMBER BATTALION ORDERS READ FAILED personnel=%s",personnel.get("id"))
+            ops=[]
+        return render_template("orders.html", operations=ops, documents=documents, personnel=personnel)
+
+    if database_ready():
+        try:
+            archive_expired_operations()
+        except Exception:
+            log.exception("Staff Orders archive maintenance failed")
+        try:
+            ops=fetch_all("SELECT * FROM operations WHERE UPPER(COALESCE(status,'')) <> 'DELETED' ORDER BY COALESCE(start_at,created_at) DESC")
+        except Exception:
+            log.exception("Staff Orders operation read failed")
+            ops=[]
+    return render_template("orders.html", operations=ops, documents=documents, personnel=personnel)
 
 
 @app.get("/why-join-us")
@@ -6548,11 +8052,20 @@ def awards_decorations():
     ribbons=[]
     try:
         if database_ready():
-            ribbons = fetch_all("""SELECT ribbon_code,ribbon_name,automation_mode,requirement_text,sort_order,image_filename
+            ribbons = fetch_all("""SELECT ribbon_code,ribbon_name,automation_mode,requirement_text,description_text,earning_text,award_type_label,sort_order,image_filename
                                    FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name""")
     except Exception:
         app.logger.exception("Public awards catalog unavailable")
-    return render_template("awards_decorations.html", ribbons=ribbons, medals=[])
+    recent_decorations=[]
+    try:
+        if database_ready():
+            recent_decorations=fetch_all("""SELECT pa.award_name,pa.award_date,pa.order_number,p.rank_code,p.first_name,p.last_name
+                                           FROM personnel_awards pa JOIN personnel p ON p.id=pa.personnel_id
+                                           WHERE p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE
+                                           ORDER BY pa.award_date DESC,pa.id DESC LIMIT 12""")
+    except Exception:
+        app.logger.exception("Recent public decorations unavailable")
+    return render_template("awards_decorations.html", ribbons=ribbons, medals=[], recent_decorations=recent_decorations)
 
 @app.get("/about-1-5-cav")
 def about():
@@ -6877,6 +8390,17 @@ def award_recommendation():
     target = fetch_one("SELECT id,rank_code,first_name,last_name FROM personnel WHERE id=%s", (personnel_id,))
     if not target:
         abort(404)
+    duplicate = fetch_one(
+        """SELECT id,status FROM personnel_recommendations
+           WHERE personnel_id=%s AND recommendation_type='AWARD'
+             AND UPPER(COALESCE(recommended_action,''))=UPPER(%s)
+             AND UPPER(COALESCE(status,'')) NOT IN ('APPROVED','DENIED','CANCELLED','CANCELED','CLOSED','COMPLETE','COMPLETED')
+           ORDER BY created_at DESC LIMIT 1""",
+        (personnel_id, award_name),
+    )
+    if duplicate:
+        flash(f"AWARD RECOMMENDATION NOT DUPLICATED — {award_name.upper()} IS ALREADY PENDING ({str(duplicate.get('status') or 'OPEN').replace('_',' ')}).", "warning")
+        return redirect(request.referrer or url_for("my_soldier_record"))
     execute(
         """INSERT INTO personnel_recommendations
            (personnel_id,recommendation_type,recommended_action,justification,recommending_personnel_id,status)
@@ -6887,6 +8411,209 @@ def award_recommendation():
     return redirect(request.referrer or url_for("my_soldier_record"))
 
 
+
+
+_FIELD_BILLET_ALIASES={
+    'PLATOON SERGEANT':'PSG',
+    'SQUAD LEADER':'SL',
+    'ASSISTANT SQUAD LEADER':'ASST_SL',
+    'TEAM LEADER':'FTL',
+    'FIRE TEAM LEADER':'FTL',
+}
+
+def _formation_node_for_billet(person, appointment_code):
+    """Resolve the billet formation, including older records that only stored text labels."""
+    if not person:
+        return None
+    wanted='Platoon' if appointment_code=='PSG' else 'Squad'
+    if person.get('unit_node_id'):
+        ancestry=unit_ancestry(person['unit_node_id'])
+        found=next((n for n in ancestry if str(n.get('unit_type') or '').lower()==wanted.lower()),None)
+        if found:
+            return found
+    unit=str(person.get('unit_code') or '').upper()
+    company_letter=''
+    m=re.search(r'\b([ABC])\b',unit)
+    if m: company_letter=m.group(1)
+    if wanted=='Squad' and company_letter and person.get('platoon') and person.get('squad'):
+        found=fetch_one("""SELECT s.* FROM unit_nodes s
+                            JOIN unit_nodes pl ON pl.id=s.parent_id
+                            JOIN unit_nodes co ON co.id=pl.parent_id
+                            WHERE s.unit_type='Squad' AND s.is_active=TRUE
+                              AND UPPER(s.display_name)=UPPER(%s)
+                              AND UPPER(pl.display_name)=UPPER(%s)
+                              AND co.unit_code=%s LIMIT 1""",
+                        (person.get('squad'),person.get('platoon'),f'{company_letter}-1-5'))
+        if found:
+            execute("UPDATE personnel SET unit_node_id=%s,updated_at=NOW() WHERE id=%s",(found['id'],person['id']))
+            execute("UPDATE assignment_history SET unit_node_id=%s WHERE personnel_id=%s AND is_current=TRUE",(found['id'],person['id']))
+            person['unit_node_id']=found['id']
+            return found
+    if wanted=='Platoon' and company_letter and person.get('platoon'):
+        found=fetch_one("""SELECT pl.* FROM unit_nodes pl JOIN unit_nodes co ON co.id=pl.parent_id
+                            WHERE pl.unit_type='Platoon' AND pl.is_active=TRUE
+                              AND UPPER(pl.display_name)=UPPER(%s) AND co.unit_code=%s LIMIT 1""",
+                        (person.get('platoon'),f'{company_letter}-1-5'))
+        if found:
+            return found
+    return None
+
+def reconcile_formation_billets():
+    """One-time-safe migration of clear legacy duty positions into authoritative billets."""
+    people=fetch_all("""SELECT * FROM personnel WHERE separated_at IS NULL AND COALESCE(archived,FALSE)=FALSE""") or []
+    for person in people:
+        duty=re.sub(r'[^A-Z0-9 ]+',' ',str(person.get('duty_position') or '').upper()).strip()
+        code=_FIELD_BILLET_ALIASES.get(duty)
+        # resolve prior exceptions each pass; re-open only if still ambiguous
+        execute("UPDATE formation_migration_exceptions SET is_active=FALSE,resolved_at=NOW() WHERE personnel_id=%s AND is_active=TRUE",(person['id'],))
+        if not code:
+            continue
+        node=_formation_node_for_billet(person,code)
+        if not node:
+            execute("""INSERT INTO formation_migration_exceptions(personnel_id,exception_code,detail,is_active,detected_at,resolved_at)
+                       VALUES(%s,'MISSING_FORMATION',%s,TRUE,NOW(),NULL)
+                       ON CONFLICT(personnel_id,exception_code) DO UPDATE SET detail=EXCLUDED.detail,is_active=TRUE,detected_at=NOW(),resolved_at=NULL""",
+                    (person['id'],f"{person.get('rank_code') or ''} {person.get('last_name') or ''} is marked {person.get('duty_position') or code} but has no compatible structured formation assignment."))
+            continue
+        team=(person.get('fire_team') or '').upper().strip() if code=='FTL' else None
+        if code=='FTL' and team not in {'ALPHA','BRAVO','ALPHA TEAM','BRAVO TEAM'}:
+            execute("""INSERT INTO formation_migration_exceptions(personnel_id,exception_code,detail,is_active,detected_at,resolved_at)
+                       VALUES(%s,'TEAM_LEADER_WITHOUT_TEAM',%s,TRUE,NOW(),NULL)
+                       ON CONFLICT(personnel_id,exception_code) DO UPDATE SET detail=EXCLUDED.detail,is_active=TRUE,detected_at=NOW(),resolved_at=NULL""",
+                    (person['id'],f"{person.get('rank_code') or ''} {person.get('last_name') or ''} is a Team Leader but Alpha/Bravo Team is not defined."))
+            continue
+        team='ALPHA TEAM' if team.startswith('ALPHA') else ('BRAVO TEAM' if team.startswith('BRAVO') else None)
+        existing=fetch_one("""SELECT id,unit_node_id,fire_team FROM personnel_appointments WHERE personnel_id=%s AND appointment_code=%s AND is_current=TRUE""",(person['id'],code))
+        if existing:
+            if str(existing.get('unit_node_id') or '')!=str(node['id']) or str(existing.get('fire_team') or '').upper()!=str(team or '').upper():
+                execute("UPDATE personnel_appointments SET unit_node_id=%s,fire_team=%s,organization=%s,remarks=COALESCE(remarks,'') || ' | RECONCILED TO STRUCTURED FORMATION' WHERE id=%s",
+                        (node['id'],team,format_assignment_node(node['id']),existing['id']))
+        else:
+            appt_name=fetch_one("SELECT appointment_name FROM appointment_catalog WHERE appointment_code=%s",(code,)) or {'appointment_name':code}
+            execute("""INSERT INTO personnel_appointments(personnel_id,appointment_code,unit_node_id,fire_team,organization,appointment_status,effective_date,authority,remarks,is_current)
+                       VALUES(%s,%s,%s,%s,%s,'PERMANENT',CURRENT_DATE,'SYSTEM MIGRATION','AUTO-MIGRATED FROM CURRENT DUTY POSITION',TRUE)""",
+                    (person['id'],code,node['id'],team,format_assignment_node(node['id'])))
+            log.info("Formation billet migrated: %s -> %s / %s",person['id'],appt_name.get('appointment_name'),node.get('display_name'))
+
+def formation_control_snapshot(squad_id):
+    squad=unit_node(squad_id)
+    if not squad or str(squad.get('unit_type') or '').lower()!='squad':
+        return None
+    ancestry=unit_ancestry(squad_id)
+    platoon=next((n for n in ancestry if str(n.get('unit_type') or '').lower()=='platoon'),None)
+    company=next((n for n in ancestry if str(n.get('unit_type') or '').lower()=='company'),None)
+    members=fetch_all("""SELECT p.*,COALESCE(rc.precedence,0) rank_precedence
+                         FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code
+                         WHERE p.unit_node_id=%s AND p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE
+                         ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name""",(squad_id,)) or []
+    appts=fetch_all("""SELECT pa.*,p.rank_code,p.first_name,p.last_name FROM personnel_appointments pa JOIN personnel p ON p.id=pa.personnel_id
+                       WHERE pa.unit_node_id=%s AND pa.is_current=TRUE AND pa.appointment_code IN ('SL','ASST_SL','FTL')
+                       ORDER BY pa.appointment_code,pa.fire_team,p.last_name""",(squad_id,)) or []
+    bykey={}
+    for a in appts:
+        key=a['appointment_code']
+        if key=='FTL': key=f"FTL_{str(a.get('fire_team') or '').upper().replace(' TEAM','')}"
+        bykey[key]=a
+    return {'squad':squad,'platoon':platoon,'company':company,'members':members,'appointments':bykey}
+
+# Automatic billet migration/reconciliation after all helpers are available.
+if database_ready():
+    try:
+        reconcile_formation_billets()
+    except Exception:
+        log.exception('Automatic formation billet reconciliation failed')
+
+@app.route('/staff/formation-control',methods=['GET','POST'])
+@login_required
+def staff_formation_control():
+    role=session.get('access_role')
+    if role not in {'s1','battalion_hq','commander','admin'}: abort(403)
+    authority=session.get('display_name') or session.get('username') or role.upper()
+    squads=fetch_all("""SELECT s.*,p.display_name platoon_name,c.display_name company_name
+                         FROM unit_nodes s
+                         JOIN unit_nodes p ON p.id=s.parent_id
+                         JOIN unit_nodes c ON c.id=p.parent_id
+                         WHERE s.unit_type='Squad' AND s.is_active=TRUE AND p.is_active=TRUE AND c.is_active=TRUE
+                         ORDER BY c.sort_order,p.sort_order,s.sort_order""") or []
+    squad_id=request.values.get('squad_id') or (str(squads[0]['id']) if squads else None)
+    if request.method=='POST':
+        action=(request.form.get('action') or '').upper()
+        if action=='RECONCILE':
+            reconcile_formation_billets(); flash('FORMATION BILLET RECONCILIATION COMPLETE. REVIEW EXCEPTIONS BELOW.','success')
+            return redirect(url_for('staff_formation_control',squad_id=squad_id))
+        if action=='ASSIGN_SLOT':
+            snap=formation_control_snapshot(squad_id)
+            if not snap: abort(400)
+            person_id=request.form.get('personnel_id') or ''
+            slot=(request.form.get('slot_code') or '').upper()
+            person=fetch_one("SELECT * FROM personnel WHERE id=%s AND separated_at IS NULL",(person_id,)) if person_id else None
+            if not person: abort(400)
+            mapping={
+                'SL':('SL',None,'Squad Leader'),
+                'ASST_SL':('ASST_SL',None,'Assistant Squad Leader'),
+                'FTL_ALPHA':('FTL','ALPHA TEAM','Team Leader'),
+                'FTL_BRAVO':('FTL','BRAVO TEAM','Team Leader'),
+                'ALPHA_RIFLEMAN':(None,'ALPHA TEAM','Rifleman'),
+                'ALPHA_GRENADIER':(None,'ALPHA TEAM','Grenadier'),
+                'ALPHA_AUTOMATIC_RIFLEMAN':(None,'ALPHA TEAM','Automatic Rifleman'),
+                'BRAVO_RIFLEMAN':(None,'BRAVO TEAM','Rifleman'),
+                'BRAVO_GRENADIER':(None,'BRAVO TEAM','Grenadier'),
+                'BRAVO_AUTOMATIC_RIFLEMAN':(None,'BRAVO TEAM','Automatic Rifleman'),
+            }
+            if slot not in mapping: abort(400)
+            appt_code,team,duty=mapping[slot]
+            # Relieve the current occupant of a singleton leadership slot.
+            if appt_code:
+                rows=fetch_all("""SELECT id,personnel_id FROM personnel_appointments WHERE unit_node_id=%s AND appointment_code=%s AND is_current=TRUE""",(squad_id,appt_code)) or []
+                for row in rows:
+                    if appt_code!='FTL' or str((fetch_one('SELECT fire_team FROM personnel_appointments WHERE id=%s',(row['id'],)) or {}).get('fire_team') or '').upper()==str(team or '').upper():
+                        if str(row['personnel_id'])!=str(person_id): relieve_appointment(row['id'],date.today(),authority,None,'Reassigned through Formation Assignment Control.')
+            process_assignment_action(person_id,squad_id,duty,date.today(),authority,None,'Formation Assignment Control',fire_team=team)
+            if appt_code:
+                current=fetch_all("SELECT id,appointment_code,fire_team FROM personnel_appointments WHERE personnel_id=%s AND is_current=TRUE AND appointment_code IN ('SL','ASST_SL','FTL')",(person_id,)) or []
+                for row in current:
+                    if row['appointment_code']!=appt_code or (appt_code=='FTL' and str(row.get('fire_team') or '').upper()!=str(team or '').upper()):
+                        relieve_appointment(row['id'],date.today(),authority,None,'Reassigned through Formation Assignment Control.')
+                already=fetch_one("SELECT id FROM personnel_appointments WHERE personnel_id=%s AND appointment_code=%s AND unit_node_id=%s AND is_current=TRUE AND COALESCE(fire_team,'')=COALESCE(%s,'')",(person_id,appt_code,squad_id,team))
+                if not already: process_appointment_action(person_id,appt_code,None,'PERMANENT',date.today(),authority,None,'Formation Assignment Control',squad_id,fire_team=team)
+            enqueue_discord_role_sync(person_id,'FORMATION ASSIGNMENT CONTROL')
+            flash('FORMATION SLOT ASSIGNED. WEBSITE RECORD AND DISCORD ROLE MIRROR QUEUED.','success')
+            return redirect(url_for('staff_formation_control',squad_id=squad_id))
+    snapshot=formation_control_snapshot(squad_id) if squad_id else None
+    candidates=fetch_all("""SELECT p.*,COALESCE(rc.precedence,0) rank_precedence FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code
+                           WHERE p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE AND COALESCE(p.field_status,'')<>'Replacement'
+                           ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name""") or []
+    exceptions=fetch_all("""SELECT e.*,p.rank_code,p.first_name,p.last_name FROM formation_migration_exceptions e JOIN personnel p ON p.id=e.personnel_id
+                             WHERE e.is_active=TRUE ORDER BY e.detected_at DESC,p.last_name""") or []
+    return render_template('staff_formation_control.html',squads=squads,snapshot=snapshot,candidates=candidates,exceptions=exceptions)
+
+
+def validate_appointment_compatibility(person, appointment, unit_id=None, fire_team=None, allow_override=False):
+    """Block structurally impossible field-leadership choices before they reach history/Discord.
+
+    Command can explicitly override rank guidance, but formation/echelon requirements remain
+    hard constraints so a Squad Leader cannot silently exist without a Squad, etc.
+    """
+    if not appointment:
+        return True, None
+    code=str(appointment.get('appointment_code') or '').upper()
+    node=unit_node(unit_id) if unit_id else None
+    node_type=str((node or {}).get('unit_type') or '').upper()
+    required={'PSG':'PLATOON','SL':'SQUAD','ASST_SL':'SQUAD','FTL':'SQUAD'}
+    if code in required:
+        if not node:
+            return False, f"{code} REQUIRES A STRUCTURED {required[code]} ASSIGNMENT."
+        if node_type!=required[code]:
+            return False, f"{code} MUST BE ATTACHED TO A {required[code]}, NOT {node_type or 'AN UNSPECIFIED FORMATION'}."
+    if code=='FTL':
+        team=str(fire_team or person.get('fire_team') or '').upper().replace(' TEAM','').strip()
+        if team not in {'ALPHA','BRAVO'}:
+            return False, "TEAM LEADER REQUIRES ALPHA OR BRAVO FIRE TEAM."
+    suggested=str(appointment.get('suggested_rank') or '').upper().strip()
+    current=str(person.get('rank_code') or '').upper().strip()
+    if suggested and current and current!=suggested and not allow_override:
+        return False, f"{code} IS NORMALLY AUTHORIZED FOR {suggested}; {current} REQUIRES COMMAND OVERRIDE."
+    return True, None
 
 
 @app.route('/staff/personnel/<personnel_id>/manage',methods=['GET','POST'])
@@ -6905,17 +8632,80 @@ def staff_personnel_manage(personnel_id):
     evidence=award_recommendation_evidence(personnel_id)
     promotion_packet=promotion_board_packet(personnel_id)
     situation=current_situation_snapshot(person)
+    current_leadership=fetch_one("""SELECT pa.appointment_code,ac.appointment_name FROM personnel_appointments pa JOIN appointment_catalog ac ON ac.appointment_code=pa.appointment_code WHERE pa.personnel_id=%s AND pa.is_current=TRUE AND pa.appointment_code IN ('PSG','SL','ASST_SL','FTL') ORDER BY pa.effective_date DESC LIMIT 1""",(personnel_id,))
+    action_permissions={
+        'PERSONNEL_CONTROL': {'s1','battalion_hq','commander','admin'},
+        'AWARD': {'s1','battalion_hq','commander','admin'},
+        'FIELD_CITATION': {'s1','s3','battalion_hq','commander','admin'},
+        'QUALIFICATION': {'s3','training','battalion_hq','commander','admin'},
+        'TRAINING': {'s3','training','battalion_hq','commander','admin'},
+        'LEAVE': {'s1','battalion_hq','commander','admin'},
+        'WEAPON': {'s4','battalion_hq','commander','admin'},
+        'COMMAND_REMARK': {'s1','s3','s4','battalion_hq','commander','admin'},
+        'WATCHLIST': {'battalion_hq','commander','admin'},
+    }
+    allowed_actions=[k for k,v in action_permissions.items() if role in v]
+    requested_action=((request.args.get('action') if request.method=='GET' else request.form.get('action')) or '').upper()
+    initial_action=requested_action if requested_action in allowed_actions else (allowed_actions[0] if allowed_actions else '')
     if request.method=='POST':
         action=(request.form.get('action') or '').upper()
         eff_raw=request.form.get('effective_date') or today.isoformat()
         eff=date.fromisoformat(str(eff_raw)[:10]) if not isinstance(eff_raw,date) else eff_raw
         remarks=(request.form.get('remarks') or '').strip() or None
-        if action=='ASSIGNMENT':
+        if action=='PERSONNEL_CONTROL':
+            if role not in {'s1','battalion_hq','commander','admin'}: abort(403)
+            rank=validate_system_choice((request.form.get('rank_code') or '').upper(),catalogs['ranks'],'rank_code')
+            node=validate_system_choice(request.form.get('unit_node_id'),catalogs['assignment_options'],'id')
+            duty=validate_system_choice(request.form.get('duty_position'),catalogs['duty_positions'],'value')
+            mos=validate_system_choice((request.form.get('mos_code') or '').upper(),catalogs['mos_catalog'],'mos_code')
+            fire_team=(request.form.get('fire_team') or '').upper().strip()
+            valid_teams={x['value'] for x in catalogs['fire_teams']}
+            if fire_team not in valid_teams: abort(400)
+            duty_status=(request.form.get('duty_status') or 'PRESENT FOR DUTY').upper().strip()
+            valid_status={x['value'] for x in catalogs['duty_statuses']}
+            if duty_status not in valid_status: abort(400)
+            appointment_code=(request.form.get('appointment_code') or '').upper().strip()
+            if appointment_code and appointment_code!='NONE':
+                appt=validate_system_choice(appointment_code,catalogs['appointment_catalog'],'appointment_code')
+            else:
+                appt=None
+            if not rank or not node or not duty or not mos:
+                flash('RANK, ASSIGNMENT, MOS, AND DUTY POSITION ARE REQUIRED.','danger')
+            else:
+                current=fetch_one('SELECT * FROM personnel WHERE id=%s',(personnel_id,)) or person
+                changes=[]
+                if (current.get('rank_code') or '').upper()!=rank['rank_code']:
+                    process_rank_action(personnel_id,rank['rank_code'],eff,authority,None,remarks); changes.append(f"Rank → {rank['rank_code']}")
+                if (current.get('mos_code') or '').upper()!=mos['mos_code']:
+                    file_primary_mos_change(personnel_id,mos['mos_code'],eff,authority,remarks); changes.append(f"MOS → {mos['mos_code']}")
+                assignment_changed=(str(current.get('unit_node_id') or '')!=str(node['id']) or
+                                    (current.get('duty_position') or '')!=duty['value'] or
+                                    (current.get('fire_team') or '').upper()!=fire_team)
+                if assignment_changed:
+                    process_assignment_action(personnel_id,node['id'],duty['value'],eff,authority,None,remarks,fire_team=fire_team or None); changes.append('Formation / billet updated')
+                if (current.get('duty_status') or 'PRESENT FOR DUTY').upper()!=duty_status:
+                    execute("UPDATE personnel SET duty_status=%s,updated_at=NOW() WHERE id=%s",(duty_status,personnel_id))
+                    write_service_entry(personnel_id,'STATUS','DUTY STATUS CHANGED',f'Duty status changed to {duty_status}.',authority,None,eff); changes.append(f"Duty status → {duty_status}")
+                managed_codes={'PSG','SL','ASST_SL','FTL'}
+                current_managed=fetch_all("SELECT id,appointment_code FROM personnel_appointments WHERE personnel_id=%s AND is_current=TRUE AND appointment_code=ANY(%s)",(personnel_id,list(managed_codes)))
+                desired_code=appt['appointment_code'] if appt and appt['appointment_code'] in managed_codes else None
+                for row in current_managed:
+                    if row['appointment_code']!=desired_code:
+                        relieve_appointment(row['id'],eff,authority,None,remarks); changes.append(f"Relieved {row['appointment_code']}")
+                if desired_code and not any(row['appointment_code']==desired_code for row in current_managed):
+                    process_appointment_action(personnel_id,desired_code,None,'PERMANENT',eff,authority,None,remarks,node['id'],fire_team=fire_team or None); changes.append(f"Appointment → {desired_code}")
+                if changes:
+                    enqueue_discord_role_sync(personnel_id,'STAFF PERSONNEL CONTROL — AUTHORITATIVE SYNC')
+                    staff_log('S-1','PERSONNEL CONTROL',f"{rank['rank_code']} {current.get('last_name','')} — " + '; '.join(changes),authority,personnel_id,details={'unit_node_id':str(node['id']),'fire_team':fire_team or None,'duty_position':duty['value'],'mos_code':mos['mos_code'],'rank_code':rank['rank_code'],'appointment_code':desired_code,'duty_status':duty_status,'changes':changes})
+                    flash('PERSONNEL CONTROL FILED. WEBSITE UPDATED AND DISCORD ROLE MIRROR QUEUED.','success')
+                else:
+                    flash('NO PERSONNEL CHANGES WERE DETECTED. NOTHING WAS FILED OR QUEUED.','warning')
+        elif action=='ASSIGNMENT':
             if role not in {'s1','battalion_hq','commander','admin'}: abort(403)
             node=validate_system_choice(request.form.get('unit_node_id'),catalogs['assignment_options'],'id'); duty=validate_system_choice(request.form.get('duty_position'),catalogs['duty_positions'],'value'); mos=validate_system_choice((request.form.get('mos_code') or '').upper(),catalogs['mos_catalog'],'mos_code')
             if not node or not duty or not mos: flash('SELECT AN ASSIGNMENT, MOS, AND DUTY POSITION FROM THE AUTHORIZED LISTS.','danger')
             else:
-                file_primary_mos_change(personnel_id,mos['mos_code'],eff,authority,remarks); process_assignment_action(personnel_id,node['id'],duty['value'],eff,authority,None,remarks); flash('ASSIGNMENT / TRANSFER FILED AND DISCORD ROLE MIRROR QUEUED.','success')
+                file_primary_mos_change(personnel_id,mos['mos_code'],eff,authority,remarks); process_assignment_action(personnel_id,node['id'],duty['value'],eff,authority,None,remarks,fire_team=(request.form.get('fire_team') or None)); flash('ASSIGNMENT / TRANSFER FILED AND DISCORD ROLE MIRROR QUEUED.','success')
         elif action=='RANK':
             if role not in {'s1','battalion_hq','commander','admin'}: abort(403)
             rank=validate_system_choice((request.form.get('rank_code') or '').upper(),catalogs['ranks'],'rank_code')
@@ -6926,7 +8716,12 @@ def staff_personnel_manage(personnel_id):
             if unit_id: validate_system_choice(unit_id,catalogs['organization_nodes'],'id')
             status=(request.form.get('appointment_status') or 'PERMANENT').upper()
             if status not in {'PERMANENT','ACTING','TEMPORARY'}: abort(400)
-            if appt: process_appointment_action(personnel_id,appt['appointment_code'],None,status,eff,authority,None,remarks,unit_id); flash('APPOINTMENT FILED AND DISCORD ROLE MIRROR QUEUED.','success')
+            override=role in {'battalion_hq','commander','admin'} and request.form.get('command_override')=='YES'
+            ok, reason=validate_appointment_compatibility(person,appt,unit_id,request.form.get('fire_team'),allow_override=override)
+            if not ok:
+                flash(f'APPOINTMENT BLOCKED — {reason}','danger')
+            elif appt:
+                process_appointment_action(personnel_id,appt['appointment_code'],None,status,eff,authority,None,remarks,unit_id,fire_team=(request.form.get('fire_team') or None)); flash('APPOINTMENT FILED AND DISCORD ROLE MIRROR QUEUED.','success')
         elif action=='AWARD':
             if role not in {'s1','battalion_hq','commander','admin'}: abort(403)
             award=next((a for a in awards if a['ribbon_code']==request.form.get('ribbon_code')),None)
@@ -6992,11 +8787,13 @@ def staff_personnel_manage(personnel_id):
             if role not in {'s1','s3','s4','battalion_hq','commander','admin'}: abort(403)
             if remarks: write_service_entry(personnel_id,'COMMAND REMARK','COMMAND / STAFF REMARK',remarks,authority,None,date.today()); flash('COMMAND / STAFF REMARK FILED.','success')
         else: abort(400)
-        return redirect(url_for('staff_personnel_manage',personnel_id=personnel_id))
+        return redirect(url_for('staff_personnel_manage',personnel_id=personnel_id,action=action))
+    discord_sync=fetch_one("SELECT status,reason,requested_at,processed_at,error_text FROM discord_role_sync_queue WHERE personnel_id=%s ORDER BY requested_at DESC LIMIT 1",(personnel_id,))
     return render_template('staff_personnel_manage.html',personnel=person,authority=authority,today=today.isoformat(),
                            award_catalog=awards,operations_list=operations_list,qualification_types=qual_types,
                            training_programs=training_programs,current_weapon=current_weapon,evidence=evidence,
-                           promotion_packet=promotion_packet,current_situation=situation,**catalogs)
+                           promotion_packet=promotion_packet,current_situation=situation,current_leadership=current_leadership,
+                           initial_action=initial_action,allowed_actions=allowed_actions,discord_sync=discord_sync,**catalogs)
 
 @app.post("/personnel/<personnel_id>/staff-action")
 @login_required
@@ -7169,8 +8966,6 @@ def s1():
                 flash("SELECT A VALID ACTIVE SOLDIER AND AWARD.", "danger")
             elif not citation:
                 flash("A CITATION IS REQUIRED BEFORE THE AWARD CAN BE FILED.", "danger")
-            elif fetch_one("SELECT 1 FROM personnel_ribbons WHERE personnel_id=%s AND ribbon_code=%s", (pid, ribbon_code)):
-                flash(f"{catalog['ribbon_name'].upper()} IS ALREADY RECORDED FOR THIS SOLDIER.", "warning")
             else:
                 award_name = catalog["ribbon_name"]
                 narrative = f"{award_name} is awarded to {person.get('rank_code','')} {person.get('first_name','')} {person.get('last_name','')} for the following cited service: {citation}"
@@ -7190,7 +8985,9 @@ def s1():
                 execute(
                     """INSERT INTO personnel_ribbons(personnel_id,ribbon_code,earned_at,source_type,source_reference,notes,is_worn)
                        VALUES(%s,%s,%s,'S-1 DIRECT AWARD',%s,%s,FALSE)
-                       ON CONFLICT(personnel_id,ribbon_code) DO NOTHING""",
+                       ON CONFLICT(personnel_id,ribbon_code) DO UPDATE SET
+                         source_reference=EXCLUDED.source_reference,
+                         notes=EXCLUDED.notes""",
                     (pid, ribbon_code, award_date, order_number, citation),
                 )
                 write_service_entry(
@@ -7303,7 +9100,7 @@ def s1():
             open_personnel_action(pid,"PERSONNEL","Command inactivity / property accountability review","HQ","URGENT",authority,{"remarks":notes},source_key=f"INACTIVITY-COMMAND:{pid}")
             flash("SOLDIER REFERRED FOR COMMAND / PROPERTY ACCOUNTABILITY REVIEW.", "success")
     counts = fetch_one("SELECT COUNT(*) total, COUNT(*) FILTER (WHERE readiness_percent>=80) ready FROM personnel")
-    recent = fetch_all("SELECT * FROM personnel WHERE archived=FALSE AND separated_at IS NULL ORDER BY last_name,first_name LIMIT 300")
+    recent = fetch_all("""SELECT p.*,COALESCE(rc.precedence,0) AS rank_precedence FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code WHERE p.archived=FALSE AND p.separated_at IS NULL ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name LIMIT 300""")
     cards = fetch_all("SELECT brc.personnel_id,brc.roster_number,brc.issued_at,brc.last_used_at FROM battle_roster_cards brc WHERE brc.is_active=TRUE")
     card_map = {str(c['personnel_id']): c for c in cards}
     weapons = fetch_all("SELECT wih.personnel_id,wi.serial_number,wi.rack_number,wi.status,wi.condition_state FROM weapon_issue_history wih JOIN weapon_inventory wi ON wi.id=wih.weapon_id WHERE wih.is_current=TRUE")
@@ -7324,6 +9121,7 @@ def s1():
         progress_map[str(row["id"])] = personnel_progress(row["id"])
     training_programs = fetch_all("SELECT * FROM training_program_catalog WHERE is_active=TRUE ORDER BY sort_order")
     award_catalog = fetch_all("SELECT ribbon_code,ribbon_name,automation_mode,sort_order FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name")
+    award_eligibility = award_eligibility_board(recent)
     award_queue = fetch_all(
         """SELECT pr.*,p.rank_code,p.last_name,p.first_name,p.unit_code,
                   rp.rank_code AS recommender_rank,rp.last_name AS recommender_last,rp.first_name AS recommender_first
@@ -7352,7 +9150,7 @@ def s1():
                        FROM personnel_actions pa LEFT JOIN personnel p ON p.id=pa.personnel_id
                        WHERE pa.owning_section='S-1' AND pa.status NOT IN ('COMPLETE','CLOSED','DENIED')
                        ORDER BY pa.due_date NULLS LAST,pa.priority DESC,pa.created_at LIMIT 100""")
-    return render_template("s1_personnel.html", counts=counts, recent=recent, card_map=card_map, weapon_map=weapon_map, issued_packet=issued_packet, communications_roster=communications_roster, ranks=ranks, mos_catalog=mos_catalog, duty_positions=duty_positions, assignment_options=assignment_options, staff_authority=staff_authority, appointment_catalog=appointment_catalog, appointment_map=appointment_map, organization_nodes=organization_nodes, replacement_map=replacement_map, promotion_map=promotion_map, progress_map=progress_map, training_programs=training_programs, award_catalog=award_catalog, award_queue=award_queue, forwarded_awards=forwarded_awards, inactivity_board=inactivity_board, inactivity_counts=inactivity_counts, s1_suspense=s1_suspense, s1_today=date.today().isoformat(), workload=staff_workload("S-1"))
+    return render_template("s1_personnel.html", counts=counts, recent=recent, card_map=card_map, weapon_map=weapon_map, issued_packet=issued_packet, communications_roster=communications_roster, ranks=ranks, mos_catalog=mos_catalog, duty_positions=duty_positions, assignment_options=assignment_options, staff_authority=staff_authority, appointment_catalog=appointment_catalog, appointment_map=appointment_map, organization_nodes=organization_nodes, replacement_map=replacement_map, promotion_map=promotion_map, progress_map=progress_map, training_programs=training_programs, award_catalog=award_catalog, award_eligibility=award_eligibility, award_queue=award_queue, forwarded_awards=forwarded_awards, inactivity_board=inactivity_board, inactivity_counts=inactivity_counts, s1_suspense=s1_suspense, s1_today=date.today().isoformat(), workload=staff_workload("S-1"))
 
 
 @app.route("/personnel-actions", methods=["GET","POST"])
@@ -7429,6 +9227,29 @@ def s2():
     return render_template("section.html", section="S-2 INTELLIGENCE", section_code="s2", subtitle="Maps, intelligence summaries, threat reporting and operational intelligence.", counts=None, recent=[])
 
 
+def hll_battalion_field_report(hours=24):
+    """Read-only S-3 field return from RCON telemetry for the recent window."""
+    try:
+        row=fetch_one("""SELECT COUNT(DISTINCT ps.personnel_id) FILTER (WHERE ps.personnel_id IS NOT NULL) AS linked_soldiers,
+                                 COUNT(DISTINCT ps.steam_id) AS players,COUNT(DISTINCT ps.match_id) AS matches,
+                                 COALESCE(SUM(ps.connected_seconds),0) AS seconds,COALESCE(SUM(ps.distance_meters),0) AS distance_meters,
+                                 COALESCE(SUM(ps.infantry_kills),0) AS infantry_kills,COALESCE(SUM(ps.deaths),0) AS deaths,
+                                 COALESCE(SUM(ps.vehicle_kills),0) AS vehicle_kills
+                          FROM hll_player_match_stats ps JOIN hll_match_sessions ms ON ms.id=ps.match_id
+                          WHERE ps.last_seen_at >= NOW() - make_interval(hours => %s)""",(int(hours),)) or {}
+        maps=fetch_all("""SELECT COALESCE(ms.map_name,ms.map_id,'UNKNOWN') AS map_name,COUNT(DISTINCT ms.id) matches,
+                                COALESCE(SUM(ps.connected_seconds),0) seconds
+                         FROM hll_player_match_stats ps JOIN hll_match_sessions ms ON ms.id=ps.match_id
+                         WHERE ps.last_seen_at >= NOW() - make_interval(hours => %s)
+                         GROUP BY COALESCE(ms.map_name,ms.map_id,'UNKNOWN') ORDER BY seconds DESC LIMIT 6""",(int(hours),)) or []
+        return {"available":True,"hours":hours,"linked_soldiers":int(row.get('linked_soldiers') or 0),"players":int(row.get('players') or 0),
+                "matches":int(row.get('matches') or 0),"seconds":int(row.get('seconds') or 0),"distance_meters":float(row.get('distance_meters') or 0),
+                "infantry_kills":int(row.get('infantry_kills') or 0),"deaths":int(row.get('deaths') or 0),"vehicle_kills":int(row.get('vehicle_kills') or 0),
+                "maps":[dict(x) for x in maps]}
+    except Exception:
+        return {"available":False,"hours":hours,"linked_soldiers":0,"players":0,"matches":0,"seconds":0,"distance_meters":0.0,"infantry_kills":0,"deaths":0,"vehicle_kills":0,"maps":[]}
+
+
 @app.get("/s3")
 @login_required
 @role_required("s3")
@@ -7438,7 +9259,7 @@ def s3():
     training_due=fetch_one("SELECT COUNT(*) total FROM qualifications WHERE expires_at BETWEEN CURRENT_DATE AND CURRENT_DATE + 30") or {"total":0}
     operation_board=fetch_all("SELECT * FROM operations WHERE lifecycle_status NOT IN ('AAR FILED','CANCELLED') ORDER BY COALESCE(start_at,created_at),created_at LIMIT 20")
     deficiencies=training_deficiencies()
-    return render_template("section.html", section="S-3 OPERATIONS & TRAINING", section_code="s3", subtitle="Operations ledger, training, attendance, qualifications, readiness and after-action workflow.", counts={"total":counts.get("open",0),"ready":training_due.get("total",0)}, recent=recent, action_counts=counts, operation_board=operation_board, deficiencies=deficiencies, workload=staff_workload("S-3"))
+    return render_template("section.html", section="S-3 OPERATIONS & TRAINING", section_code="s3", subtitle="Operations ledger, training, attendance, qualifications, readiness and after-action workflow.", counts={"total":counts.get("open",0),"ready":training_due.get("total",0)}, recent=recent, action_counts=counts, operation_board=operation_board, deficiencies=deficiencies, workload=staff_workload("S-3"), hll_field_report=hll_battalion_field_report(24))
 
 
 @app.get("/s4")
@@ -7557,7 +9378,7 @@ def member_clean_weapon():
     weapon = fetch_one(
         """SELECT wi.* FROM weapon_issue_history wih
            JOIN weapon_inventory wi ON wi.id=wih.weapon_id
-           WHERE wih.personnel_id=%s AND wih.is_current=TRUE LIMIT 1""",
+           WHERE wih.personnel_id=%s AND wih.is_current=TRUE ORDER BY wih.issued_at DESC LIMIT 1""",
         (p["id"],),
     )
     if not weapon:
@@ -7567,41 +9388,30 @@ def member_clean_weapon():
         flash("THIS M16 IS IN S-4 MAINTENANCE AND CANNOT BE MEMBER-CLEANED UNTIL RELEASED.", "warning")
         return redirect(url_for("my_soldier_record") + "#equipment")
     performer = f"{p.get('rank_code') or ''} {p.get('last_name') or ''}".strip() or "SOLDIER"
+    pre_clean_rounds=max(0,int(weapon.get("rounds_since_cleaning") or 0))
     try:
-        weapon_maintenance_action(
-            weapon["id"], "CLEANED", p["id"], performer,
-            "Operator cleaning performed by assigned Soldier."
-        )
+        weapon_maintenance_action(weapon["id"], "CLEANED", p["id"], performer,
+                                  f"Operator cleaning performed by assigned Soldier; {pre_clean_rounds} rounds in fouling cycle before cleaning.")
+        verified=fetch_one("SELECT rounds_since_cleaning,last_cleaned_at,condition_state,condition_percent FROM weapon_inventory WHERE id=%s",(weapon["id"],)) or {}
+        latest=fetch_one("""SELECT id,performed_at FROM weapon_maintenance_log
+                            WHERE weapon_id=%s AND personnel_id=%s AND UPPER(action_type)='CLEANED'
+                            ORDER BY performed_at DESC LIMIT 1""",(weapon["id"],p["id"]))
+        if int(verified.get("rounds_since_cleaning") or -1)!=0 or not verified.get("last_cleaned_at") or not latest:
+            raise RuntimeError("post-clean verification failed")
     except Exception:
-        # A Soldier must never be stranded on an error page because an older
-        # maintenance-log schema or optional history write is behind. Preserve
-        # the actual cleaning, log the recovery, and let bootstrap migrations
-        # repair the detailed ledger on subsequent deployments.
-        log.exception(
-            "Member weapon-clean audit recovery personnel_id=%s weapon_id=%s",
-            p.get("id"), weapon.get("id"),
-        )
-        execute(
-            """UPDATE weapon_inventory
-               SET rounds_since_cleaning=0,last_cleaned_at=NOW(),
-                   condition_percent=100,condition_state='SERVICEABLE',updated_at=NOW()
-               WHERE id=%s""",
-            (weapon["id"],),
-        )
+        log.exception("Member weapon-clean authoritative path failed personnel_id=%s weapon_id=%s",p.get("id"),weapon.get("id"))
+        # Last-resort recovery keeps the Soldier-facing state truthful even if an
+        # optional history subsystem is temporarily unavailable.
+        execute("""UPDATE weapon_inventory SET rounds_since_cleaning=0,last_cleaned_at=NOW(),
+                   condition_percent=100,condition_state='SERVICEABLE',updated_at=NOW() WHERE id=%s""",(weapon["id"],))
         try:
-            refresh_weapon_condition(weapon["id"])
+            reconcile_weapon_rounds_since_cleaning(weapon["id"]); refresh_weapon_condition(weapon["id"])
         except Exception:
-            log.exception("Member weapon-clean condition refresh recovery weapon_id=%s", weapon.get("id"))
-        try:
-            write_service_entry(
-                p["id"], "ARMS", "CLEANED",
-                f"M16 serial {weapon.get('serial_number')} — operator cleaning completed.",
-                performer, None, date.today(),
-            )
-        except Exception:
-            log.exception("Member weapon-clean service-entry recovery personnel_id=%s", p.get("id"))
+            log.exception("Member weapon-clean recovery refresh failed weapon_id=%s",weapon.get("id"))
+        flash("M16 CLEANING WAS APPLIED, BUT THE MAINTENANCE LEDGER NEEDS S-4 REVIEW.","warning")
+        return redirect(url_for("my_soldier_record") + "#equipment")
     execute("UPDATE personnel SET activity_last_seen_at=NOW(),updated_at=NOW() WHERE id=%s", (p["id"],))
-    flash("M16 OPERATOR CLEANING COMPLETED — FOULING COUNTER RESET AND ENTRY FILED.", "success")
+    flash(f"M16 OPERATOR CLEANING COMPLETE — {pre_clean_rounds} ROUND FOULING CYCLE CLEARED; MAINTENANCE ENTRY VERIFIED.", "success")
     return redirect(url_for("my_soldier_record") + "#equipment")
 
 
@@ -7775,7 +9585,8 @@ def battalion_control():
     company_history=fetch_all("""SELECT COALESCE(p.unit_code,'BATTALION') unit_code,COUNT(*) total,MAX(bh.history_date) last_entry
                                FROM battalion_history bh LEFT JOIN personnel p ON p.id=bh.personnel_id
                                GROUP BY COALESCE(p.unit_code,'BATTALION') ORDER BY unit_code""")
-    return render_template("battalion_control.html",health=health,lifecycle=lifecycle,due_weapons=due_weapons,logs=logs,history=history,personnel_list=personnel_list,daily=daily,milestones=milestones,company_history=company_history)
+    integrity=battalion_integrity_scan(200)
+    return render_template("battalion_control.html",health=health,lifecycle=lifecycle,due_weapons=due_weapons,logs=logs,history=history,personnel_list=personnel_list,daily=daily,milestones=milestones,company_history=company_history,integrity=integrity)
 
 
 def _clerk_authorized() -> bool:
@@ -7823,10 +9634,12 @@ def _credit_scheduled_duty(event, personnel_id, seconds, source_reference=None):
     execute("""UPDATE battalion_event_attendance SET attendance_grade=%s,attendance_percent=%s,updated_at=NOW()
                WHERE event_id=%s AND personnel_id=%s""", (grade,attendance_percent,event["id"],personnel_id))
 
-    # OPERATION ammunition is no longer delayed until closeout. Every verified
-    # Battalion Clerk voice chunk advances the issued rifle toward the S-3 configured
-    # full-operation expenditure.
-    live_rounds=accrue_live_operation_weapon_rounds(event,personnel_id,total)
+    # Every verified OPERATION presence chunk is now mirrored immediately into
+    # the member's operation history and M16 ledger. The row begins as TRACKED
+    # PRESENCE, advances to PARTIAL / LATE, and upgrades to FULL CREDIT only when
+    # the configured threshold is met.
+    live_presence=sync_operation_presence_from_attendance(event,personnel_id,total,"BATTALION CLERK")
+    live_rounds={"target":live_presence.get("rounds_target",0),"applied":live_presence.get("rounds_applied",0)}
     if total < threshold_seconds or already:
         return False, total
 
@@ -7834,8 +9647,13 @@ def _credit_scheduled_duty(event, personnel_id, seconds, source_reference=None):
                WHERE event_id=%s AND personnel_id=%s""", (grade,attendance_percent,event["id"], personnel_id))
     execute("""INSERT INTO personnel_activity_credit
                (personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited)
-               VALUES (%s,'BATTALION DUTY',%s,%s,%s,%s,TRUE)""",
-            (personnel_id, str(event["id"]), event["event_type"], event["starts_at"].date(), total))
+               SELECT %s,'BATTALION DUTY',%s,%s,%s,%s,TRUE
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM personnel_activity_credit
+                 WHERE personnel_id=%s AND source='BATTALION DUTY' AND source_reference=%s AND activity_type=%s
+               )""",
+            (personnel_id, str(event["id"]), event["event_type"], event["starts_at"].date(), total,
+             personnel_id,str(event["id"]),event["event_type"]))
     execute("UPDATE personnel SET activity_last_duty_at=NOW(),activity_last_seen_at=NOW(),updated_at=NOW() WHERE id=%s", (personnel_id,))
     write_service_entry(
         personnel_id,
@@ -7846,12 +9664,12 @@ def _credit_scheduled_duty(event, personnel_id, seconds, source_reference=None):
         source_reference or event.get("external_event_id"),
     )
     if event["event_type"] == "OPERATION" and event.get("operation_id"):
-        file_operation_participation(
+        # sync_operation_presence_from_attendance already upgraded the same
+        # idempotent operation row and weapon ledger to FULL CREDIT above.
+        operation_credit_cascade(
             event["operation_id"], personnel_id,
-            attendance_status="FULL CREDIT",
-            rounds_expended=int((live_rounds or {}).get("target") or operation_round_target_for_time(event,total)),
-            remarks=f'Automatic Battalion Clerk credit: {total // 60} qualifying minutes.',
-            credited_by="BATTALION CLERK"
+            int((live_rounds or {}).get("target") or operation_round_target_for_time(event,total)),
+            "BATTALION CLERK"
         )
     fresh=fetch_one("SELECT * FROM personnel WHERE id=%s",(personnel_id,))
     if fresh: sync_readiness(fresh)
@@ -8011,7 +9829,7 @@ def _sync_discord_assignment(person, roles, authority="HEADQUARTERS — BATTALIO
 
     if changes:
         execute("UPDATE assignment_history SET is_current=FALSE,ended_date=CURRENT_DATE WHERE personnel_id=%s AND is_current=TRUE",(person["id"],))
-        assigned = bool(new_unit not in {None,"","1-5 CAV","REPLACEMENT DETACHMENT"} and new_platoon and new_squad)
+        assigned = bool(new_unit not in {None,"","1-5 CAV","REPLACEMENT DETACHMENT"})
         field_status = "Assigned" if assigned else (person.get("field_status") or "Replacement")
         duty_status = "PRESENT FOR DUTY" if assigned and str(person.get("duty_status") or "").upper() in {"REPLACEMENT — UNASSIGNED","REPLACEMENT - UNASSIGNED","IN PROCESSING"} else person.get("duty_status")
         execute("UPDATE personnel SET unit_code=%s,platoon=%s,squad=%s,field_status=%s,duty_status=COALESCE(%s,duty_status),updated_at=NOW() WHERE id=%s",(new_unit,new_platoon,new_squad,field_status,duty_status,person["id"]))
@@ -8123,7 +9941,7 @@ def _ensure_clerk_personnel(guild_id:int, discord_user_id:int, username:str, dis
         (allocate_service_number(), first_name, last_name, rank or "", mos_code, mos_title))
     execute("""INSERT INTO promotion_history
                (personnel_id,old_rank_code,new_rank_code,effective_date,authority,remarks)
-               VALUES(%s,NULL,%s,CURRENT_DATE,'HEADQUARTERS — BATTALION CLERK','Initial rank recorded when the Soldier was entered on the battalion rolls.')""",
+               VALUES(%s,NULL,%s,CURRENT_DATE,'HEADQUARTERS — BATTALION CLERK','Initial rank recorded when the Soldier was entered on the Battle Roster.')""",
             (person["id"],rank))
     execute("""INSERT INTO assignment_history(personnel_id,unit_code,duty_position,effective_date)
                VALUES(%s,'1-5 CAV',%s,CURRENT_DATE)""",(person["id"],mos_title))
@@ -8131,10 +9949,10 @@ def _ensure_clerk_personnel(guild_id:int, discord_user_id:int, username:str, dis
                VALUES(%s,%s,%s,'PRIMARY',CURRENT_DATE,'HEADQUARTERS — BATTALION CLERK','Initial battlefield MOS read from Discord role set.')
                ON CONFLICT(personnel_id,mos_code,mos_kind) DO NOTHING""",(person["id"],mos_code,mos_title))
     person=_sync_discord_assignment(person,roles)
-    # Organizational assignment is independent of entry grade. A SGT/2LT/etc. with
-    # company+platoon+squad roles is an assigned Soldier immediately, not an
-    # unassigned Replacement Depot member. Administrative in-processing may still be open.
-    if person.get("platoon") and person.get("squad") and person.get("unit_code") not in {None,"","1-5 CAV"}:
+    # Organizational assignment is independent of entry grade. Company assignment
+    # alone ends Replacement status; platoon/squad and administrative processing
+    # may still be completed afterward.
+    if person.get("unit_code") not in {None,"","1-5 CAV","REPLACEMENT DETACHMENT"}:
         execute("UPDATE personnel SET field_status='Assigned',duty_status='PRESENT FOR DUTY',updated_at=NOW() WHERE id=%s",(person["id"],))
         person=fetch_one("SELECT * FROM personnel WHERE id=%s",(person["id"],))
     execute("""INSERT INTO website_member_links(guild_id,discord_user_id,personnel_id)
@@ -8144,7 +9962,7 @@ def _ensure_clerk_personnel(guild_id:int, discord_user_id:int, username:str, dis
             (guild_id,discord_user_id,str(person["id"])))
     card,field_code=issue_battle_roster_card(person["id"])
     weapon=issue_m16(person["id"])
-    _assigned_on_entry = bool(person.get("platoon") and person.get("squad") and person.get("unit_code") not in {None,"","1-5 CAV"})
+    _assigned_on_entry = bool(person.get("unit_code") not in {None,"","1-5 CAV","REPLACEMENT DETACHMENT"})
     _arrival_status = f"Assigned to {person.get('unit_code')} / {person.get('platoon')} / {person.get('squad')}." if _assigned_on_entry else "Awaiting organizational assignment."
     write_service_entry(person["id"],"ARRIVAL","PERSONNEL RECORD OPENED",
         f"Entered on the battalion personnel roster at initial grade {rank}. {_arrival_status}",
@@ -8166,8 +9984,8 @@ def _ensure_clerk_personnel(guild_id:int, discord_user_id:int, username:str, dis
         open_personnel_action(person["id"],"PERSONNEL",f"Initial battalion in-processing — entry grade {rank}","S-1","ROUTINE","BATTALION CLERK",source_key=f"INITIAL-INPROCESS:{person['id']}")
     person=reconcile_lifecycle(soldier_view(fetch_one("SELECT * FROM personnel WHERE id=%s",(person["id"],))),"HEADQUARTERS — BATTALION CLERK") or person
     initial_order = replacement_orders_for(person["id"])
-    staff_log("S-1","NEW SOLDIER",f"{rank} {person.get('last_name','')} entered on battalion rolls", "BATTALION CLERK",person["id"],initial_order.get("document_number") if initial_order else None,{"mos":mos_code})
-    battalion_history_entry("ARRIVAL",f"{rank} {person.get('last_name','')} entered battalion rolls",f"Primary MOS {mos_code} — {mos_title}.",person["id"],reference_number=initial_order.get("document_number") if initial_order else None)
+    staff_log("S-1","NEW SOLDIER",f"{rank} {person.get('last_name','')} entered on the Battle Roster", "BATTALION CLERK",person["id"],initial_order.get("document_number") if initial_order else None,{"mos":mos_code})
+    battalion_history_entry("ARRIVAL",f"{rank} {person.get('last_name','')} entered the Battle Roster",f"Primary MOS {mos_code} — {mos_title}.",person["id"],reference_number=initial_order.get("document_number") if initial_order else None)
     return {"created":True,"linked":True,"personnel":person,"roster":card,
             "field_code":field_code,"weapon":weapon,"initial_order":initial_order,"reason":reason}
 
@@ -8218,6 +10036,8 @@ def clerk_personnel_sync():
             "unit_code":person.get("unit_code") if person else None,
             "platoon":person.get("platoon") if person else None,
             "squad":person.get("squad") if person else None,
+            "fire_team":person.get("fire_team") if person else None,
+            "field_status":person.get("field_status") if person else None,
             "appointment_roles":discord_appointment_roles,
             "role_drift":result.get("role_drift") or [],
             "roster_number":card.get("roster_number") if card else None,
@@ -8425,7 +10245,8 @@ def clerk_event_status():
         guild_id = int(request.args.get("guild_id"))
     except (TypeError, ValueError):
         return {"ok": False, "error": "guild_id required"}, 400
-    # guild is represented by configured channel binding; events themselves are global to this battalion site.
+    reconcile_operation_schedule_states()
+    # Guild is represented by configured channel binding; events themselves are global to this battalion site.
     rows = fetch_all("""SELECT e.*, COUNT(a.id) AS tracked_count,
                      COALESCE(SUM(CASE WHEN a.credited_at IS NOT NULL THEN 1 ELSE 0 END),0) AS qualified_count
                      FROM battalion_events e LEFT JOIN battalion_event_attendance a ON a.event_id=e.id
@@ -8435,7 +10256,17 @@ def clerk_event_status():
         event["attendance"] = fetch_all("""SELECT p.rank_code,p.first_name,p.last_name,a.qualifying_seconds,a.credited_at,a.last_seen_at
             FROM battalion_event_attendance a JOIN personnel p ON p.id=a.personnel_id
             WHERE a.event_id=%s ORDER BY a.qualifying_seconds DESC,p.last_name""", (event["id"],))
-    return {"ok": True, "events": rows, "credit_threshold_minutes": 45}
+    return {"ok": True, "events": rows}
+
+
+@app.post("/internal/clerk/operations/maintenance")
+def clerk_operation_maintenance():
+    """Reconcile verified historical attendance, M16 rounds, and stale schedules."""
+    if not _clerk_authorized():
+        return {"ok":False,"error":"authorization required"},401
+    reconcile_operation_schedule_states()
+    result=run_operation_maintenance("BATTALION CLERK MAINTENANCE")
+    return {"ok":True,"summary":result}
 
 
 @app.post("/internal/clerk/events/<event_id>/close")
@@ -8511,6 +10342,60 @@ def clerk_refresh_inactivity_weapons():
         if before.get("condition_state")!=after.get("condition_state") or int(before.get("condition_percent") or 0)!=int(after.get("condition_percent") or 0):
             changed.append({"weapon_id":str(row["weapon_id"]),"state":after.get("condition_state"),"percent":after.get("condition_percent")})
     return {"ok":True,"issued_weapons":len(rows),"changed":changed}
+
+
+@app.post("/internal/clerk/weapons/voice-rounds")
+def clerk_voice_weapon_rounds():
+    """Apply one verified five-minute voice ammunition block (25 rounds)."""
+    if not _clerk_authorized():
+        return {"ok":False,"error":"authorization required"},401
+    data=request.get_json(silent=True) or {}
+    try:
+        guild_id=int(data.get("guild_id")); discord_user_id=int(data.get("discord_user_id") or data.get("member_id"))
+        seconds=max(0,int(data.get("seconds") or 300))
+    except (TypeError,ValueError):
+        return {"ok":False,"error":"guild_id, discord_user_id, and valid seconds required"},400
+    source_key=str(data.get("source_key") or "").strip()
+    if not source_key:
+        return {"ok":False,"error":"source_key required"},400
+    link=fetch_one("SELECT personnel_id FROM website_member_links WHERE guild_id=%s AND discord_user_id=%s",(guild_id,discord_user_id))
+    if not link:
+        return {"ok":True,"applied":0,"reason":"no linked Soldier record"}
+    # 300 rounds/hour, filed in completed 5-minute increments.
+    rounds=(seconds//300)*25
+    occurred_at=_parse_iso(data.get("occurred_at")) if data.get("occurred_at") else _round_event_time_from_source_key(source_key)
+    result=record_voice_weapon_rounds(str(link["personnel_id"]),rounds,source_key,
+        str(data.get("source_type") or "DISCORD ACTIVITY VOICE"),"BATTALION CLERK",
+        str(data.get("remarks") or "Verified Discord voice ammunition expenditure."),occurred_at=occurred_at)
+    return {"ok":True,**result}
+
+
+@app.post("/internal/clerk/weapons/reconcile-voice-rounds")
+def clerk_reconcile_voice_rounds():
+    """Safely backfill completed 5-minute blocks from stored Activity voice sessions."""
+    if not _clerk_authorized():
+        return {"ok":False,"error":"authorization required"},401
+    sessions=fetch_all("""SELECT vs.guild_id,vs.discord_user_id,vs.channel_id,vs.started_at,vs.ended_at,vs.duration_seconds
+        FROM voice_sessions vs JOIN activity_voice_channels avc ON avc.guild_id=vs.guild_id AND avc.channel_id::text=vs.channel_id::text
+        WHERE vs.duration_seconds>=300 AND vs.ended_at IS NOT NULL AND vs.started_at>=NOW()-INTERVAL '90 days'
+        ORDER BY vs.started_at""")
+    applied=0; blocks=0
+    for row in sessions:
+        # If this Activity channel was simultaneously the selected OPERATION channel,
+        # the operation attendance ledger is authoritative; never double-credit it here.
+        overlap=fetch_one("""SELECT 1 FROM battalion_events WHERE event_type='OPERATION' AND channel_id::text=%s
+                            AND starts_at < %s AND ends_at > %s LIMIT 1""",
+                          (str(row["channel_id"]),row["ended_at"],row["started_at"]))
+        if overlap: continue
+        link=fetch_one("SELECT personnel_id FROM website_member_links WHERE guild_id::text=%s AND discord_user_id::text=%s",(str(row["guild_id"]),str(row["discord_user_id"])))
+        if not link: continue
+        count=max(0,int(row.get("duration_seconds") or 0)//300)
+        for idx in range(1,count+1):
+            key=f"VOICE-HIST:{row['guild_id']}:{row['discord_user_id']}:{row['channel_id']}:{row['started_at'].isoformat()}:{idx}"
+            occurred=row["started_at"]+timedelta(seconds=idx*300)
+            result=record_voice_weapon_rounds(str(link["personnel_id"]),25,key,"DISCORD ACTIVITY VOICE — HISTORICAL","BATTALION CLERK","Historical verified Activity voice reconciliation.",occurred_at=occurred)
+            applied+=int(result.get("applied") or 0); blocks+=1
+    return {"ok":True,"sessions":len(sessions),"blocks_checked":blocks,"rounds_applied":applied}
 
 
 @app.post("/internal/clerk/attendance")
@@ -8759,7 +10644,7 @@ def leadership_record_action():
                VALUES(%s,%s,%s,%s,%s,%s,%s)""",(pid,request.form.get('record_date') or date.today(),request.form.get('leadership_type') or 'LEADERSHIP SERVICE',title,narrative,request.form.get('operation_id') or None,authority))
     write_service_entry(pid,'LEADERSHIP',title,narrative,authority)
     add_tour_book_entry(pid,'LEADERSHIP',title,narrative,request.form.get('operation_id') or None,source_key=f"LEAD:{pid}:{title}:{date.today()}")
-    flash('LEADERSHIP PERFORMANCE RECORD FILED.','success'); return redirect(request.referrer or url_for('my_soldiers'))
+    flash('LEADERSHIP PERFORMANCE RECORD FILED.','success'); return redirect(request.referrer or url_for('my_squad'))
 
 
 @app.route('/acting-appointment',methods=['POST'])
@@ -8913,22 +10798,73 @@ def my_qualification_card(source,record_id):
 def my_weapon_service_history():
     p=linked_personnel()
     if not p: abort(403)
-    weapon=current_weapon_for(p)
+    safe_member_panel("M16 history visit tracking", None, welcome_visit, p["id"], "VIEW_M16")
+    weapon=safe_member_panel("M16 history current weapon", None, current_weapon_for, p)
     if not weapon: return render_template("member_weapon_history.html",personnel=soldier_view(p),weapon=None,issue_history=[],maintenance=[],inspections=[],operations=[])
-    issue_history=fetch_all("""SELECT wih.*,wi.serial_number,wi.rack_number FROM weapon_issue_history wih JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+    issue_history=safe_member_fetch_all("M16 issue history", """SELECT wih.*,wi.serial_number,wi.rack_number FROM weapon_issue_history wih JOIN weapon_inventory wi ON wi.id=wih.weapon_id
       WHERE wih.personnel_id=%s ORDER BY wih.issued_at DESC,wih.created_at DESC""",(p["id"],))
-    maintenance=fetch_all("SELECT * FROM weapon_maintenance_log WHERE weapon_id=%s ORDER BY performed_at DESC",(weapon["id"],))
-    inspections=fetch_all("SELECT * FROM weapon_inspections WHERE weapon_id=%s ORDER BY inspection_date DESC,created_at DESC",(weapon["id"],))
-    operations=fetch_all("""SELECT op.*,o.operation_code,o.title,o.operation_date FROM operation_participation op JOIN operations o ON o.id=op.operation_id
+    maintenance=safe_member_fetch_all("M16 maintenance history", "SELECT * FROM weapon_maintenance_log WHERE weapon_id=%s ORDER BY performed_at DESC",(weapon["id"],))
+    inspections=safe_member_fetch_all("M16 inspection history", "SELECT * FROM weapon_inspections WHERE weapon_id=%s ORDER BY inspection_date DESC,created_at DESC",(weapon["id"],))
+    operations=safe_member_fetch_all("M16 operation history", """SELECT op.*,o.operation_code,o.title,o.operation_date FROM operation_participation op JOIN operations o ON o.id=op.operation_id
       WHERE op.personnel_id=%s ORDER BY COALESCE(o.operation_date,CURRENT_DATE) DESC""",(p["id"],))
     return render_template("member_weapon_history.html",personnel=soldier_view(p),weapon=weapon,issue_history=issue_history,maintenance=maintenance,inspections=inspections,operations=operations)
 
-@app.get("/my-squad")
+@app.route("/my-squad", methods=["GET","POST"])
 @login_required
 def my_squad():
-    p=linked_personnel()
-    if not p: abort(403)
-    return render_template("member_formation.html",personnel=soldier_view(p),snapshot=member_formation_snapshot(p,"squad"),formation_type="SQUAD")
+    raw=linked_personnel()
+    if not raw: abort(403)
+    safe_member_panel("My Squad visit tracking", None, welcome_visit, raw["id"], "VIEW_MY_SQUAD")
+    personnel=soldier_view(raw)
+    roster, scope, team_filter, leadership_appt, actionable_ids=safe_member_panel("My Squad roster", ([],None,None,None,[]), squad_roster_for, raw)
+    rank=str(raw.get("rank_code") or "").upper()
+    can_act=rank in SQUAD_LEADERSHIP_RANKS and bool(leadership_appt) and bool(actionable_ids)
+    allowed_ids=set(actionable_ids)
+
+    if request.method=="POST":
+        if not can_act: abort(403)
+        target_id=str(request.form.get("personnel_id") or "")
+        if target_id not in allowed_ids or target_id==str(raw.get("id")): abort(403)
+        action=(request.form.get("quick_action") or "").upper().strip()
+        justification=(request.form.get("justification") or "").strip()
+        target=next((x for x in roster if str(x.get("id"))==target_id),None)
+        authority=f"{rank} {raw.get('last_name','')}".strip()
+        if not target or not justification: abort(400)
+        if action=="PROMOTION":
+            target_rank=(request.form.get("target_rank") or "").upper().strip()
+            if not target_rank: abort(400)
+            execute("""INSERT INTO personnel_recommendations(personnel_id,recommendation_type,recommended_action,justification,promotion_narrative,recommending_personnel_id,status)
+                       VALUES(%s,'PROMOTION',%s,%s,%s,%s,'PENDING')""",(target_id,f"PROMOTION TO {target_rank}",justification,justification,raw["id"]))
+            open_personnel_action(target_id,"PROMOTION",f"Promotion recommendation — {target_rank}","S-1","HIGH",authority,{"target_rank":target_rank,"justification":justification},source_key=f"SQUAD-PROMO:{target_id}:{target_rank}:{date.today()}")
+            flash("PROMOTION RECOMMENDATION FORWARDED TO S-1.","success")
+        elif action=="AWARD":
+            award_name=(request.form.get("award_name") or "").strip()
+            if not award_name: abort(400)
+            execute("""INSERT INTO personnel_recommendations(personnel_id,recommendation_type,recommended_action,justification,recommending_personnel_id,status)
+                       VALUES(%s,'AWARD',%s,%s,%s,'PENDING_S1')""",(target_id,award_name,justification,raw["id"]))
+            open_personnel_action(target_id,"AWARD",f"Award recommendation — {award_name}","S-1","NORMAL",authority,{"award_name":award_name,"justification":justification},source_key=f"SQUAD-AWARD:{target_id}:{award_name}:{date.today()}")
+            flash("AWARD RECOMMENDATION FORWARDED TO S-1.","success")
+        elif action=="LEADERSHIP_NOTE":
+            execute("""INSERT INTO leadership_performance_records(personnel_id,record_date,leadership_type,title,narrative,recorded_by)
+                       VALUES(%s,%s,'SQUAD LEADERSHIP','NCO LEADERSHIP NOTE',%s,%s)""",(target_id,date.today(),justification,authority))
+            write_service_entry(target_id,"LEADERSHIP","NCO LEADERSHIP NOTE",justification,authority)
+            flash("LEADERSHIP NOTE FILED.","success")
+        else:
+            abort(400)
+        return redirect(url_for("my_squad",soldier=target_id))
+
+    selected_id=str(request.args.get("soldier") or "")
+    selected=next((x for x in roster if str(x.get("id"))==selected_id),None) if selected_id else None
+    selected_view=soldier_view(selected) if selected else None
+    uniform_rows=[]; earned=[]
+    if selected:
+        uniform_rows, earned=safe_member_panel("My Squad ribbon rack", ([],[]), worn_ribbon_rows, selected["id"])
+    awards=safe_member_fetch_all("My Squad award catalog", "SELECT ribbon_name FROM ribbon_catalog WHERE is_active=TRUE ORDER BY sort_order,ribbon_name") or []
+    ranks=safe_member_fetch_all("My Squad rank catalog", "SELECT rank_code,rank_name,precedence FROM rank_catalog ORDER BY precedence") or []
+    return render_template("my_squad.html",personnel=personnel,soldiers=roster,scope=scope,team_filter=team_filter,
+                           leadership_appt=leadership_appt,actionable_ids=actionable_ids,
+                           can_act=can_act,selected=selected_view,uniform_ribbon_rows=uniform_rows,earned_ribbons=earned,
+                           awards=awards,ranks=ranks)
 
 @app.get("/my-platoon")
 @login_required
@@ -8975,8 +10911,9 @@ def hq_unit_identity():
 def my_unit():
     p=linked_personnel()
     if not p: abort(403)
+    safe_member_panel("My Unit visit tracking", None, welcome_visit, p["id"], "VIEW_MY_UNIT")
     # Assignment-scoped member view: only their own unit_code is visible.
-    members=fetch_all("SELECT id,rank_code,last_name,first_name,unit_code,platoon,squad,duty_position,mos_code FROM personnel WHERE separated_at IS NULL AND unit_code=%s ORDER BY platoon NULLS FIRST,squad NULLS FIRST,last_name",(p['unit_code'],))
+    members=safe_member_fetch_all("My Unit roster", """SELECT p.id,p.rank_code,p.last_name,p.first_name,p.unit_code,p.platoon,p.squad,p.duty_position,p.mos_code,COALESCE(rc.precedence,0) AS rank_precedence FROM personnel p LEFT JOIN rank_catalog rc ON rc.rank_code=p.rank_code WHERE p.separated_at IS NULL AND p.unit_code=%s ORDER BY COALESCE(rc.precedence,0) DESC,p.last_name,p.first_name""",(p['unit_code'],))
     return render_template('my_unit.html',personnel=soldier_view(p),members=members)
 
 
@@ -9132,7 +11069,16 @@ def recruiting_control():
                 execute("""UPDATE recruiting_cases SET status='REPLACEMENT_DEPOT',replacement_depot_entered_at=COALESCE(replacement_depot_entered_at,NOW()),
                            command_notes=%s,reviewed_by=%s,reviewed_at=NOW(),approved_at=COALESCE(approved_at,NOW()),
                            discord_join_error=NULL,credentials_delivery_error=NULL,updated_at=NOW() WHERE id=%s""",(remarks,authority,case_id))
-                flash('APPLICATION APPROVED. BATTALION CLERK WILL ADD THE RECRUIT TO DISCORD, ASSIGN REPLACEMENT DEPOT, OPEN THE 201 FILE, AND DELIVER LOGIN CREDENTIALS AUTOMATICALLY.','success')
+                # Approval itself opens the Website personnel/onboarding record immediately.
+                # Battalion Clerk still owns Discord guild join, role mirroring, and DM delivery.
+                try:
+                    approved_case=fetch_one('SELECT * FROM recruiting_cases WHERE id=%s',(case_id,))
+                    provision=_provision_replacement_personnel(approved_case,discord_user_id=approved_case.get('discord_user_id'),username=approved_case.get('discord_verified_username') or approved_case.get('discord_username_input'),display_name=approved_case.get('discord_verified_username'))
+                    if provision.get('ok'):
+                        _ensure_recruit_login_delivery(approved_case,provision)
+                except Exception:
+                    log.exception('Immediate Welcome Packet provisioning failed after approval case=%s',case_id)
+                flash('APPLICATION APPROVED. THE REPLACEMENT 201 FILE AND WELCOME PACKET ARE OPEN. BATTALION CLERK WILL COMPLETE DISCORD JOIN, ROLES, AND PRIVATE LOGIN DELIVERY AUTOMATICALLY.','success')
             else:
                 execute("UPDATE recruiting_cases SET status='APPROVED_AWAITING_DISCORD',command_notes=%s,reviewed_by=%s,reviewed_at=NOW(),approved_at=COALESCE(approved_at,NOW()),updated_at=NOW() WHERE id=%s",(remarks,authority,case_id))
                 flash('APPLICATION APPROVED. APPLICANT MUST VERIFY DISCORD BEFORE BATTALION CLERK CAN BEGIN REPLACEMENT PROCESSING.','success')
@@ -9164,6 +11110,42 @@ def recruiting_control():
 
 
 
+
+
+@app.post('/hq/recruiting/<case_id>/delete')
+@login_required
+@role_required('battalion_hq')
+def recruiting_case_delete(case_id):
+    """Permanently remove an unprovisioned recruiting application.
+
+    Once a case owns a personnel record, history is preserved and Command must use
+    normal personnel/separation workflows instead of destructive deletion.
+    """
+    case=fetch_one("SELECT * FROM recruiting_cases WHERE id=%s",(case_id,))
+    if not case:
+        abort(404)
+    confirm=(request.form.get('confirm_case_number') or '').strip().upper()
+    expected=str(case.get('case_number') or '').strip().upper()
+    if not expected or confirm != expected:
+        flash('DELETE CANCELLED. TYPE THE EXACT CASE NUMBER TO PERMANENTLY REMOVE THIS APPLICATION.','danger')
+        return redirect(request.referrer or url_for('recruiting_control'))
+    if case.get('personnel_id'):
+        flash('THIS APPLICATION IS LINKED TO AN OFFICIAL PERSONNEL RECORD AND CANNOT BE HARD-DELETED. USE THE PERSONNEL / SEPARATION WORKFLOW TO PRESERVE THE SERVICE RECORD.','warning')
+        return redirect(url_for('recruiting_case_archive',case_id=case_id))
+    authority=session.get('display_name') or session.get('username') or 'BATTALION HEADQUARTERS'
+    # A pre-provisioning case should have no official personnel dependencies. If a
+    # partially-created Welcome Packet exists without personnel, detach/remove it first.
+    safe_member_panel('Recruiting delete orphan Welcome Packet', None, execute, 'DELETE FROM welcome_packets WHERE recruiting_case_id=%s AND personnel_id IS NULL', (case_id,))
+    deleted=fetch_one('DELETE FROM recruiting_cases WHERE id=%s AND personnel_id IS NULL RETURNING case_number',(case_id,))
+    if not deleted:
+        flash('APPLICATION COULD NOT BE REMOVED BECAUSE IT IS NOW LINKED TO A PERSONNEL RECORD.','warning')
+        return redirect(url_for('recruiting_control'))
+    try:
+        staff_log('HQ','RECRUITING APPLICATION DELETED',f"{deleted.get('case_number')} permanently removed before personnel provisioning.",authority,details={'case_number':deleted.get('case_number')})
+    except Exception:
+        log.exception('Recruiting delete audit log failed for %s',case_id)
+    flash(f"APPLICATION {deleted.get('case_number')} PERMANENTLY REMOVED.",'success')
+    return redirect(url_for('recruiting_control'))
 
 
 @app.get('/hq/recruiting/<case_id>')
@@ -9291,6 +11273,28 @@ def clerk_recruiting_verify():
     return {'ok':True,'case_number':case['case_number'],'status':new_status}
 
 
+@app.get('/internal/clerk/recruiting/pending-entry')
+def clerk_recruiting_pending_entry():
+    """Applicants are admitted to Discord as soon as the website application is filed.
+
+    This endpoint deliberately returns only pre-approval Recruiting Cases. No 201 File,
+    Battle Roster credential, Replacement status, rank, MOS, or unit assignment is created
+    here. Discord is the communications bridge while Command reviews the application.
+    """
+    if not _clerk_authorized(): return {'ok':False,'error':'authorization required'},401
+    guild_id=request.args.get('guild_id',type=int)
+    rows=fetch_all("""SELECT id,case_number,public_token,discord_user_id,discord_verified_username,status,
+                             discord_joined_at,discord_join_error,discord_join_last_attempt_at
+                      FROM recruiting_cases
+                      WHERE status IN ('SUBMITTED','DISCORD_VERIFIED','PENDING_COMMAND','MORE_INFO_REQUIRED')
+                        AND discord_user_id IS NOT NULL
+                        AND (guild_id=%s OR guild_id IS NULL)
+                        AND (discord_joined_at IS NULL
+                             AND (discord_join_last_attempt_at IS NULL OR discord_join_last_attempt_at < NOW()-INTERVAL '2 minutes'))
+                      ORDER BY created_at ASC""",(guild_id,))
+    return {'ok':True,'cases':rows}
+
+
 @app.get('/internal/clerk/recruiting/notifications')
 def clerk_recruiting_notifications():
     if not _clerk_authorized(): return {'ok':False,'error':'authorization required'},401
@@ -9348,6 +11352,8 @@ def _provision_replacement_personnel(case, *, guild_id=None, discord_user_id=Non
                            ON CONFLICT(guild_id,discord_user_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,linked_at=NOW()""",
                         (guild_id,discord_user_id,personnel_id))
             execute("UPDATE recruiting_cases SET personnel_id=%s,status='APPROVED_AWAITING_PROCESSING',guild_id=COALESCE(%s,guild_id),updated_at=NOW() WHERE id=%s",(personnel_id,guild_id,case['id']))
+            try: ensure_welcome_packet(personnel_id,case.get('id'))
+            except Exception: log.exception('Welcome Packet ensure failed for existing replacement %s',personnel_id)
             return {'ok':True,'created':False,'personnel_id':str(personnel_id),'personnel':person}
 
     preferred=(case.get('discord_verified_username') or display_name or username or case.get('discord_username_input') or 'Replacement').strip()
@@ -9378,12 +11384,16 @@ def _provision_replacement_personnel(case, *, guild_id=None, discord_user_id=Non
     execute("""INSERT INTO personnel_training_records(personnel_id,program_code,status,started_at)
                VALUES(%s,'REPLACEMENT','IN PROGRESS',CURRENT_DATE) ON CONFLICT(personnel_id,program_code) DO NOTHING""",(person['id'],))
     write_service_entry(person['id'],'ARRIVAL','REPLACEMENT DETACHMENT — 201 FILE OPENED',
-        f"Approved recruit entered on battalion rolls as PVT and placed in Replacement Detachment under Recruiting Case {case.get('case_number') or 'N/A'}. Permanent MOS and formation assignment pending.",
+        f"Approved recruit entered on the Battle Roster as PVT and placed in Replacement Detachment under Recruiting Case {case.get('case_number') or 'N/A'}. Permanent MOS and formation assignment pending.",
         'BATTALION HEADQUARTERS')
     initial_order=replacement_orders_for(person['id'])
     enqueue_discord_role_sync(person['id'],'APPROVED REPLACEMENT PROVISIONED')
     staff_log('S-1','NEW REPLACEMENT',f"PVT {person.get('last_name','')} entered Replacement Detachment",'BATTALION CLERK',person['id'],
               (initial_order or {}).get('document_number') if initial_order else None,{'case_number':case.get('case_number')})
+    try:
+        ensure_welcome_packet(person['id'],case.get('id'))
+    except Exception:
+        log.exception('Welcome Packet generation failed for new replacement %s',person['id'])
     return {'ok':True,'created':True,'personnel_id':str(person['id']),'personnel':person,'roster':card,'field_code':field_code,
             'initial_order':initial_order}
 
@@ -9428,8 +11438,9 @@ def clerk_recruiting_join_authorization(case_id):
     if not _clerk_authorized(): return {'ok':False,'error':'authorization required'},401
     case=fetch_one("SELECT * FROM recruiting_cases WHERE id=%s",(case_id,))
     if not case: return {'ok':False,'error':'recruiting case not found'},404
-    if str(case.get('status') or '').upper() not in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
-        return {'ok':False,'error':'recruiting case is not approved for Discord entry'},409
+    allowed_join_statuses={'SUBMITTED','DISCORD_VERIFIED','PENDING_COMMAND','MORE_INFO_REQUIRED','REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}
+    if str(case.get('status') or '').upper() not in allowed_join_statuses:
+        return {'ok':False,'error':'recruiting case is not eligible for Discord entry'},409
     if not case.get('discord_user_id'):
         return {'ok':False,'error':'verified Discord identity required'},409
     scope=str(case.get('discord_oauth_scope') or '')
@@ -9543,6 +11554,18 @@ def clerk_personnel_action_suspense():
                       ORDER BY pa.due_date,pa.priority DESC""")
     return {'ok':True,'actions':rows}
 
+# Run one idempotent operation repair pass on every deployment/startup. This
+# backfills historical verified attendance and missing M16 rounds from the existing
+# Battalion Clerk attendance ledger, then removes yesterday's operations from the
+# active schedule. Failures are logged but never prevent the website from starting.
+try:
+    if database_ready():
+        _operation_boot_repair=run_operation_maintenance("DEPLOYMENT RECONCILIATION")
+        log.info("Operation reconciliation complete: %s",_operation_boot_repair)
+except Exception:
+    log.exception("Operation reconciliation failed during startup; Clerk maintenance will retry.")
+
+
 @app.get("/health")
 def health():
     missing_oauth = []
@@ -9560,5 +11583,249 @@ def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# Welcome Packet / New Soldier Onboarding
+# ---------------------------------------------------------------------------
+WELCOME_PHASES = [
+    ("REPLACEMENT_ORIENTATION", "Replacement Detachment Orientation"),
+    ("MOVEMENT_ASSIGNMENT", "Movement & Assignment"),
+    ("UNIT_ORIENTATION", "Unit Orientation"),
+]
+WELCOME_TASK_DEFS = [
+    ("REVIEW_REPLACEMENT_PROCESS","REPLACEMENT_ORIENTATION","Understand Replacement Detachment","You are attached to Replacement Detachment while S-1 completes your permanent assignment.",None,"ACK",10),
+    ("WEBSITE_LOGIN","REPLACEMENT_ORIENTATION","Report to the Battalion Website","Your first verified Member Access login is recorded automatically.","my_soldier_record","AUTO",20),
+    ("VIEW_WALL_LOCKER","REPLACEMENT_ORIENTATION","Inspect Your Wall Locker","Open My Soldier and learn where your issued equipment, orders, and record live.","my_soldier_record","VISIT",30),
+    ("VIEW_201","REPLACEMENT_ORIENTATION","Review Your 201 File","Open your permanent personnel record and confirm your identity and current status.","my_201_file","VISIT",40),
+    ("STANDING_ORDERS","REPLACEMENT_ORIENTATION","Acknowledge Standing Orders","Read and acknowledge the battalion standing orders.","my_soldier_record","SYSTEM",50),
+    ("VIEW_TRAINING","REPLACEMENT_ORIENTATION","Review Initial Training","Open Training and review your current requirements.","training","VISIT",60),
+    ("REVIEW_DISCORD","REPLACEMENT_ORIENTATION","Review Discord Channels","Confirm you understand that Discord delivers notices while the Website is the official record.",None,"ACK",70),
+    ("COMPANY_ASSIGNED","MOVEMENT_ASSIGNMENT","Receive Company Assignment","This completes automatically when S-1 assigns you to a line company.","my_unit","SYSTEM",10),
+    ("REVIEW_MOVEMENT_ORDERS","MOVEMENT_ASSIGNMENT","Review Movement Orders","Open your Orders after Company assignment.","orders","VISIT",20),
+    ("VIEW_MY_UNIT","MOVEMENT_ASSIGNMENT","Report to My Unit","Review your Company and Platoon information.","my_unit","VISIT",30),
+    ("SQUAD_ASSIGNED","UNIT_ORIENTATION","Receive Platoon / Squad Assignment","This completes automatically when your permanent squad assignment is on file.","my_squad","SYSTEM",10),
+    ("VIEW_MY_SQUAD","UNIT_ORIENTATION","Meet Your Squad","Open My Squad and review your immediate leadership and teammates.","my_squad","VISIT",20),
+    ("M16_ISSUED","UNIT_ORIENTATION","Receive Your Issued M16","This completes automatically when S-4 places an active M16 issue on your personnel record.","my_weapon_service_history","SYSTEM",25),
+    ("VIEW_M16","UNIT_ORIENTATION","Review Your Issued M16","Inspect your weapon status and maintenance responsibilities.","my_weapon_service_history","VISIT",30),
+    ("VIEW_OPERATIONS","UNIT_ORIENTATION","Review Operations","Open Operations and understand how scheduled duty and attendance credit work.","orders","VISIT",40),
+    ("ACK_CHAIN","UNIT_ORIENTATION","Acknowledge Chain of Command","Confirm you know who you report to in your assigned formation.","my_squad","ACK",50),
+    ("REPORT_FOR_DUTY","UNIT_ORIENTATION","Report for Duty","Final acknowledgment that your onboarding is complete and you are ready to serve with your assigned unit.",None,"FINAL",60),
+]
+
+def _welcome_person(personnel_id):
+    return fetch_one("SELECT * FROM personnel WHERE id=%s",(personnel_id,)) if personnel_id else None
+
+def ensure_welcome_packet(personnel_id, recruiting_case_id=None):
+    if not personnel_id or not database_ready(): return None
+    pkt=fetch_one("SELECT * FROM welcome_packets WHERE personnel_id=%s",(personnel_id,))
+    created=False
+    if not pkt:
+        pkt=fetch_one("""INSERT INTO welcome_packets(personnel_id,recruiting_case_id) VALUES(%s,%s) RETURNING *""",(personnel_id,recruiting_case_id))
+        created=True
+    elif recruiting_case_id and not pkt.get('recruiting_case_id'):
+        execute("UPDATE welcome_packets SET recruiting_case_id=%s,updated_at=NOW() WHERE id=%s",(recruiting_case_id,pkt['id']))
+        pkt=fetch_one("SELECT * FROM welcome_packets WHERE id=%s",(pkt['id'],))
+    for code,phase,title,desc,target,mode,order in WELCOME_TASK_DEFS:
+        execute("""INSERT INTO welcome_packet_tasks(packet_id,task_code,phase_code,title,description,target_endpoint,completion_mode,sort_order,status)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(packet_id,task_code) DO NOTHING""",
+                (pkt['id'],code,phase,title,desc,target,mode,order,'OPEN' if phase=='REPLACEMENT_ORIENTATION' else 'LOCKED'))
+    # Existing personnel records can satisfy system milestones without staff intervention.
+    progress=fetch_one("SELECT rules_acknowledged_at FROM personnel_progress_control WHERE personnel_id=%s",(personnel_id,)) or {}
+    if progress.get('rules_acknowledged_at'): welcome_complete_task(personnel_id,'STANDING_ORDERS','SYSTEM',reconcile=False)
+    pkt=reconcile_welcome_packet(personnel_id)
+    return pkt
+
+def _welcome_notify(packet, event_type, title, message, suffix):
+    if not packet: return
+    key=f"WELCOME:{packet['personnel_id']}:{suffix}"
+    execute("""INSERT INTO welcome_packet_notifications(packet_id,personnel_id,event_key,event_type,title,message)
+               VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(event_key) DO NOTHING""",
+            (packet['id'],packet['personnel_id'],key,event_type,title,message))
+
+def welcome_complete_task(personnel_id, task_code, completed_by='SYSTEM', *, reconcile=True):
+    pkt=fetch_one("SELECT * FROM welcome_packets WHERE personnel_id=%s",(personnel_id,))
+    if not pkt: return None
+    execute("""UPDATE welcome_packet_tasks SET status='COMPLETE',completed_at=COALESCE(completed_at,NOW()),completed_by=COALESCE(completed_by,%s),updated_at=NOW()
+               WHERE packet_id=%s AND task_code=%s AND status NOT IN ('COMPLETE','WAIVED')""",(completed_by,pkt['id'],task_code))
+    execute("UPDATE welcome_packets SET last_activity_at=NOW(),updated_at=NOW() WHERE id=%s",(pkt['id'],))
+    return reconcile_welcome_packet(personnel_id) if reconcile else pkt
+
+def welcome_visit(personnel_id, task_code):
+    if not personnel_id: return
+    try:
+        if not fetch_one("SELECT 1 FROM welcome_packets WHERE personnel_id=%s",(personnel_id,)):
+            return
+        welcome_complete_task(personnel_id,task_code,'SOLDIER')
+    except Exception:
+        log.exception('Welcome Packet visit milestone failed personnel=%s task=%s',personnel_id,task_code)
+
+def _welcome_phase_required_done(packet_id, phase):
+    row=fetch_one("""SELECT COUNT(*) FILTER (WHERE required=TRUE) AS total,
+                            COUNT(*) FILTER (WHERE required=TRUE AND status IN ('COMPLETE','WAIVED')) AS done
+                     FROM welcome_packet_tasks WHERE packet_id=%s AND phase_code=%s""",(packet_id,phase)) or {}
+    return int(row.get('total') or 0)>0 and int(row.get('total') or 0)==int(row.get('done') or 0)
+
+def reconcile_welcome_packet(personnel_id):
+    pkt=fetch_one("SELECT * FROM welcome_packets WHERE personnel_id=%s",(personnel_id,))
+    if not pkt: return None
+    person=_welcome_person(personnel_id) or {}
+    company=str(person.get('unit_code') or '')
+    formation=permanent_formation_state(person) if person else {}
+    has_company=bool(formation.get('company_ok') or formation.get('special_assignment'))
+    has_squad=bool(formation.get('squad_ok') or formation.get('special_assignment'))
+    progress=fetch_one("SELECT rules_acknowledged_at FROM personnel_progress_control WHERE personnel_id=%s",(personnel_id,)) or {}
+    if progress.get('rules_acknowledged_at'):
+        welcome_complete_task(personnel_id,'STANDING_ORDERS','SYSTEM',reconcile=False)
+    if has_company:
+        welcome_complete_task(personnel_id,'COMPANY_ASSIGNED','SYSTEM',reconcile=False)
+    if has_squad:
+        welcome_complete_task(personnel_id,'SQUAD_ASSIGNED','SYSTEM',reconcile=False)
+    try:
+        if current_weapon_for(person): welcome_complete_task(personnel_id,'M16_ISSUED','SYSTEM',reconcile=False)
+    except Exception:
+        log.exception('Welcome Packet M16 issue reconciliation failed for %s',personnel_id)
+
+    phase1=_welcome_phase_required_done(pkt['id'],'REPLACEMENT_ORIENTATION')
+    if phase1 and has_company:
+        execute("UPDATE welcome_packet_tasks SET status='OPEN' WHERE packet_id=%s AND phase_code='MOVEMENT_ASSIGNMENT' AND status='LOCKED'",(pkt['id'],))
+    phase2=_welcome_phase_required_done(pkt['id'],'MOVEMENT_ASSIGNMENT')
+    if phase1 and phase2 and has_squad:
+        execute("UPDATE welcome_packet_tasks SET status='OPEN' WHERE packet_id=%s AND phase_code='UNIT_ORIENTATION' AND status='LOCKED'",(pkt['id'],))
+    phase3=_welcome_phase_required_done(pkt['id'],'UNIT_ORIENTATION')
+
+    current='REPLACEMENT_ORIENTATION'; status='IN_PROGRESS'
+    if phase1 and not has_company:
+        current='MOVEMENT_ASSIGNMENT'; status='AWAITING_ASSIGNMENT'
+        execute("UPDATE welcome_packets SET replacement_completed_at=COALESCE(replacement_completed_at,NOW()) WHERE id=%s",(pkt['id'],))
+    elif phase1 and has_company and not phase2:
+        current='MOVEMENT_ASSIGNMENT'; status='IN_PROGRESS'
+        execute("UPDATE welcome_packets SET replacement_completed_at=COALESCE(replacement_completed_at,NOW()),assignment_phase_started_at=COALESCE(assignment_phase_started_at,NOW()) WHERE id=%s",(pkt['id'],))
+    elif phase1 and phase2 and not has_squad:
+        current='UNIT_ORIENTATION'; status='AWAITING_ASSIGNMENT'
+    elif phase1 and phase2 and has_squad and not phase3:
+        current='UNIT_ORIENTATION'; status='IN_PROGRESS'
+        execute("UPDATE welcome_packets SET unit_orientation_started_at=COALESCE(unit_orientation_started_at,NOW()) WHERE id=%s",(pkt['id'],))
+    elif phase1 and phase2 and phase3:
+        current='COMPLETE'; status='COMPLETE'
+        execute("UPDATE welcome_packets SET completed_at=COALESCE(completed_at,NOW()) WHERE id=%s",(pkt['id'],))
+
+    old_phase=pkt.get('current_phase'); old_status=pkt.get('status')
+    execute("""UPDATE welcome_packets SET current_phase=%s,status=%s,
+               completed_at=CASE WHEN %s='COMPLETE' THEN COALESCE(completed_at,NOW()) ELSE NULL END,updated_at=NOW() WHERE id=%s""",
+            (current,status,status,pkt['id']))
+    pkt=fetch_one("SELECT * FROM welcome_packets WHERE id=%s",(pkt['id'],))
+    if old_phase!=current or old_status!=status:
+        if phase1 and status=='AWAITING_ASSIGNMENT' and not has_company:
+            _welcome_notify(pkt,'PHASE_COMPLETE','Replacement Orientation Complete','Your Replacement Detachment orientation is complete. Stand by for permanent Company assignment.','REPLACEMENT-COMPLETE')
+            try:
+                if not fetch_one("SELECT 1 FROM personnel_service_history WHERE personnel_id=%s AND title='REPLACEMENT ORIENTATION COMPLETE' LIMIT 1",(personnel_id,)):
+                    write_service_entry(personnel_id,'TRAINING','REPLACEMENT ORIENTATION COMPLETE','Initial Welcome Packet orientation requirements completed. Soldier is awaiting permanent assignment.','BATTALION HEADQUARTERS')
+            except Exception: pass
+        elif current=='MOVEMENT_ASSIGNMENT' and has_company:
+            _welcome_notify(pkt,'ASSIGNMENT','Movement Orders Received',f"You have been assigned to {company}. Open your Welcome Packet to review movement orders and report to your unit.",f"COMPANY:{company}")
+        elif current=='UNIT_ORIENTATION' and has_squad:
+            _welcome_notify(pkt,'UNIT_ASSIGNMENT','Final Formation Assignment Posted',f"Your platoon/squad assignment is on file. Open your Welcome Packet to meet your leadership and complete unit orientation.",f"SQUAD:{person.get('platoon')}:{person.get('squad')}")
+        elif status=='COMPLETE':
+            _welcome_notify(pkt,'COMPLETE','Welcome Packet Complete','Orientation is complete. Your Report for Duty has been filed in your permanent service record.','COMPLETE')
+            try:
+                if not fetch_one("SELECT 1 FROM personnel_service_history WHERE personnel_id=%s AND title='WELCOME PACKET / ORIENTATION COMPLETE' LIMIT 1",(personnel_id,)):
+                    write_service_entry(personnel_id,'ADMIN','WELCOME PACKET / ORIENTATION COMPLETE','Soldier completed Replacement Detachment and unit orientation and reported for duty with the assigned formation.','BATTALION HEADQUARTERS')
+            except Exception: pass
+    return pkt
+
+def welcome_packet_context(personnel_id):
+    pkt=fetch_one("SELECT * FROM welcome_packets WHERE personnel_id=%s",(personnel_id,))
+    if not pkt: return {'packet':None,'tasks':[],'phases':[],'total':0,'done':0,'percent':0,'personnel':_welcome_person(personnel_id)}
+    pkt=reconcile_welcome_packet(personnel_id)
+    tasks=fetch_all("SELECT * FROM welcome_packet_tasks WHERE packet_id=%s ORDER BY CASE phase_code WHEN 'REPLACEMENT_ORIENTATION' THEN 1 WHEN 'MOVEMENT_ASSIGNMENT' THEN 2 ELSE 3 END,sort_order",(pkt['id'],))
+    phases=[]
+    for code,label in WELCOME_PHASES:
+        rows=[t for t in tasks if t['phase_code']==code]
+        total=sum(1 for t in rows if t.get('required')); done=sum(1 for t in rows if t.get('required') and t.get('status') in {'COMPLETE','WAIVED'})
+        phases.append({'code':code,'label':label,'tasks':rows,'total':total,'done':done,'percent':int(done*100/total) if total else 0,'locked':all(t.get('status')=='LOCKED' for t in rows) if rows else True})
+    total=sum(p['total'] for p in phases); done=sum(p['done'] for p in phases)
+    return {'packet':pkt,'tasks':tasks,'phases':phases,'total':total,'done':done,'percent':int(done*100/total) if total else 0,'personnel':_welcome_person(personnel_id)}
+
+@app.route('/welcome-packet',methods=['GET','POST'])
+@login_required
+def welcome_packet():
+    if session.get('access_role') not in {'member','nco','company_hq'}: abort(403)
+    pid=session.get('personnel_id'); person=linked_personnel()
+    if not pid or not person: abort(403)
+    ctx=welcome_packet_context(pid)
+    if not ctx.get('packet'):
+        flash('NO ACTIVE WELCOME PACKET IS REQUIRED FOR THIS SOLDIER RECORD.','warning')
+        return redirect(url_for('my_soldier_record'))
+    if request.method=='POST':
+        code=(request.form.get('task_code') or '').strip().upper()
+        task=fetch_one("SELECT t.* FROM welcome_packet_tasks t JOIN welcome_packets p ON p.id=t.packet_id WHERE p.personnel_id=%s AND t.task_code=%s",(pid,code))
+        if not task or task.get('status')=='LOCKED': abort(400)
+        if task.get('completion_mode') in {'ACK','FINAL'}:
+            # Final report-for-duty only unlocks after every other required task in the phase is done.
+            if code=='REPORT_FOR_DUTY':
+                remaining=fetch_one("SELECT COUNT(*) AS n FROM welcome_packet_tasks WHERE packet_id=%s AND phase_code='UNIT_ORIENTATION' AND required=TRUE AND task_code<>'REPORT_FOR_DUTY' AND status NOT IN ('COMPLETE','WAIVED')",(task['packet_id'],))
+                if int((remaining or {}).get('n') or 0)>0:
+                    flash('COMPLETE THE REMAINING UNIT ORIENTATION ITEMS BEFORE REPORTING FOR DUTY.','warning'); return redirect(url_for('welcome_packet'))
+            welcome_complete_task(pid,code,f"{person.get('rank_code') or ''} {person.get('last_name') or ''}".strip())
+            flash('WELCOME PACKET ITEM COMPLETED AND FILED.','success')
+        return redirect(url_for('welcome_packet'))
+    return render_template('welcome_packet.html',**ctx)
+
+@app.get('/staff/onboarding')
+@login_required
+@role_required('s1')
+def staff_onboarding():
+    people=fetch_all("""SELECT p.*,wp.id packet_id,wp.current_phase,wp.status onboarding_status,wp.last_activity_at,wp.completed_at,
+                       (SELECT COUNT(*) FROM welcome_packet_tasks t WHERE t.packet_id=wp.id AND t.required=TRUE) total_tasks,
+                       (SELECT COUNT(*) FROM welcome_packet_tasks t WHERE t.packet_id=wp.id AND t.required=TRUE AND t.status IN ('COMPLETE','WAIVED')) done_tasks
+                       FROM welcome_packets wp JOIN personnel p ON p.id=wp.personnel_id
+                       WHERE p.separated_at IS NULL ORDER BY CASE wp.status WHEN 'IN_PROGRESS' THEN 0 WHEN 'AWAITING_ASSIGNMENT' THEN 1 ELSE 2 END,wp.last_activity_at DESC""")
+    return render_template('staff_onboarding.html',rows=people)
+
+@app.route('/staff/onboarding/<personnel_id>',methods=['GET','POST'])
+@login_required
+@role_required('s1')
+def staff_welcome_packet(personnel_id):
+    ctx=welcome_packet_context(personnel_id)
+    if not ctx.get('packet'): abort(404)
+    if request.method=='POST':
+        code=(request.form.get('task_code') or '').strip().upper(); action=(request.form.get('action') or '').upper(); authority=session.get('display_name') or session.get('username') or 'BATTALION HEADQUARTERS'
+        task=fetch_one("SELECT * FROM welcome_packet_tasks WHERE packet_id=%s AND task_code=%s",(ctx['packet']['id'],code))
+        if not task: abort(404)
+        if action=='COMPLETE': welcome_complete_task(personnel_id,code,authority)
+        elif action=='WAIVE':
+            execute("UPDATE welcome_packet_tasks SET status='WAIVED',waived_at=NOW(),waived_by=%s,updated_at=NOW() WHERE id=%s",(authority,task['id'])); reconcile_welcome_packet(personnel_id)
+        elif action=='RESET':
+            execute("UPDATE welcome_packet_tasks SET status=%s,completed_at=NULL,completed_by=NULL,waived_at=NULL,waived_by=NULL,updated_at=NOW() WHERE id=%s",('OPEN' if task['phase_code']=='REPLACEMENT_ORIENTATION' else 'LOCKED',task['id'])); reconcile_welcome_packet(personnel_id)
+        staff_log('S-1','WELCOME PACKET',f"{action} — {task['title']}",authority,personnel_id,details={'task_code':code})
+        return redirect(url_for('staff_welcome_packet',personnel_id=personnel_id))
+    return render_template('staff_welcome_packet.html',**ctx)
+
+@app.get('/internal/clerk/welcome-packet/notifications')
+def clerk_welcome_packet_notifications():
+    if not _clerk_authorized(): return {'ok':False,'error':'authorization required'},401
+    guild_id=request.args.get('guild_id',type=int)
+    # One useful reminder per stalled day; never nag Soldiers who already finished
+    # their current phase and are waiting on S-1 assignment.
+    execute("""INSERT INTO welcome_packet_notifications(packet_id,personnel_id,event_key,event_type,title,message)
+               SELECT wp.id,wp.personnel_id,'WELCOME:'||wp.personnel_id::text||':REMINDER:'||CURRENT_DATE::text,'REMINDER',
+                      'Welcome Packet Action Required','Your Welcome Packet still has required orientation items open. Sign in to the battalion website to continue.'
+               FROM welcome_packets wp
+               WHERE wp.status='IN_PROGRESS' AND wp.last_activity_at < NOW()-INTERVAL '24 hours'
+               ON CONFLICT(event_key) DO NOTHING""")
+    rows=fetch_all("""SELECT n.id,n.event_type,n.title,n.message,n.personnel_id,wml.discord_user_id,wml.guild_id
+                      FROM welcome_packet_notifications n JOIN website_member_links wml ON wml.personnel_id=n.personnel_id
+                      WHERE n.delivered_at IS NULL AND (wml.guild_id=%s OR %s IS NULL) ORDER BY n.created_at ASC LIMIT 100""",(guild_id,guild_id))
+    return {'ok':True,'notifications':rows}
+
+@app.post('/internal/clerk/welcome-packet/notifications/<notification_id>/delivered')
+def clerk_welcome_packet_notification_delivered(notification_id):
+    if not _clerk_authorized(): return {'ok':False,'error':'authorization required'},401
+    data=request.get_json(silent=True) or {}; ok=bool(data.get('ok',True))
+    execute("UPDATE welcome_packet_notifications SET delivered_at=NOW(),delivery_error=%s WHERE id=%s",((None if ok else (data.get('error') or 'Discord delivery failed')),notification_id))
+    return {'ok':True}
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=CONFIG.port, debug=True)
+
+

@@ -1,0 +1,21 @@
+STAFF 201 FILE / ACTION SOLDIER OVERHAUL — 2026-08-22
+
+PURPOSE
+Make the individual Soldier 201 File the primary staff action hub while preserving the existing authoritative personnel workflows and Discord role synchronization.
+
+CHANGES
+- Removed duplicate direct Award / Command Remark / Open Personnel Action forms from the 201 File.
+- Added one compact ACTION SOLDIER command hub at the top of the 201 File.
+- Added at-a-glance Rank, Assignment, Billet, and Discord Sync status.
+- Added primary links: Action Soldier, Formation Control, View Record.
+- Added quick shortcuts to Personnel Control, Award, Training, M16/S-4, and File Note when authorized.
+- Personnel Action Engine now presents a reduced action menu; assignment/rank/billet/MOS/status are consolidated under Personnel Control.
+- Personnel Control preview emphasizes actual changed fields.
+- No-op Personnel Control submissions no longer create unnecessary Discord sync jobs or audit entries.
+- After filing, Action Soldier reopens the action just used.
+- Existing Website -> Discord canonical role-sync queue remains authoritative.
+
+SYSTEM OWNERSHIP
+- 201 File: individual Soldier action hub.
+- Formation Assignment Control: formation-wide billet filling and movement.
+- Battalion Clerk: mirrors authoritative Website rank/MOS/formation/team/appointment changes to Discord.

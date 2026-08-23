@@ -1,7 +1,20 @@
-1/5 CAV BATTALION CLERK — OPERATION MAINTENANCE UPDATE
+1/5 CAV — OPERATION ATTENDANCE / M16 / ARCHIVE REPAIR
 2026-08-22
 
-- Added recurring 10-minute operation maintenance reconciliation against the Website system of record.
-- Reconciles existing attendance -> operation history -> M16 round ledger.
-- Completes ended operations and archives stale past operations through the Website maintenance endpoint.
-- Existing recruiting auto-Discord-join / credential-delivery pipeline is retained.
+FIXED
+- Any verified Battalion Clerk OPERATION voice presence now creates/updates an operation history record immediately.
+- Presence states: TRACKED PRESENCE -> PARTIAL / LATE -> FULL CREDIT.
+- Full credit remains threshold-controlled; partial presence does not inflate credited-operation statistics.
+- M16 rounds accrue proportionally to verified attendance and reach the full configured rounds_per_soldier at the full-credit threshold.
+- Operation round reconciliation is idempotent; existing rounds are never double-added.
+- Historical repair scans existing battalion_event_attendance rows and backfills missing operation participation and M16 round events.
+- Historical round repair selects the rifle issued on the operation date when weapon issue history exists, falling back to the current issue only when necessary.
+- Ended Clerk operation events are automatically closed and their linked operation becomes COMPLETED.
+- On the next calendar day, completed/stale operations become ARCHIVED and no longer appear as scheduled/current.
+- Member Current Orders excludes ended/archived operations.
+- Member operation history now shows verified partial attendance instead of hiding PARTIAL / LATE rows.
+- Added protected Clerk maintenance endpoint for recurring reconciliation.
+- Deployment startup runs one idempotent historical repair pass automatically.
+
+RETROACTIVE LIMIT
+The repair can only credit historical attendance that exists in Battalion Clerk's persisted attendance ledger. It does not fabricate attendance when no verified historical record exists.

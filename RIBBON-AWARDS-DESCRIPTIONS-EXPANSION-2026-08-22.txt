@@ -1,0 +1,16 @@
+1/5 CAV — RIBBON AWARDS DESCRIPTIONS EXPANSION
+2026-08-22
+
+Scope:
+- Preserved all existing ribbon codes, precedence, images, personnel ribbon records, wear/not-wear behavior, uniform rack behavior, 201 File history, and award automation.
+- Added ribbon_catalog.description_text, earning_text, and award_type_label with safe IF NOT EXISTS migrations.
+- Expanded all 11 active ribbons with distinct recognition and earning guidance.
+- Added visible award classifications: PROGRESSION AWARD, CAMPAIGN AWARD, VERIFICATION AWARD, COMMAND AWARD.
+- Public Awards page now displays WHAT THIS RIBBON RECOGNIZES, HOW TO EARN IT, and OFFICIAL REQUIREMENT.
+- Existing automation_mode remains authoritative and unchanged.
+
+Validation:
+- app.py / database.py compile: PASS
+- 73 Jinja templates parse with registered project filter compatibility: PASS
+- All 11 ribbon catalog rows retained: PASS
+- Existing ribbon codes unchanged: PASS

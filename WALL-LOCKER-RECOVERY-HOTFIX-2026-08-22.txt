@@ -1,0 +1,15 @@
+WALL LOCKER RECOVERY MODE HOTFIX — 22 AUG 2026
+
+PURPOSE
+Restores the full member Wall Locker when an optional/extended module has a live Railway schema or data error.
+
+FIXES
+- Optional Wall Locker database panels are now failure-isolated.
+- Welcome Packet visit-tracking can no longer block Wall Locker access.
+- Core Soldier Record, M16, uniform, awards, operations, training, history, milestones and other optional modules no longer share one fatal query chain.
+- A failing optional panel logs its own diagnostic reference and returns a safe empty/default value instead of forcing the entire page into 201 File Recovery Mode.
+- Existing recovery mode remains available only for genuinely fatal core/render failures.
+
+UPLOAD
+For the smallest update, upload app.py to the ROOT of the Website GitHub repository, replacing the current app.py.
+No static-folder upload is required for this hotfix.
