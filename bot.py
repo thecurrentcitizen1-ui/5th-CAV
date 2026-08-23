@@ -3672,13 +3672,30 @@ async def hll_link_member(interaction:discord.Interaction, member:discord.Member
         await interaction.followup.send(f"Link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
     await interaction.followup.send(f"Linked **{result.get('soldier')}** to SteamID64 `{result.get('steam_id')}`.",ephemeral=True)
 
-@bot.tree.command(name='hll-link-console', description='Staff: link an Xbox or PS5 Soldier by their in-game gamertag.')
+@bot.tree.command(name='hll-link-console', description='Link your Xbox or PS5 account to your 1/5 CAV Soldier Record.')
+@app_commands.describe(platform='Your console platform',gamertag='Your Gamertag / PSN Online ID exactly as it appears in-game')
+@app_commands.choices(platform=[
+    app_commands.Choice(name='Xbox', value='XBOX'),
+    app_commands.Choice(name='PlayStation 5', value='PS5'),
+])
+async def hll_link_console(interaction:discord.Interaction, platform:app_commands.Choice[str], gamertag:str):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.link_console_personnel(interaction.guild.id,interaction.user.id,platform.value,gamertag,f'DISCORD CONSOLE SELF-LINK:{interaction.user.id}')
+    if not result.get('ok'):
+        await interaction.followup.send(f"Console link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
+    await interaction.followup.send(
+        f"**HLL: VIETNAM CONSOLE LINK FILED**\nLinked **{result.get('soldier')}** to **{platform.name}** player **{result.get('player_name')}**. "
+        "Battalion Clerk will now attach your verified server service record to your Soldier Record.", ephemeral=True)
+
+@bot.tree.command(name='hll-link-console-member', description='Staff: link another Soldier to an Xbox or PS5 player by gamertag.')
 @app_commands.describe(member='Soldier to link',platform='Console platform',gamertag='Gamertag / PSN Online ID exactly as it appears in-game')
 @app_commands.choices(platform=[
     app_commands.Choice(name='Xbox', value='XBOX'),
     app_commands.Choice(name='PlayStation 5', value='PS5'),
 ])
-async def hll_link_console(interaction:discord.Interaction, member:discord.Member, platform:app_commands.Choice[str], gamertag:str):
+async def hll_link_console_member(interaction:discord.Interaction, member:discord.Member, platform:app_commands.Choice[str], gamertag:str):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
     result=await hllv.link_console_personnel(interaction.guild.id,member.id,platform.value,gamertag,f'STAFF CONSOLE LINK:{interaction.user.id}')
