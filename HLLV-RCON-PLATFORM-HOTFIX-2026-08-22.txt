@@ -1,0 +1,18 @@
+HLL: Vietnam RCON Platform Compatibility Hotfix
+
+Issue observed on live server:
+- RCON connection/authentication succeeds.
+- GetPlayers fails validation on EPlatformFamily::XboxSeries when using hllrcon 2.0.0.0-beta-1.
+
+Fix:
+- Track the current upstream hllrcon master branch, which contains ongoing HLL: Vietnam compatibility updates rather than pinning the August 9 beta snapshot.
+- No RCON credentials or Railway variables are included in this package.
+
+Expected successful startup sequence:
+[HLLV RCON SCHEMA READY]
+[HLLV RCON STARTED]
+Connected!
+Received auth token, successfully authenticated
+[HLLV MATCH OPEN] ...
+
+If a future HLLV protocol/model value changes, collector health records the exact validation/transport error without breaking Battalion Clerk.
