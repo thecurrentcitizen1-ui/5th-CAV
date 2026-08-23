@@ -1,9 +1,0 @@
-HLL: VIETNAM MEMBER REAL-TIME DASHBOARD — 22 AUG 2026
-
-- Replaced the generic member HLL telemetry tile with a Current Field Situation command board.
-- Live server contact now shows current/last map, mode, round time, round distance, role id and K/D.
-- Administrative duty assignment remains separate and authoritative: rank, unit, platoon/squad, duty, M16 and personnel status.
-- Career strip uses RCON-verified server time, distance, rounds, kills, deaths, K/D, vehicle kills and total score.
-- 201 File Combat Record now identifies the data as RCON verified, adds K/D, total score and role-time ledger.
-- Game mode falls back deterministically from HLLV layer ids when the RCON library omits gameMode.
-- No promotion, award, rank, M16, qualification or personnel authority was transferred to RCON telemetry.
