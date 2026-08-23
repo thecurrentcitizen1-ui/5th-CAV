@@ -1,0 +1,5 @@
+1/5 CAV — BATTALION CLERK HLL M16 RECONCILIATION — 2026-08-23
+
+- Battalion Clerk now asks the website weapon engine to reconcile verified HLL M16 field-use blocks every 60 seconds.
+- The website remains authoritative for weapon issue history, cleaning boundaries, round ledger, and fouling state.
+- Existing RCON polling, server broadcast, manual server message, Air Cav/Slick Rides, role research, and other Clerk automation remain intact.

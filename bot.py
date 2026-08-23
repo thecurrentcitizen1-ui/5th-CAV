@@ -1325,6 +1325,26 @@ async def before_operation_maintenance_watch():
 
 
 @tasks.loop(seconds=60)
+async def hll_m16_reconcile_watch():
+    """File completed HLL M16 field-use blocks into the issued-rifle ledger."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        result=await web.request('POST','/internal/clerk/weapons/reconcile-hll-rounds',json={'days':365})
+        if int(result.get('rounds_applied') or 0):
+            log.info('[HLL M16 RECONCILE] players=%s matches=%s blocks=%s rounds=%s weapons=%s',
+                     result.get('players',0),result.get('matches',0),result.get('blocks_checked',0),
+                     result.get('rounds_applied',0),result.get('weapons_updated',0))
+    except Exception as exc:
+        log.warning('[HLL M16 RECONCILE FAILED] %s',exc)
+
+
+@hll_m16_reconcile_watch.before_loop
+async def before_hll_m16_reconcile_watch():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=60)
 async def operation_reminder_watch():
     now=utc_now()
     for guild in bot.guilds:
@@ -2617,6 +2637,7 @@ async def on_ready():
         operation_reminder_watch.start()
     if not operation_maintenance_watch.is_running():
         operation_maintenance_watch.start()
+    hll_m16_reconcile_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
     if not clerk_health_watch.is_running():
