@@ -39,10 +39,11 @@ RCON_RECONNECT_SECONDS = max(5, int(os.getenv("HLL_RCON_RECONNECT_SECONDS", "15"
 # Single, low-frequency 1/5 CAV server recruiting broadcast.
 RCON_RECRUITING_WEBSITE = "WWW.5THCAVGAMING.COM"
 RCON_RECRUITING_INTERVAL_SECONDS = 30 * 60
-RCON_RECRUITING_DISPLAY_SECONDS = 10
+RCON_RECRUITING_DISPLAY_SECONDS = 20
 RCON_RECRUITING_MESSAGE = (
-    "CHARLIE WON’T WAIT. WHY SHOULD YOU?\n"
-    f"REPORT FOR DUTY WITH 1/5 CAV — {RCON_RECRUITING_WEBSITE}"
+    "WELCOME TO THE 5TH CAVALRY SERVER\n\n"
+    "Charlie won’t wait, so why should you.\n\n"
+    f"ENLIST TODAY - {RCON_RECRUITING_WEBSITE.lower()}"
 )
 # Conservative airborne-movement signature. A verified Pilot role files this as
 # Airmobile Flight Time; every other role files it as Slick Ride time. This does
@@ -625,7 +626,7 @@ class HLLVTelemetryCollector:
         return 0
 
     async def _run_recruiting_broadcast(self, match_id: int, server: dict, players: list[Any]):
-        """Broadcast one recruiting hook every 30 minutes for 10 seconds.
+        """Broadcast one recruiting hook every 30 minutes for 20 seconds.
 
         No permanent welcome text, private player messages, or rotating ads are used.
         The first poll in an already-running round schedules only the *next*

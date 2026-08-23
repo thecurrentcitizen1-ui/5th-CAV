@@ -2,14 +2,17 @@
 2026-08-23
 
 PLAYER-FACING MESSAGE
-CHARLIE WON’T WAIT. WHY SHOULD YOU?
-REPORT FOR DUTY WITH 1/5 CAV — WWW.5THCAVGAMING.COM
+WELCOME TO THE 5TH CAVALRY SERVER
+
+Charlie won’t wait, so why should you.
+
+ENLIST TODAY - www.5thcavgaming.com
 
 BEHAVIOR
 - Global HLLV ServerBroadcast only.
 - One message every 30 minutes of the active round while players are online.
-- Message remains visible for 10 seconds.
-- Battalion Clerk clears the broadcast with an empty ServerBroadcast after 10 seconds.
+- Message remains visible for 20 seconds.
+- Battalion Clerk clears the broadcast with an empty ServerBroadcast after 20 seconds.
 - No rotating recruitment messages.
 - No permanent deployment/welcome message.
 - No private first-join recruiting message.
