@@ -1,0 +1,26 @@
+5TH CAVALRY FINAL CLEAN FULL UPLOAD — INTEGRITY REPORT
+2026-08-18
+
+- Python compile PASS
+- Jinja PASS (47 templates)
+- Flask/url_for PASS (101 routes)
+- Forms/buttons route-method PASS
+- PostgreSQL UUID FK PASS
+- Formation Legacy SQL PASS
+- Operation credit→M16 + delta dedupe PASS
+- Recruit approval recovery PASS
+- Bot automation/commands PASS (49 commands)
+- Panel/text overflow safeguards PASS
+
+Verified cumulative areas:
+- Recruiting approval + Discord verification recovery
+- Replacement/personnel automation
+- Live activity + inactivity accountability
+- M16 rounds/fouling/maintenance
+- 45-minute Operation credit + member credit ledger
+- Readiness, MOS, leadership, cohesion, unit experience
+- Member career progression/goals/promotion readiness
+- Qualification cards, weapon history, squad/platoon pages
+- Operation reminders and duplicate protection
+
+Static checks cannot reproduce live Railway environment variables, Discord permissions, OAuth secrets, or every device viewport. A deployed smoke test remains the final live validation.

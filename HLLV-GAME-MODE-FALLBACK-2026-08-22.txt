@@ -1,0 +1,10 @@
+HLL: VIETNAM GAME MODE FALLBACK — 22 AUG 2026
+
+The current HLLV RCON server/model combination can omit gameMode while still returning a layer id.
+Battalion Clerk now derives the display mode from the server layer id when needed:
+- offensivenva -> NVA Offensive
+- offensiveus -> US Offensive
+- warfare -> Warfare
+- domination -> Domination
+- conquest -> Conquest
+This is only a display/storage compatibility fallback and does not alter server configuration.

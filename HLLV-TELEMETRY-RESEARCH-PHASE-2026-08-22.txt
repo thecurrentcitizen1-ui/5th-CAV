@@ -1,0 +1,16 @@
+HLLV TELEMETRY RESEARCH PHASE — 22 AUG 2026
+
+Adds research-only evidence capture for exact HLLV role mapping, vehicle/aviation classification and ammunition feasibility research.
+
+New database tables:
+- hll_role_mappings
+- hll_role_loadout_observations
+- hll_research_samples
+
+Linked Soldiers now produce detailed research samples with role ID, observed role label when available, loadout, position, speed, vertical speed, score and combat counters. Public/unlinked players contribute only aggregate role/loadout observations to prevent excessive database growth.
+
+New Discord commands:
+- /hll-research — member's latest research sample
+- /hll-role-research — staff aggregate role evidence
+
+No automated awards, rank, qualification, MOS certification, flight hours, vehicle occupancy or ammunition expenditure are granted by this research layer.

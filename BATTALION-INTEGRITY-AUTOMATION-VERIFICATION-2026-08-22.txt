@@ -1,0 +1,31 @@
+BATTALION CLERK AUTOMATION VERIFICATION — 22 AUG 2026
+
+No runtime behavior was intentionally removed or replaced for the Website Integrity
+Engine release. Battalion Clerk remains the delivery/event worker while the Website
+remains authoritative.
+
+VERIFIED WORKER SET (17)
+- clerk_health_watch
+- personnel_orders_watch
+- operation_maintenance_watch
+- operation_reminder_watch
+- duty_announcement_watch
+- flush_duty_chunks
+- operation_duty_watch
+- canonical_role_sync_watch
+- member_record_reminder_watch
+- welcome_packet_watch
+- applicant_intake_watch
+- recruit_status_watch
+- approved_recruit_watch
+- live_activity_credit_watch
+- inactivity_watch
+- personnel_suspense_watch
+- promotion_eligibility_watch
+
+VALIDATION
+- bot.py / database.py / collector.py / config.py compile: PASS
+- 17 tasks.loop definitions found
+- each loop has exactly one .start() reference
+- 29 literal /internal/clerk/ API path families accounted for against Website routes
+- M16 voice/attendance/Operation logic preserved from Full Integrity M16 Automation Repair
