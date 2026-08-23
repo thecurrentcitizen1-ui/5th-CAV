@@ -1,0 +1,7 @@
+ARMOR SERVICE / ROLE MAPPING UPDATE — 23 AUG 2026
+
+Confirmed HLL: Vietnam mappings:
+- Role 11 = CREWMAN / ARMOR / 19K
+- Role 12 = TANK COMMANDER / ARMOR / 19C
+
+The collector seeds these mappings into hll_role_mappings and uses the names when the RCON library only exposes numeric roles. Existing role_seconds remains the authoritative clock, so no competing armor timer or schema reset was introduced.

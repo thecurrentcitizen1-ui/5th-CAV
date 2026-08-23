@@ -270,6 +270,12 @@ def _weapon_label(value: Any) -> str:
     return _text(value)
 
 
+HLL_KNOWN_ROLE_MAPPINGS = {
+    "11": {"name": "CREWMAN", "category": "ARMOR", "mos_code": "19K"},
+    "12": {"name": "TANK COMMANDER", "category": "ARMOR", "mos_code": "19C"},
+}
+
+
 def _role_label(role: Any, data: dict) -> str:
     """Best-effort human label without trusting it as authoritative.
 
@@ -284,8 +290,13 @@ def _role_label(role: Any, data: dict) -> str:
         getattr(role, "label", None),
     ):
         if candidate:
-            return str(candidate).replace("HLLVRole.", "").replace("_", " ").strip()
-    return ""
+            label=str(candidate).replace("HLLVRole.", "").replace("_", " ").strip()
+            # Numeric enum names are not useful member-facing labels. Prefer a
+            # confirmed mapping when one is known.
+            if not label.isdigit():
+                return label
+    role_id=_text(_first(data, "role_id", "roleId", "role", default=role))
+    return HLL_KNOWN_ROLE_MAPPINGS.get(role_id,{}).get("name","")
 
 
 class HLLVTelemetryCollector:
@@ -428,6 +439,22 @@ class HLLVTelemetryCollector:
                 sample_count BIGINT NOT NULL DEFAULT 0
             )
         """)
+        for role_id, role_info in HLL_KNOWN_ROLE_MAPPINGS.items():
+            await self.db.execute("""
+                INSERT INTO hll_role_mappings(role_id,observed_label,verified_role_name,role_category,mos_code,verified,verified_by,verified_at,notes,last_seen_at)
+                VALUES($1,$2,$2,$3,$4,TRUE,'ROLE-ID-MAP',NOW(),'Confirmed HLL: Vietnam role mapping supplied by unit staff.',NOW())
+                ON CONFLICT(role_id) DO UPDATE SET
+                    observed_label=EXCLUDED.observed_label,
+                    verified_role_name=EXCLUDED.verified_role_name,
+                    role_category=EXCLUDED.role_category,
+                    mos_code=EXCLUDED.mos_code,
+                    verified=TRUE,
+                    verified_by='ROLE-ID-MAP',
+                    verified_at=COALESCE(hll_role_mappings.verified_at,NOW()),
+                    notes=EXCLUDED.notes,
+                    last_seen_at=NOW()
+            """, role_id, role_info["name"], role_info["category"], role_info["mos_code"])
+
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_role_loadout_observations (
                 role_id TEXT NOT NULL,
