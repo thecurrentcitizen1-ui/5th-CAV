@@ -47,7 +47,7 @@
     <h1>{{doc.title}}</h1>
     <dl class="official-order-person"><dt>SOLDIER</dt><dd>{{doc.rank_code}} {{doc.last_name|upper}}, {{doc.first_name}}</dd><dt>SERVICE NO.</dt><dd>{{doc.service_number or 'PENDING'}}</dd><dt>ORGANIZATION</dt><dd>{{doc.unit_code}}{% if doc.platoon %} • {{doc.platoon}}{% endif %}{% if doc.squad %} • {{doc.squad}}{% endif %}</dd></dl>
     <p class="official-order-body">{{doc.body_text}}</p>
-    <div class="official-order-authority"><b>{{doc.by_order_of or 'BY ORDER OF THE BATTALION COMMANDER'}}</b><br>{{doc.signature_block or doc.authority or 'HEADQUARTERS'}}</div>
+    <div class="official-order-authority"><b>{{doc.by_order_of or 'BY ORDER OF THE BATTALION COMMANDER'}}</b><br>{{(doc.signature_block or doc.authority or 'HEADQUARTERS')|upper}}</div>
     <div class="official-order-filed">FILED<br>S-1</div>
   </article>
   {% endif %}

@@ -54,7 +54,7 @@
       <div><small>REVIEWED AT</small><b>{{case.reviewed_at or 'NOT RECORDED'}}</b></div>
       <div><small>APPROVED AT</small><b>{{case.approved_at or 'NOT APPLICABLE'}}</b></div>
       <div><small>DENIED AT</small><b>{{case.denied_at or 'NOT APPLICABLE'}}</b></div>
-      <div><small>REPLACEMENT DEPOT ENTRY</small><b>{{case.replacement_depot_entered_at or 'NOT APPLICABLE'}}</b></div>
+      <div><small>REPLACEMENT DETACHMENT ENTRY</small><b>{{case.replacement_depot_entered_at or 'NOT APPLICABLE'}}</b></div>
       <div><small>BATTALION CLERK NOTIFIED</small><b>{{case.discord_notified_at or 'NOT RECORDED'}}</b></div>
     </section>
   </article>
@@ -74,5 +74,16 @@
     <p>This recruiting file remains viewable for historical reference but cannot be reopened through Recruiting Control.</p>
   </article>
   {% endif %}
+  {% if not case.personnel_id %}
+  <article class="document-sheet recruit-delete-file">
+    <header><small>COMMAND AUTHORITY • DESTRUCTIVE ACTION</small><h2>REMOVE APPLICATION</h2></header>
+    <p>Use this only to permanently remove an application that should not remain in Recruiting Control. This is unavailable once an official personnel record exists.</p>
+    <form method="post" action="{{url_for('recruiting_case_delete',case_id=case.id)}}" onsubmit="return confirm('Permanently delete {{case.case_number}}? This cannot be undone.');">
+      <label>TYPE CASE NUMBER TO CONFIRM<input name="confirm_case_number" autocomplete="off" required placeholder="{{case.case_number}}"></label>
+      <button class="danger-delete" type="submit">DELETE APPLICATION PERMANENTLY</button>
+    </form>
+  </article>
+  {% endif %}
+
 </section>
 {% endblock %}

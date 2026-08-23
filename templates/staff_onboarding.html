@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block title %}Onboarding Control • {{site_name}}{% endblock %}
+{% block body_class %}page-staff-onboarding{% endblock %}
+{% block content %}
+<section class="staff-onboarding-shell">
+  <header class="staff-onboarding-head"><div><small>S-1 PERSONNEL • NEW SOLDIER CONTROL</small><h1>WELCOME PACKET / ONBOARDING</h1><p>One board for every Soldier moving from approval through Replacement Detachment and permanent unit orientation.</p></div><a href="{{url_for('replacement_detachment')}}">REPLACEMENT DETACHMENT →</a></header>
+  <div class="staff-onboarding-table">
+    <div class="staff-onboarding-row staff-onboarding-row--head"><span>SOLDIER</span><span>ASSIGNMENT</span><span>PHASE</span><span>PROGRESS</span><span>STATUS</span><span>ACTION</span></div>
+    {% for r in rows %}<div class="staff-onboarding-row"><span><b>{{r.rank_code}} {{r.last_name|upper}}, {{r.first_name}}</b><small>{{r.service_number or 'NO SERVICE #'}}</small></span><span><b>{{r.unit_code or 'REPLACEMENT'}}</b><small>{{r.platoon or 'PENDING'}}{% if r.squad %} • {{r.squad}}{% endif %}</small></span><span><b>{{r.current_phase|replace('_',' ')}}</b><small>LAST ACTIVITY {{r.last_activity_at.strftime('%d %b') if r.last_activity_at and r.last_activity_at.strftime else r.last_activity_at}}</small></span><span><b>{{r.done_tasks or 0}} / {{r.total_tasks or 0}}</b><div class="staff-onboarding-progress"><i style="width:{{ ((r.done_tasks or 0) * 100 / (r.total_tasks or 1))|round }}%"></i></div></span><span><b>{{r.onboarding_status|replace('_',' ')}}</b></span><span><a href="{{url_for('staff_welcome_packet',personnel_id=r.id)}}">OPEN PACKET</a><a href="{{url_for('personnel_service_record',personnel_id=r.id)}}">201 FILE</a></span></div>{% else %}<p class="typed-empty">NO WELCOME PACKETS HAVE BEEN GENERATED YET.</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

@@ -12,8 +12,8 @@
   <div class="public-ops-cards">
     {% for op in upcoming %}
     <article>
-      <time>{% if op.starts_at %}<b>{{op.starts_at.strftime('%d')}}</b><span>{{op.starts_at.strftime('%b %Y')|upper}}</span>{% else %}<b>--</b><span>TBD</span>{% endif %}</time>
-      <div><small>{{op.event_type or 'OFFICIAL OPERATION'}}</small><h3>{{op.title}}</h3><p>{% if op.starts_at %}STEP-OFF {{op.starts_at.strftime('%H%M')}} HRS{% else %}STEP-OFF PENDING{% endif %}{% if op.area_of_operations %} • {{op.area_of_operations}}{% endif %}</p></div>
+      <time>{% if op.local_start_at %}<b>{{op.local_start_at.strftime('%d')}}</b><span>{{op.local_start_at.strftime('%b %Y')|upper}}</span>{% else %}<b>--</b><span>TBD</span>{% endif %}</time>
+      <div><small>{{op.event_type or 'OFFICIAL OPERATION'}}</small><h3>{{op.title}}</h3><p>{% if op.local_start_at %}STEP-OFF {{op.local_start_at.strftime('%I:%M %p')}}{% else %}STEP-OFF PENDING{% endif %}{% if op.area_of_operations %} • {{op.area_of_operations}}{% endif %}</p></div>
       <span class="public-op-status">SCHEDULED</span>
     </article>
     {% else %}
@@ -27,7 +27,7 @@
   <section class="public-completed-ops">
     <header>RECENT COMPLETED OPERATIONS</header>
     {% for op in completed %}
-    <div><span>{{op.operation_number or op.operation_code or 'OPERATION'}}</span><b>{{op.title}}</b><small>{% if op.completed_at %}{{op.completed_at.strftime('%d %b %Y')|upper}}{% endif %}{% if op.result %} • {{op.result}}{% endif %}</small></div>
+    <div><span>{{op.public_operation_number or 'OPERATION'}}</span><b>{{op.title}}</b><small>{% if op.completed_at %}{{op.completed_at.strftime('%d %b %Y')|upper}}{% endif %}{% if op.result %} • {{op.result}}{% endif %}</small></div>
     {% else %}<p>No completed operation records are currently published.</p>{% endfor %}
   </section>
 </section>

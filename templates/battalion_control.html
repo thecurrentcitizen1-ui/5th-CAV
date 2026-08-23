@@ -3,6 +3,12 @@
 {% block body_class %}page-battalion-control{% endblock %}
 {% block content %}
 <section class="staff-section-hero"><div class="staff-photo"></div><div class="staff-shade"></div><div class="staff-sign"><span>BATTALION HEADQUARTERS</span><h1>SYSTEM CONTROL & HISTORICAL LEDGER</h1><p>Command recovery tools, lifecycle status, staff audit, arms inspection, and the permanent battalion record.</p></div></section>
+<section class="system-health-board">
+  <header><div><small>BATTALION INTEGRITY ENGINE • 1965</small><h1>SYSTEM HEALTH & EXCEPTION BOARD</h1><p>Read-only cross-system checks. The board reports disagreements; the authoritative personnel, Operations, M16, Training, Awards, and Discord systems remain unchanged.</p></div><span class="system-health-stamp {{'clear' if integrity.all_clear else 'attention'}}">{{'ALL CLEAR' if integrity.all_clear else 'ACTION REQUIRED'}}</span></header>
+  <div class="system-health-checks">{% for c in integrity.checks %}<article class="health-{{c.state|lower|replace(' ','-')}}"><small>{{c.label}}</small><b>{{c.state}}</b><span>{{c.count}} EXCEPTION{{'' if c.count == 1 else 'S'}}</span></article>{% endfor %}</div>
+  <div class="system-health-exceptions"><header><small>CROSS-SYSTEM EXCEPTIONS</small><b>{{integrity.total}} OPEN</b><span>{{integrity.red}} CRITICAL • {{integrity.amber}} REVIEW</span></header>{% for e in integrity.issues %}<a class="system-health-row severity-{{e.severity}}" href="{{url_for(e.endpoint)}}"><span><small>{{e.code|replace('_',' ')}}</small><b>{{e.title}}</b><em>{{e.detail}}</em></span><strong>{{'FIX NOW' if e.severity == 'red' else 'REVIEW'}}</strong></a>{% else %}<div class="staff-clear-state"><b>NO CONFLICTS DETECTED</b><span>The current authoritative records agree across the checked systems.</span></div>{% endfor %}</div>
+</section>
+
 <section class="staff-workspace battalion-control-grid">
   <article class="document-sheet"><header class="army-letterhead compact"><small>COMMAND SYSTEM STATUS</small><strong>BATTALION HEALTH</strong><span>LIVE DATABASE CHECKS</span></header>
     <div class="brief-strength"><div><small>ACTIVE SOLDIERS</small><b>{{health.active}}</b></div><div><small>ARCHIVED / FORMER</small><b>{{health.archived}}</b></div><div><small>OPEN ACTIONS</small><b>{{health.open_actions}}</b><span>{{health.urgent}} HIGH PRIORITY</span></div><div><small>WEAPONS DUE</small><b>{{health.weapon_due}}</b></div><div><small>MISSING MOS</small><b>{{health.missing_mos}}</b></div><div><small>UNLINKED RECORDS</small><b>{{health.unlinked}}</b></div></div>

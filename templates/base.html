@@ -9,13 +9,13 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Oswald:wght@400;500;600;700&family=Stardos+Stencil:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='site.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='site.css', v='20260822-hllv-service-record-r3') }}">
 </head>
 {% set access_role=session.get('access_role') %}
 <body class="{% block body_class %}{% endblock %}{% if access_role in ['battalion_hq','commander','admin'] %} command-global-view{% endif %}">
 <a class="skip-link" href="#main-content">SKIP TO RECORDS</a>
 {% if not session.get('user_id') %}
-<header class="public-hq-header public-hq-header--1966" data-site-header>
+<header class="public-hq-header public-hq-header--1965" data-site-header>
   <div class="public-hq-topline">
     <a class="public-hq-plaque" href="{{ url_for('home') }}" aria-label="1st Battalion, 5th Cavalry Regiment home">
       <img src="{{ url_for('static', filename='art/official-community-logo.webp') }}" alt="1st Battalion, 5th Cavalry Regiment community emblem">
@@ -28,10 +28,11 @@
   <button class="index-button public-index-button" type="button" aria-expanded="false" aria-controls="primary-index">BATTALION INDEX</button>
   <nav id="primary-index" class="public-field-nav record-index" aria-label="Primary navigation">
     <a href="{{ url_for('home') }}" {% if request.endpoint == 'home' %}aria-current="page"{% endif %}>HOME</a>
-    <a class="public-nav-enlist" href="{{ url_for('recruiting') }}" {% if request.endpoint in ['recruiting','recruiting_status'] %}aria-current="page"{% endif %}>ENLIST</a>
-    <a href="{{ url_for('public_operations') }}" {% if request.endpoint == 'public_operations' %}aria-current="page"{% endif %}>OPERATIONS</a>
-    <a href="{{ url_for('awards_decorations') }}" {% if request.endpoint == 'awards_decorations' %}aria-current="page"{% endif %}>AWARDS &amp; DECORATIONS</a>
-    <a href="{{ url_for('organization') }}" {% if request.endpoint in ['organization','company','platoon','unit_history_page'] %}aria-current="page"{% endif %}>UNITS</a>
+    <a href="{{ url_for('about') }}" {% if request.endpoint == 'about' %}aria-current="page"{% endif %}>ABOUT US</a>
+    <a href="{{ url_for('why_join') }}" {% if request.endpoint == 'why_join' %}aria-current="page"{% endif %}>WHY JOIN</a>
+    <a href="{{ url_for('public_operations') }}" {% if request.endpoint == 'public_operations' %}aria-current="page"{% endif %}>THE EXPERIENCE</a>
+    <a href="{{ url_for('awards_decorations') }}" {% if request.endpoint == 'awards_decorations' %}aria-current="page"{% endif %}>HONORS</a>
+    <a class="public-nav-enlist" href="{{ url_for('recruiting') }}" {% if request.endpoint in ['recruiting','recruiting_status','recruiting_discord_callback'] %}aria-current="page"{% endif %}>RECRUITING OFFICE</a>
     <a href="{{ url_for('contact') }}" {% if request.endpoint == 'contact' %}aria-current="page"{% endif %}>CONTACT</a>
   </nav>
 </header>
@@ -43,7 +44,7 @@
   <div class="unit-wire">
     <span>DEPARTMENT OF THE ARMY</span>
     <span>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY</span>
-    <span>REPUBLIC OF VIETNAM • 1966</span>
+    <span>REPUBLIC OF VIETNAM • 1965</span>
   </div>
   <div class="header-desk">
     <a class="unit-mark" href="{{ url_for('home') }}" aria-label="5th Cavalry Regiment home">
@@ -58,19 +59,20 @@
         <a href="{{ url_for('why_join') }}" {% if request.endpoint == 'why_join' %}aria-current="page"{% endif %}>WHY JOIN US</a>
         <a href="{{ url_for('about') }}" {% if request.endpoint == 'about' %}aria-current="page"{% endif %}>ABOUT 1/5 CAV</a>
         <a href="{{ url_for('recruiting') }}" {% if request.endpoint == 'recruiting' %}aria-current="page"{% endif %}>ENLIST</a>
-        <a class="duty-tab" href="{{ url_for('my_soldier_record') }}">MY SOLDIER RECORD</a>
-        <a class="duty-tab staff-login-tab" href="{{ url_for('staff_login') }}">STAFF LOGIN</a>
+        <a class="duty-tab member-login-tab" href="{{ url_for('my_soldier_record') }}">MEMBER LOGIN</a>
+        <a class="duty-tab staff-login-tab" href="/staff-login" data-auth-lane="staff">STAFF LOGIN</a>
       {% elif role == 'member' or role in ['nco','company_hq'] %}
-        <a class="duty-tab" href="{{ url_for('my_soldier_record') }}">MY SOLDIER</a>
+        <a class="duty-tab" href="{{ url_for('my_soldier_record') }}">WALL LOCKER</a>
+        <a href="{{url_for('my_action_center')}}" {% if request.endpoint == 'my_action_center' %}aria-current="page"{% endif %}>MY ACTIONS</a>
+        {% if member_welcome_active %}<a class="welcome-nav-tab" href="{{url_for('welcome_packet')}}">WELCOME PACKET</a>{% endif %}
         <a href="{{url_for('my_unit')}}">MY UNIT</a>
-        <a href="{{url_for('orders')}}">OPERATIONS</a>
+        <a href="{{url_for('operations')}}">OPERATIONS</a>
         <a href="{{url_for('training')}}">TRAINING</a>
         <a href="{{url_for('my_201_file')}}">201 FILE</a>
-        {% if member_nco %}<a href="{{url_for('my_soldiers')}}">MY SOLDIERS</a>{% endif %}
+        <a href="{{url_for('my_squad')}}">MY SQUAD</a>
         <a href="{{ url_for('logout') }}">SIGN OUT</a>
       {% elif role in ['s1','s2','s3','s4','training','battalion_hq','commander','admin'] %}
-        <a class="duty-tab staff-center-tab" href="{{url_for('staff_action_center')}}">ACTION CENTER</a>
-        <a href="{{url_for('awards_decorations')}}">1/5 AWARDS</a>
+        <a class="duty-tab staff-center-tab" href="{{url_for('staff_action_center')}}">COMMAND DESK</a>
         {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('replacement_detachment')}}">REPLACEMENTS</a><a href="{{url_for('personnel_office')}}">PERSONNEL</a>{% endif %}
         {% if role in ['s3','training','battalion_hq','commander','admin'] %}<a href="{{url_for('operations')}}">OPERATIONS</a>{% endif %}
         {% if role in ['s4','battalion_hq','commander','admin'] %}<a href="{{url_for('arms_room')}}">LOGISTICS</a>{% endif %}
@@ -86,19 +88,20 @@
 <nav class="command-global-bar staff-global-bar" aria-label="Staff workspace">
   <div class="command-global-bar-inner">
     <span class="command-global-label"><small>STAFF ACCESS</small><b>{{(access_role or 'STAFF')|upper|replace('_',' ')}}</b></span>
-    <a href="{{url_for('staff_action_center')}}"><b>ACTION CENTER</b><small>BRIEF / SEARCH / SUSPENSE</small></a>
-    {% if access_role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('replacement_detachment')}}"><b>REPLACEMENTS</b><small>DETACHMENT / IN-PROCESSING</small></a><a href="{{url_for('personnel_office')}}"><b>PERSONNEL</b><small>ROSTER / 201 FILES</small></a>{% endif %}{% if access_role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('recruiting_control')}}"><b>RECRUITING</b><small>APPLICANTS / DEPOT</small></a>{% endif %}
+    <a href="{{url_for('staff_action_center')}}"><b>COMMAND DESK</b><small>ACTION REQUIRED / SEARCH</small></a>
+    {% if access_role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('replacement_detachment')}}"><b>REPLACEMENTS</b><small>DETACHMENT / IN-PROCESSING</small></a><a href="{{url_for('staff_onboarding')}}"><b>ONBOARDING</b><small>WELCOME PACKETS / PROGRESS</small></a><a href="{{url_for('personnel_office')}}"><b>PERSONNEL</b><small>ROSTER / 201 FILES</small></a>{% endif %}{% if access_role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('recruiting_control')}}"><b>RECRUITING</b><small>APPLICANTS / DETACHMENT</small></a>{% endif %}
     {% if access_role in ['s3','training','battalion_hq','commander','admin'] %}<a href="{{url_for('operations')}}"><b>OPERATIONS</b><small>OPS / ATTENDANCE</small></a><a href="{{url_for('training_office_phase9')}}"><b>TRAINING</b><small>SCHOOLS / QUALS</small></a>{% endif %}
     {% if access_role in ['s4','battalion_hq','commander','admin'] %}<a href="{{url_for('arms_room')}}"><b>LOGISTICS</b><small>ARMS / PROPERTY</small></a>{% endif %}
-    <a href="{{url_for('personnel_actions')}}" {% if access_role == 's2' %}class="staff-nav-disabled" title="S-2 does not own Personnel Action Control" aria-disabled="true"{% endif %}><b>ACTIONS</b><small>ACTIVE / ARCHIVE</small></a>
+    {% if access_role != 's2' %}<a href="{{url_for('personnel_actions')}}"><b>ACTIONS</b><small>ACTIVE / ARCHIVE</small></a>{% endif %}
+    {% if access_role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('battalion_control')}}"><b>SYSTEM HEALTH</b><small>INTEGRITY / AUTOMATION</small></a>{% endif %}
   </div>
 </nav>
 {% endif %}
 {% if access_role in ['s1','s2','s3','s4','training','battalion_hq','commander','admin'] %}
 <section class="staff-utility-bar">
-  <nav class="staff-breadcrumbs" aria-label="Breadcrumb"><a href="{{url_for('staff_action_center')}}">HEADQUARTERS</a><span>›</span><b>{{(request.endpoint or 'STAFF')|replace('_',' ')|upper}}</b></nav>
+  <nav class="staff-breadcrumbs" aria-label="Breadcrumb"><a href="{{url_for('staff_action_center')}}">COMMAND DESK</a><span>›</span><b>{{(request.endpoint or 'STAFF')|replace('_',' ')|upper}}</b></nav>
   <form method="get" action="{{url_for('staff_action_center')}}" class="staff-global-search"><label for="staff-global-q">PERSONNEL SEARCH</label><input id="staff-global-q" name="q" placeholder="Name / Discord / service #" value="{{request.args.get('q','') if request.endpoint == 'staff_action_center' else ''}}"><button type="submit">FIND</button></form>
-  <a class="staff-return-office" href="{{url_for('staff_action_center')}}">← ACTION CENTER</a>
+  <a class="staff-return-office" href="{{url_for('staff_action_center')}}">← COMMAND DESK</a>
 </section>
 {% endif %}
 {% with messages = get_flashed_messages(with_categories=true) %}
@@ -110,7 +113,7 @@
 {% endif %}
 <main id="main-content">{% block content %}{% endblock %}</main>
 {% if not session.get('user_id') %}
-<footer class="public-hq-footer public-hq-footer--1966">
+<footer class="public-hq-footer public-hq-footer--1965">
   <div class="public-hq-footer__inner">
     <div class="public-hq-footer__brand">
       <img src="{{ url_for('static', filename='art/official-community-logo.webp') }}" alt="">

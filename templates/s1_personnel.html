@@ -3,6 +3,8 @@
 {% block body_class %}page-s1{% endblock %}
 {% block content %}
 <section class="staff-workload-strip document-sheet"><span>S-1 WORKLOAD</span><b>{{workload.counts.open or 0}} OPEN</b><b>{{workload.counts.urgent or 0}} HIGH PRIORITY</b><b>{{workload.overdue_count}} OVERDUE</b><a href="{{url_for('staff_workload_page',section='S-1')}}">OPEN WORKLOAD DESK</a></section>
+<div class="s1-command-actions"><a class="paper-action primary" href="{{url_for('staff_formation_control')}}"><span>FORMATION ASSIGNMENT CONTROL</span><small>COMPANY → PLATOON → SQUAD → TEAM → BILLET</small></a></div>
+
 <section class="staff-section-hero s1-hero"><div class="staff-hero-photo"></div><div class="staff-sign"><span>BATTALION STAFF</span><h1>S-1 PERSONNEL</h1><p>Personnel records, battalion roster entry, in-country dates and Battle Roster Cards.</p></div></section>
 <section class="s1-workroom">
   <article class="document-sheet s1-roster-control" id="personnel-roster-control">
@@ -34,7 +36,7 @@
     <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>AWARD RECOMMENDATION CONTROL</strong><span>NCO RECOMMENDATIONS / ADMINISTRATIVE REVIEW / FORWARD TO COMMAND</span></header>
     <section class="s1-award-issue-desk">
       <header><span>AWARDS &amp; DECORATIONS</span><strong>DIRECT AWARD ISSUE</strong></header>
-      <p class="award-issue-note">File an approved award directly to a Soldier's permanent record. The official order number is generated automatically. Earned ribbons are added to the Soldier's profile as <b>NOT WORN</b> so the Soldier may choose whether to place the ribbon on the uniform.</p>
+      <p class="award-issue-note">File an approved award directly to a Soldier's permanent record. The official order number is generated automatically. A first award authorizes the ribbon as <b>NOT WORN</b> until the Soldier chooses to wear it. A subsequent award files a new General Order and citation while preserving the Soldier's current wear choice; repeat awards are displayed with 1965 Army-style oak leaf cluster devices.</p>
       <form method="post" class="army-form-grid">
         <input type="hidden" name="action" value="grant_award">
         <label>SOLDIER<select name="personnel_id" required><option value="">SELECT SOLDIER</option>{% for row in recent %}<option value="{{row.id}}">{{row.rank_code}} {{row.last_name|upper}}, {{row.first_name}} — {{row.unit_code}}</option>{% endfor %}</select></label>
@@ -45,6 +47,15 @@
         <label class="wide">S-1 REMARKS<input name="remarks" placeholder="OPTIONAL ADMINISTRATIVE REMARKS"></label>
         <button class="paper-action primary button-reset" type="submit"><span>FILE AWARD</span><small>ISSUE ORDER / UPDATE 201 FILE / ADD TO MEMBER AWARDS</small></button>
       </form>
+    </section>
+
+    <section class="award-eligibility-board">
+      <header><span>AWARD ELIGIBILITY BOARD</span><strong>PROGRESSION WATCH</strong><small>READ-ONLY • OFFICIAL RECORD DATA • 1965</small></header>
+      <p>Automatic awards remain controlled by the existing ribbon engine. This board only identifies Soldiers whose filed records show an award is due or approaching eligibility; it does not grant anything by itself.</p>
+      <div class="award-eligibility-columns">
+        <div><h3>ELIGIBLE NOW</h3>{% for item in award_eligibility.eligible %}<a href="{{url_for('personnel_service_record',personnel_id=item.person.id)}}#awards"><b>{{item.person.rank_code}} {{item.person.last_name|upper}}, {{item.person.first_name}}</b><span>{{item.ribbon.name}}</span><small>{{item.ribbon.detail}}</small></a>{% else %}<p class="typed-empty">NO UNFILED AUTOMATIC AWARDS CURRENTLY DUE.</p>{% endfor %}</div>
+        <div><h3>NEARING ELIGIBILITY</h3>{% for item in award_eligibility.nearing %}<a href="{{url_for('personnel_service_record',personnel_id=item.person.id)}}#ribbon-progress"><b>{{item.person.rank_code}} {{item.person.last_name|upper}}, {{item.person.first_name}}</b><span>{{item.ribbon.name}} • {{item.ribbon.percent}}%</span><small>{{item.ribbon.detail}}</small></a>{% else %}<p class="typed-empty">NO SOLDIERS ABOVE THE 70% WATCH THRESHOLD.</p>{% endfor %}</div>
+      </div>
     </section>
     <div class="award-control-summary"><b>{{award_queue|length}}</b><span>AWARD RECOMMENDATIONS AWAITING S-1 ACTION</span></div>
     {% for r in award_queue %}
@@ -68,7 +79,7 @@
       <input type="hidden" name="action" value="create">
       <label>FIRST NAME<input name="first_name" required></label><label>LAST NAME<input name="last_name" required></label>
       <label>MOS<select name="mos_code" required>{% for m in mos_catalog %}<option value="{{m.mos_code}}" {% if m.mos_code=='11R' %}selected{% endif %}>{{m.mos_code}} — {{m.mos_title}}</option>{% endfor %}</select></label><label>DUTY / BILLET<select name="duty_position" required>{% for d in duty_positions %}<option value="{{d.value}}" {% if d.value=='Rifleman' %}selected{% endif %}>{{d.label}}{% if d.mos_code %} [{{d.mos_code}}]{% endif %}</option>{% endfor %}</select></label>
-      <label class="wide">ORGANIZATIONAL ASSIGNMENT<select name="unit_node_id" required><option value="">SELECT COMPANY / PLATOON / SQUAD</option>{% for n in assignment_options %}<option value="{{n.id}}">{{n.assignment_label}}</option>{% endfor %}</select></label><label>BATTALION COMMUNICATIONS NAME<select name="communications_id"><option value="">NO ENTRY</option>{% for c in communications_roster %}<option value="{{c.guild_id}}:{{c.discord_user_id}}">{{c.display_name or c.username}}</option>{% endfor %}</select></label><label>DATE ASSIGNED<input type="date" name="date_joined"></label>
+      <label class="wide">ORGANIZATIONAL ASSIGNMENT<select name="unit_node_id" required><option value="">SELECT COMPANY / PLATOON / SQUAD</option>{% for n in assignment_options %}<option value="{{n.id}}">{{n.assignment_label}}</option>{% endfor %}</select></label><label>BATTALION COMMUNICATIONS NAME<select name="communications_id"><option value="">NO ENTRY</option>{% for c in communications_roster %}<option value="{{c.guild_id}}:{{c.discord_user_id}}">{{(c.display_name or c.username)|gamertag}}</option>{% endfor %}</select></label><label>DATE ASSIGNED<input type="date" name="date_joined"></label>
       <label>ARRIVAL IN COUNTRY<input type="date" name="rvn_arrival_date"></label><label>DEROS<input type="date" name="deros_date"></label>
       <button class="paper-action primary button-reset" type="submit"><span>ENTER ON BATTALION ROSTER</span><small>OPEN 201 FILE / ISSUE CARD / ISSUE M16</small></button>
     </form>

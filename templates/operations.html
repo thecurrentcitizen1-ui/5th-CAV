@@ -1,85 +1,110 @@
 {% extends 'base.html' %}
-{% block title %}S-3 Operations • {{site_name}}{% endblock %}
-{% block body_class %}page-operations phase8-operations{% endblock %}
+{% block title %}Operations • {{site_name}}{% endblock %}
+{% block body_class %}page-operations ops-simple-control{% endblock %}
 {% block content %}
-<section class="document-sheet website-authoritative-op-note"><strong>WEBSITE-AUTHORITATIVE OPERATIONS</strong><span>Schedule and publish Operations here. Battalion Clerk automatically receives the event, Discord voice channel, credit threshold, reminders, and ammunition settings. The Discord /schedule command is not required.</span></section>
-<section class="ops-tent-hero">
-  <div class="ops-tent-photo"></div><div class="ops-tent-shade"></div>
-  <div class="ops-tent-sign"><small>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY</small><h1>S-3 OPERATIONS</h1><p>Current operations • operation orders • combat journal • after action records</p></div>
+<section class="ops-simple-hero">
+  <small>S-3 • OPERATIONS CENTER</small>
+  <h1>{% if member_mode %}MY OPERATIONS{% else %}OPERATIONS CONTROL{% endif %}</h1>
+  <p>{% if member_mode %}Your scheduled operations, attendance and completed field service.{% else %}One screen controls the website schedule, Discord distribution, voice attendance, duty assignments and M16 tracking.{% endif %}</p>
+</section>
+
+<section class="hll-server-board">
+  <header><small>HLL: VIETNAM • RCON</small><h2>LIVE SERVER TELEMETRY</h2></header>
+  {% if hll_server and hll_server.connected %}<div class="hll-server-strip"><span>STATUS <b>CONNECTED</b></span><span>SERVER <b>{{hll_server.last_server_name or '1/5 CAV'}}</b></span><span>MAP <b>{{hll_server.last_map_name or '—'}}</b></span><span>MODE <b>{{hll_server.last_game_mode or '—'}}</b></span><span>PLAYERS <b>{{hll_server.last_player_count or 0}}</b></span></div>
+  {% else %}<div class="hll-server-offline"><b>RCON TELEMETRY NOT CURRENT</b><span>Operations remain available. Battalion Clerk will resume filing server statistics automatically when the collector reconnects.</span></div>{% endif %}
 </section>
 
 
-<section class="s3-command-strip">
-  <article><small>BATTALION CLERK</small><strong class="{{'status-good-text' if clerk_health.state=='CONNECTED' else 'status-attn-text'}}">{{clerk_health.state}}</strong><span>Voice collector {{'running' if clerk_health.voice_collector_running else 'status unknown'}}</span></article>
-  <article><small>CURRENT OPERATIONS</small><strong>{{current|length}}</strong><span>{{completed|length}} archived</span></article>
-  <article><small>OPERATION CREDIT CHANNEL</small><strong>{{operation_channel.channel_name if operation_channel else 'NOT SET'}}</strong><span>{% if operation_channel %}Discord ID {{operation_channel.channel_id}}{% else %}Set it while publishing an operation{% endif %}</span></article>
-  <article><small>STANDARD CREDIT</small><strong>45 MIN</strong><span>editable per operation</span></article>
+{% if can_control %}
+<section class="document-sheet ops-simple-health">
+  <div><small>BATTALION CLERK</small><b class="{{'status-good-text' if clerk_health.state=='CONNECTED' else 'status-attn-text'}}">{{clerk_health.state}}</b></div>
+  <div><small>VOICE COLLECTOR</small><b>{{'RUNNING' if clerk_health.voice_collector_running else 'CHECK CLERK'}}</b></div>
+  <div><small>ACTIVE / UPCOMING</small><b>{{current|length}}</b></div>
+  <div><small>M16 RATE</small><b>300 RDS / HR</b></div>
 </section>
 
-<section class="s3-operations-layout">
-  <div class="s3-main-column">
-    <section class="document-sheet s3-current-board"><header><small>S-3 OPERATIONS CENTER</small><h2>CURRENT / UPCOMING OPERATIONS</h2><p>Create, publish, track, and close official operations from one workspace.</p></header>
-      <div class="s3-op-card-grid">{% for op in current %}{% set live=live_map.get(op.id|string,{}) %}<article class="s3-op-card status-{{(op.status or 'planning')|lower}}"><div class="s3-op-card-head"><small>{{op.operation_number or op.operation_code}}</small><span>{{op.status}}</span></div><h3>{{op.title}}</h3><p>{{op.area_of_operations or 'AO NOT FILED'}}</p><dl><div><dt>STEP-OFF</dt><dd>{{op.start_at or 'PENDING'}}</dd></div><div><dt>CREDIT</dt><dd>{{op.credit_threshold_minutes or 45}} MIN</dd></div><div><dt>ROUNDS</dt><dd>{{op.rounds_per_soldier or 0}}</dd></div><div><dt>EXPECTED</dt><dd>{{live.expected or 0}}</dd></div><div><dt>TRACKED</dt><dd>{{live.event.tracked_count if live.event else 0}}</dd></div><div><dt>CREDITED</dt><dd>{{live.event.credited_count if live.event else 0}}</dd></div></dl><div class="s3-op-actions"><a href="{{url_for('operation_detail',operation_id=op.id)}}">OPEN CONTROL BOARD</a>{% if session.get('access_role') in ['s3','battalion_hq','commander','admin'] %}<form method="post" action="{{url_for('operation_duplicate',operation_id=op.id)}}"><button type="submit">DUPLICATE</button></form><form method="post" action="{{url_for('operation_delete_action',operation_id=op.id)}}" class="op-card-delete" onsubmit="return confirm('Delete this scheduled Operation and its Clerk schedule?');"><button type="submit">DELETE</button></form>{% endif %}</div></article>{% else %}<p class="typed-empty">NO CURRENT OPERATIONS ON FILE.</p>{% endfor %}</div>
-    </section>
-
-    {% if session.get('access_role') in ['s3','company_hq','battalion_hq','commander','admin'] %}
-    <section class="document-sheet s3-create-wizard"><header><small>FIELD ORDER WORKSHEET</small><h2>CREATE / SCHEDULE OPERATION</h2><p>One submission creates the website Operation and can immediately schedule Battalion Clerk attendance tracking.</p></header>
-      <div class="s3-template-buttons"><button type="button" data-op-template="standard">STANDARD PUBLIC OP</button><button type="button" data-op-template="company">COMPANY OP</button><button type="button" data-op-template="training">LIGHT / TRAINING OP</button></div>
-      <form method="post" class="s3-wizard-form" data-operation-wizard>
-        <input type="hidden" name="action" value="create_operation">
-        <fieldset><legend>1 — OPERATION DETAILS</legend><label>TITLE<input name="title" required></label><label>OPERATION NUMBER<input name="operation_number" placeholder="AUTO"></label><label>DATE / STEP-OFF<input type="datetime-local" name="start_at" required></label><label>DURATION (MIN)<input type="number" min="45" max="720" name="duration_minutes" value="90"></label><label>AO<input name="area_of_operations"></label><label>OIC / COMMANDER<input name="commander"></label></fieldset>
-        <fieldset><legend>2 — DISCORD CREDIT</legend><label>CREDIT VOICE CHANNEL<select name="credit_channel_id" required><option value="">SELECT DISCORD VOICE CHANNEL</option>{% for ch in discord_voice_channels %}<option value="{{ch.channel_id}}" {% if operation_channel and operation_channel.channel_id|string == ch.channel_id|string %}selected{% endif %}>{{ch.category_name ~ ' / ' if ch.category_name else ''}}{{ch.channel_name}}</option>{% endfor %}{% if operation_channel and not discord_voice_channels %}<option value="{{operation_channel.channel_id}}" selected>{{operation_channel.channel_name}}</option>{% endif %}</select></label><label>CHANNEL LABEL<input name="credit_channel_name" value="{{operation_channel.channel_name if operation_channel else 'Operation Voice'}}" placeholder="Used if channel directory is not available"></label><label>OFFICIAL CREDIT MINUTES<input type="number" min="5" max="720" name="credit_threshold_minutes" value="45"></label><p class="s3-form-note">Only verified presence in this channel during the operation window counts toward official credit.</p></fieldset>
-        <fieldset><legend>3 — WEAPON EXPENDITURE</legend><label>ROUNDS PER CREDITED SOLDIER<input type="number" min="0" max="1000" name="rounds_per_soldier" value="180"></label><p class="s3-form-note">Rounds accrue proportionally from verified Operation voice time while the event is live. Closeout reconciles the final weapon ledger without double-counting.</p></fieldset>
-        <fieldset><legend>4 — FORMATION / NOTIFICATIONS</legend><label>SCOPE<select name="formation_scope"><option>BATTALION</option><option>COMPANY</option><option>PLATOON</option><option>SQUAD</option></select></label><label>FORMATION<select name="formation_unit_node_id"><option value="">ALL BATTALION PERSONNEL</option>{% for u in units %}<option value="{{u.id}}">{{u.display_name}}</option>{% endfor %}</select></label><label>REMINDERS<input name="reminder_minutes" value="1440,120,30" placeholder="1440,120,30"></label><p class="s3-form-note">Default reminders: 24 hours, 2 hours, 30 minutes.</p></fieldset>
-        <details><summary>DETAILED FIELD ORDER (OPTIONAL)</summary><div class="army-form-grid"><label>H-HOUR<input name="h_hour"></label><label class="wide">1. SITUATION<textarea name="situation"></textarea></label><label class="wide">2. MISSION<textarea name="mission"></textarea></label><label class="wide">3. EXECUTION<textarea name="execution"></textarea></label><label class="wide">4. SERVICE SUPPORT<textarea name="service_support"></textarea></label><label class="wide">5. COMMAND & SIGNAL<textarea name="command_signal"></textarea></label></div></details>
-        <div class="s3-publish-actions"><button name="publish_now" value="NO" type="submit">SAVE DRAFT</button><button class="primary" name="publish_now" value="YES" type="submit">PUBLISH & START CLERK AUTOMATION</button></div>
-      </form>
-    </section>{% endif %}
-  </div>
-  <aside class="s3-side-column"><article class="document-sheet"><header><small>ATTENTION REQUIRED</small><h2>S-3 WATCH</h2></header>{% for op in current %}{% if not op.start_at or not op.credit_channel_id %}<p class="s3-attn-line"><b>{{op.operation_number}}</b><span>{% if not op.start_at %}Step-off missing{% endif %}{% if not op.credit_channel_id %} • Credit channel missing{% endif %}</span></p>{% endif %}{% else %}<p class="typed-empty">NO CURRENT OPERATION DEFICIENCIES.</p>{% endfor %}</article><article class="document-sheet"><header><small>WORKFLOW</small><h2>OPERATION LIFECYCLE</h2></header><ol class="s3-lifecycle"><li>CREATE / DRAFT</li><li>PUBLISH TO CLERK</li><li>TRACK LIVE ATTENDANCE</li><li>45+ MIN (OR CUSTOM) CREDIT</li><li>CLOSE & RECONCILE M16</li><li>FILE AAR / ARCHIVE</li></ol></article></aside>
-</section>
-
-<section class="operations-journal-area">
-  <article class="document-sheet operations-journal">
-    <p class="journal-note">Completed operations move from the current board into the battalion journal, where taskings, results, participation, and expenditure become part of the unit's permanent combat history.</p>
-    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>OPERATIONS JOURNAL</strong><span>1ST BATTALION, 5TH CAVALRY</span></header>
-    {% for op in completed %}
-      <a class="journal-entry" href="{{url_for('operation_detail',operation_id=op.id)}}">
-        <span>{{(op.completed_at or op.start_at).date() if (op.completed_at or op.start_at) else '—'}}</span>
-        <b>{{op.operation_number or 'OPERATION'}} — {{op.title}}</b>
-        <small>{{op.area_of_operations or 'AREA NOT FILED'}} • {{op.result or 'AAR FILED'}} • {{op.ammunition_expended or 0}} RDS EXPENDED</small>
-      </a>
-    {% else %}<p class="typed-empty">NO COMPLETED OPERATIONS HAVE BEEN ENTERED IN THE JOURNAL.</p>{% endfor %}
-  </article>
-
-  {% if session.get('access_role') in ['s3','company_hq','battalion_hq','commander','admin'] %}
-  <article class="document-sheet aar-form">
-    <header class="army-letterhead compact"><small>S-3 OPERATIONS</small><strong>AFTER ACTION REPORT</strong><span>FILE COMPLETED OPERATION</span></header>
-    <form method="post" class="army-form-grid">
-      <input type="hidden" name="action" value="file_aar">
-      <label>OPERATION<select name="operation_id">{% for op in current %}<option value="{{op.id}}">{{op.operation_number}} — {{op.title}}</option>{% endfor %}</select></label>
-      <label class="wide">RESULT<textarea name="result"></textarea></label>
-      <label class="wide">COMMANDER REMARKS<textarea name="commander_remarks"></textarea></label>
-      <button class="paper-action primary button-reset"><span>FILE AFTER ACTION REPORT</span><small>MOVE TO OPERATIONS JOURNAL</small></button>
-    </form>
-  </article>
-  {% endif %}
-</section>
-
-{% if session.get('access_role') in ['s3','battalion_hq','commander','admin'] %}
-<section class="recommendations-area">
-  <article class="document-sheet personnel-recommendation">
-    <header class="army-letterhead compact"><small>PERSONNEL ACTION</small><strong>POST-OPERATION RECOMMENDATION</strong><span>FOR COMMAND REVIEW</span></header>
-    <form method="post" class="army-form-grid">
-      <input type="hidden" name="action" value="recommend">
-      <label>SOLDIER<select name="personnel_id">{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}}</option>{% endfor %}</select></label>
-      <label>OPERATION<select name="operation_id"><option value="">NO SPECIFIC OPERATION</option>{% for op in current+completed %}<option value="{{op.id}}">{{op.operation_number}} — {{op.title}}</option>{% endfor %}</select></label>
-      <label>TYPE<select name="recommendation_type"><option>AWARD</option><option>PROMOTION</option><option>APPOINTMENT</option><option>PERSONNEL ACTION</option></select></label>
-      <label>RECOMMENDED ACTION<input name="recommended_action" required></label>
-      <label class="wide">JUSTIFICATION<textarea name="justification" required></textarea></label>
-      <button class="paper-action primary button-reset"><span>FORWARD RECOMMENDATION</span><small>COMMAND REVIEW REQUIRED</small></button>
-    </form>
-  </article>
+<section class="document-sheet ops-simple-schedule">
+  <header><small>NEW OPERATION</small><h2>SCHEDULE OPERATION</h2><p>Fill in the essentials and click once. The website publishes the Operation to Discord and arms attendance / M16 tracking automatically.</p></header>
+  <form method="post" class="ops-simple-form">
+    <input type="hidden" name="action" value="create_operation">
+    <label><span>OPERATION TITLE</span><input name="title" required placeholder="Operation name"></label>
+    <label><span>STEP-OFF</span><input type="datetime-local" name="start_at" required></label>
+    <label><span>DURATION</span><select name="duration_minutes"><option value="60">1 hour</option><option value="90" selected>1.5 hours</option><option value="120">2 hours</option><option value="180">3 hours</option><option value="240">4 hours</option></select></label>
+    <label><span>DISCORD OPERATION VOICE</span><select name="credit_channel_id" required><option value="">SELECT VOICE CHANNEL</option>{% for ch in discord_voice_channels %}<option value="{{ch.channel_id}}">{{ch.category_name ~ ' / ' if ch.category_name else ''}}{{ch.channel_name}}</option>{% endfor %}</select></label>
+    <label><span>OFFICIAL CREDIT</span><select name="credit_threshold_minutes"><option value="30">30 minutes</option><option value="45" selected>45 minutes</option><option value="60">60 minutes</option></select></label>
+    <label><span>FORMATION</span><select name="formation_unit_node_id"><option value="">ENTIRE BATTALION</option>{% for u in units %}<option value="{{u.id}}">{{u.display_name}}</option>{% endfor %}</select></label>
+    <input type="hidden" name="formation_scope" value="BATTALION">
+    <details class="ops-simple-advanced"><summary>OPTIONAL DETAILS</summary><div>
+      <label><span>OPERATION NUMBER</span><input name="operation_number" placeholder="AUTO"></label>
+      <label><span>AREA OF OPERATIONS</span><input name="area_of_operations"></label>
+      <label><span>OIC / COMMANDER</span><input name="commander"></label>
+      <label><span>H-HOUR</span><input name="h_hour"></label>
+      <label class="wide"><span>MISSION</span><textarea name="mission"></textarea></label>
+      <label class="wide"><span>EXECUTION</span><textarea name="execution"></textarea></label>
+      <input type="hidden" name="reminder_minutes" value="1440,120,30">
+    </div></details>
+    <button class="ops-primary" type="submit">SCHEDULE OPERATION</button>
+  </form>
+  {% if not discord_voice_channels %}<p class="ops-system-warning">NO DISCORD VOICE CHANNELS ARE CURRENTLY AVAILABLE. Battalion Clerk must be online long enough to refresh the Discord channel directory before an Operation can be scheduled.</p>{% endif %}
 </section>
 {% endif %}
+
+<section class="document-sheet ops-simple-board">
+  <header><small>S-3 LIVE BOARD</small><h2>CURRENT / UPCOMING</h2></header>
+  {% for op in current %}{% set live=live_map.get(op.id|string,{}) %}{% set assigned=duty_assignments.get(op.id|string,[]) %}
+  <article class="ops-simple-card">
+    <div class="ops-simple-card-main">
+      <div class="ops-simple-status"><b>{{op.status or 'SCHEDULED'}}</b><span class="{{'status-good-text' if live.sync_state=='SYNCED' else 'status-attn-text'}}">CLERK {{live.sync_state or 'CHECKING'}}</span></div>
+      <small>{{op.operation_number or 'OPERATION'}}</small>
+      <h3>{{op.title}}</h3>
+      <div class="ops-simple-meta">
+        <span><small>STEP-OFF</small><b>{{op.local_start_at.strftime('%d %b %Y • %I:%M %p') if op.local_start_at else 'NOT SET'}}</b></span>
+        <span><small>VOICE</small><b>{{op.credit_channel_name or 'NOT SET'}}</b></span>
+        <span><small>CREDIT</small><b>{{op.credit_threshold_minutes or 45}} MIN</b></span>
+        <span><small>ATTENDANCE</small><b>{{live.event.tracked_count if live.event else 0}} TRACKED / {{live.event.credited_count if live.event else 0}} CREDITED</b></span>
+      </div>
+    </div>
+
+    {% if can_control %}
+    <div class="ops-simple-actions">
+      <details><summary>EDIT SCHEDULE</summary>
+        <form method="post" class="ops-inline-form">
+          <input type="hidden" name="action" value="update_operation"><input type="hidden" name="operation_id" value="{{op.id}}">
+          <label>TITLE<input name="title" value="{{op.title}}" required></label>
+          <label>STEP-OFF<input type="datetime-local" name="start_at" value="{{op.local_start_at.strftime('%Y-%m-%dT%H:%M') if op.local_start_at else ''}}" required></label>
+          <label>DURATION<input type="number" min="45" max="720" name="duration_minutes" value="{{op.duration_minutes or 90}}"></label>
+          <label>CREDIT MIN<input type="number" min="5" max="720" name="credit_threshold_minutes" value="{{op.credit_threshold_minutes or 45}}"></label>
+          <label>VOICE<select name="credit_channel_id" required>{% for ch in discord_voice_channels %}<option value="{{ch.channel_id}}" {% if ch.channel_id|string==op.credit_channel_id|string %}selected{% endif %}>{{ch.category_name ~ ' / ' if ch.category_name else ''}}{{ch.channel_name}}</option>{% endfor %}</select></label>
+          <label>FORMATION<select name="formation_unit_node_id"><option value="">ENTIRE BATTALION</option>{% for u in units %}<option value="{{u.id}}" {% if u.id|string==op.formation_unit_node_id|string %}selected{% endif %}>{{u.display_name}}</option>{% endfor %}</select></label>
+          <input type="hidden" name="formation_scope" value="{{op.formation_scope or 'BATTALION'}}"><input type="hidden" name="reminder_minutes" value="{{op.reminder_minutes or '1440,120,30'}}">
+          <button type="submit">SAVE & RESYNC DISCORD</button>
+        </form>
+      </details>
+
+      <details><summary>ASSIGN DUTY ROLES ({{assigned|length}})</summary>
+        <form method="post" class="ops-duty-add">
+          <input type="hidden" name="action" value="assign_duty"><input type="hidden" name="operation_id" value="{{op.id}}">
+          <select name="personnel_id" required><option value="">SELECT SOLDIER</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}} — {{p.unit_code or 'UNASSIGNED'}}</option>{% endfor %}</select>
+          <select name="duty_role" required><option value="">SELECT ROLE</option><option>SQUAD LEADER</option><option>ASSISTANT SQUAD LEADER</option><option>TEAM LEADER</option><option>RIFLEMAN</option><option>GRENADIER</option><option>AUTOMATIC RIFLEMAN</option><option>MACHINE GUNNER</option><option>MEDIC</option><option>RADIOMAN</option><option>RTO</option><option>DRIVER</option><option>GUNNER</option><option>OTHER</option></select>
+          <input name="element" placeholder="Alpha / Bravo / HQ (optional)"><button type="submit">ASSIGN & DISTRIBUTE</button>
+        </form>
+        <div class="ops-duty-list">{% for a in assigned %}<div><span><b>{{a.rank_code}} {{a.last_name|upper}}</b><small>{{a.duty_role}}{{' • ' ~ a.element if a.element else ''}}</small></span><form method="post"><input type="hidden" name="action" value="remove_duty"><input type="hidden" name="operation_id" value="{{op.id}}"><input type="hidden" name="personnel_id" value="{{a.personnel_id}}"><button type="submit">REMOVE</button></form></div>{% else %}<p>NO OPERATION-SPECIFIC DUTY ROLES ASSIGNED.</p>{% endfor %}</div>
+      </details>
+
+      <details><summary>COMPLETE / CANCEL / DELETE</summary><div class="ops-destructive-row">
+        <form method="post"><input type="hidden" name="action" value="close_operation"><input type="hidden" name="operation_id" value="{{op.id}}"><select name="result"><option>COMPLETED</option><option>VICTORY</option><option>DEFEAT</option><option>DRAW</option><option>TRAINING COMPLETE</option></select><button type="submit">COMPLETE OPERATION</button></form>
+        <form method="post" onsubmit="return confirm('Cancel this Operation? Discord tracking will stop and the cancelled record will remain in history.');"><input type="hidden" name="action" value="cancel_operation"><input type="hidden" name="operation_id" value="{{op.id}}"><button type="submit">CANCEL</button></form>
+        <form method="post" action="{{url_for('operation_delete_action',operation_id=op.id)}}" onsubmit="return confirm('Delete this scheduled Operation from the active system?');"><button class="danger" type="submit">DELETE</button></form>
+      </div></details>
+      <a class="ops-history-link" href="{{url_for('operation_detail',operation_id=op.id)}}">VIEW FULL OPERATION RECORD</a>
+    </div>
+    {% endif %}
+  </article>
+  {% else %}<div class="ops-empty"><b>NO OPERATION CURRENTLY POSTED.</b><span>Scheduled Operations will appear here immediately after S-3 publishes them.</span></div>{% endfor %}
+</section>
+
+<section class="document-sheet ops-simple-completed">
+  <header><small>S-3 JOURNAL</small><h2>COMPLETED / CANCELLED</h2></header>
+  {% for op in completed %}<a href="{{url_for('operation_detail',operation_id=op.id)}}"><span><b>{{op.operation_number or 'OPERATION'}}</b> {{op.title}}</span><small>{{op.status}} • {{op.local_start_at.strftime('%d %b %Y') if op.local_start_at else ''}}{% if op.result %} • {{op.result}}{% endif %}</small></a>{% else %}<p>NO COMPLETED OPERATIONS ON FILE.</p>{% endfor %}
+</section>
 {% endblock %}

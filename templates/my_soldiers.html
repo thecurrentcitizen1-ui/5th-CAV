@@ -1,11 +1,11 @@
 {% extends 'base.html' %}
-{% block title %}My Soldiers • {{site_name}}{% endblock %}
+{% block title %}My Squad • {{site_name}}{% endblock %}
 {% block body_class %}page-my-soldiers member-soldiers-redesign{% endblock %}
 {% block content %}
 <section class="records-room-heading my-soldiers-heading">
   <div>
     <span>NONCOMMISSIONED OFFICER WORKING FILE</span>
-    <h1>MY SOLDIERS</h1>
+    <h1>MY SQUAD</h1>
     <p>{{scope.display_name if scope else 'CURRENT LEADERSHIP SCOPE'}}</p>
   </div>
 </section>
@@ -14,7 +14,7 @@
   <article class="document-sheet leader-roster">
     <header class="army-letterhead compact">
       <small>PERSONNEL STATUS</small>
-      <strong>ASSIGNED SOLDIERS</strong>
+      <strong>ASSIGNED SQUAD</strong>
       <span>READINESS • TRAINING • PROMOTION • PROPERTY</span>
     </header>
 

@@ -38,7 +38,7 @@
 
   <section class="command-status-grid">
     <article class="command-status-card {{'attention' if recruiting_counts.new_count else ''}}"><small>RECRUIT APPLICATIONS</small><strong>{{recruiting_counts.new_count or 0}}</strong><span>Awaiting Command review</span></article>
-    <article class="command-status-card"><small>ASSIGNED PERSONNEL</small><strong>{{personnel_count.total or 0}}</strong><span>Active battalion rolls</span></article>
+    <article class="command-status-card"><small>ASSIGNED PERSONNEL</small><strong>{{personnel_count.total or 0}}</strong><span>Active Battle Roster</span></article>
     <article class="command-status-card"><small>COMBAT READY</small><strong>{{ready_count.total or 0}}</strong><span>Ready / 80%+ readiness</span></article>
     <article class="command-status-card warning"><small>PROCESSING / DEFICIENT</small><strong>{{pending.total or 0}}</strong><span>Needs staff attention</span></article>
     <article class="command-status-card warning"><small>M16 INSPECTIONS DUE</small><strong>{{weapons_due.total or 0}}</strong><span>S-4 action required</span></article>
@@ -76,7 +76,7 @@
       <header class="command-panel-header"><small>COMMAND RECOGNITION</small><h2>SOLDIER OF THE MONTH / QUARTER</h2></header>
       <form method="post" action="{{url_for('honor_soldier_action')}}" class="command-form">
         <label>RECOGNITION<select name="recognition_type"><option>SOLDIER OF THE MONTH</option><option>SOLDIER OF THE QUARTER</option><option>BATTALION HONOR SOLDIER</option></select></label><label>SOLDIER<select name="personnel_id" required>{% for p in command_personnel or [] %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|upper}}, {{p.first_name}}</option>{% endfor %}</select></label>
-        <div class="command-form-two"><label>PERIOD<input name="period_label" placeholder="AUGUST 1966"></label><label>DATE<input type="date" name="effective_date"></label></div>
+        <div class="command-form-two"><label>PERIOD<input name="period_label" placeholder="AUGUST 1965"></label><label>DATE<input type="date" name="effective_date"></label></div>
         <label>NARRATIVE<textarea name="narrative" rows="4"></textarea></label>
         <button type="submit">FILE RECOGNITION</button>
       </form>

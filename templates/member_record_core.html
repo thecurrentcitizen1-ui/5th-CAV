@@ -33,6 +33,7 @@
       <div><small>RACK</small><b>{{weapon.rack_number or '—'}}</b></div>
       <div><small>TOTAL ROUNDS</small><b>{{weapon.total_rounds or 0}}</b></div>
       <div><small>SINCE CLEANING</small><b>{{weapon.rounds_since_cleaning or 0}}</b></div>
+      <div><small>LAST CLEANED</small><b>{{weapon.last_cleaned_at.strftime('%d %b %Y %H:%M')|upper if weapon.last_cleaned_at else 'NO ENTRY'}}</b></div>
       <div><small>FOULING</small><b>{{weapon.fouling_status or 'UNKNOWN'}}</b></div>
       <div><small>SERVICEABILITY</small><b>{{weapon.serviceability_status or weapon.status or 'UNKNOWN'}}</b></div>
     </div>

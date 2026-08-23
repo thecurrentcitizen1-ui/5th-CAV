@@ -12,7 +12,7 @@
   <article class="document-sheet member-unit-roster">
     <header class="army-letterhead compact">
       <small>1ST BATTALION, 5TH CAVALRY REGIMENT</small>
-      <strong>{{ personnel.unit_code or 'CURRENT ASSIGNMENT' }}</strong>
+      <strong>CURRENT FORMATION ROSTER</strong>
       <span>YOUR FORMATION</span>
     </header>
 
@@ -30,14 +30,14 @@
         <span role="columnheader">SOLDIER</span>
         <span role="columnheader">DUTY POSITION</span>
         <span role="columnheader">PLATOON</span>
-        <span role="columnheader">SQUAD</span>
+        <span role="columnheader">SQUAD / TEAM</span>
       </div>
-      {% for m in members %}
+      {% for m in members if m.id != personnel.id %}
       <div class="member-unit-table__row" role="row">
         <span class="member-unit-soldier" role="cell"><b>{{m.rank_code}} {{m.last_name|upper}}, {{m.first_name}}</b></span>
         <span role="cell">{{m.duty_position or m.mos_code or '—'}}</span>
         <span role="cell">{{m.platoon or '—'}}</span>
-        <span role="cell">{{m.squad or '—'}}</span>
+        <span role="cell">{{m.squad or '—'}}{% if m.fire_team %} • {{m.fire_team}}{% endif %}</span>
       </div>
       {% else %}
       <p class="typed-empty">NO OTHER SOLDIERS ARE CURRENTLY FILED WITHIN THIS ASSIGNMENT.</p>

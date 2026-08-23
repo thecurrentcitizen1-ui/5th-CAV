@@ -35,7 +35,7 @@
     <article class="document-sheet prospective-row">
       <div class="prospective-identity">
         <small>DISCORD MEMBER</small>
-        <h3>{{r.display_name or r.username}}</h3>
+        <h3>{{(r.display_name or r.username)|gamertag}}</h3>
         <span>@{{r.username}}</span>
       </div>
       <div><small>JOINED DISCORD</small><b>{{r.joined_at or r.updated_at}}</b></div>

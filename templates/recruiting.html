@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% block title %}Enlist • {{site_name}}{% endblock %}
-{% block body_class %}page-recruiting public-recruiting-1966{% endblock %}
+{% block body_class %}page-recruiting public-recruiting-1965{% endblock %}
 {% block content %}
 <section class="recruiting-office-intro">
   <img class="recruiting-office-intro__image" src="{{url_for('static',filename='art/public-overhaul/airmobile-operations.webp')}}" alt="1/5 Cavalry airmobile operations over Vietnam">
@@ -36,7 +36,7 @@
         <div>
           <small>STEP 1 — IDENTITY VERIFICATION</small>
           <h3>{% if discord_identity and discord_identity.id %}IDENTITY VERIFIED{% else %}VERIFY YOUR DISCORD IDENTITY{% endif %}</h3>
-          <p>Before processing begins, Headquarters must establish the Discord identity associated with this personnel file. This authorization also allows Battalion Clerk to add the approved applicant to the 1/5 Cav Discord automatically after Command approval.</p>
+          <p>Before processing begins, Headquarters must establish the Discord identity associated with this personnel file. This authorization allows Battalion Clerk to add you to the 1/5 Cav Discord automatically as soon as your application is submitted, so Headquarters can reach you while your case is under review.</p>
         </div>
         {% if discord_identity and discord_identity.id %}
         <div class="verified-discord-card">
@@ -57,7 +57,7 @@
 
       <section class="application-section-heading"><small>STEP 2 — APPLICATION</small><h3>PERSONNEL INFORMATION</h3><p>Answer each question accurately. Existing backend fields and validation are preserved.</p></section>
 
-      <form method="post" class="enlistment-form-1966">
+      <form method="post" class="enlistment-form-1965">
         <fieldset>
           <legend>SECTION I — PERSONAL INFORMATION</legend>
           <label><span>01</span><b>AGE</b><input type="number" min="13" max="99" name="age" value="{{form.get('age','')}}" placeholder="Optional"></label>
@@ -93,7 +93,7 @@
     <aside class="recruiting-admin-column">
       <section class="recruiting-side-paper">
         <header>REPORTING INSTRUCTIONS</header>
-        <ol><li>Authorize your Discord identity and automatic server entry.</li><li>Complete enlistment application.</li><li>Submit personnel packet.</li><li>Await Headquarters review.</li><li>Upon approval, Battalion Clerk adds you to the Discord and opens your Replacement 201 File.</li><li>Receive your Battle Roster Number, Field Code, and reporting instructions by Discord DM.</li></ol>
+        <ol><li>Authorize your Discord identity and automatic server entry.</li><li>Complete the enlistment application.</li><li>Submit your personnel packet.</li><li>Battalion Clerk admits you to Discord as an Applicant — Awaiting Review.</li><li>Headquarters reviews the case from the website.</li><li>Upon approval, your Replacement 201 File and Welcome Packet open automatically and Battalion Clerk sends your Battle Roster Number, Field Code, and reporting instructions by Discord DM.</li></ol>
       </section>
 
       <figure class="recruiting-taped-photo">

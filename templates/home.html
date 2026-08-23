@@ -31,8 +31,8 @@
     <div class="cav65-showcase-hero__copy reveal-object">
       <small>WELCOME TO THE 1/5 CAVALRY</small>
       <h1 id="showcase-title">YOU'VE ARRIVED<br>IN COUNTRY</h1>
-      <h2>THIS IS NOT A GAME. THIS IS YOUR TOUR.</h2>
-      <p>Report to a U.S. Army battalion in 1965 Vietnam. Earn your place. Build your record. Fight alongside your brothers. Your name belongs on the rolls.</p>
+      <h2>THIS IS YOUR TOUR. DEFINE IT.</h2>
+      <p>Report to the <strong>1st Battalion, 5th Cavalry Regiment</strong> in Vietnam. Take your place in the formation. Serve alongside your fellow soldiers. Build your record through training, operations, and service.<br><br><strong>Report for duty. Your assignment awaits.</strong></p>
       <div class="cav65-showcase-actions">
         <a class="cav65-showcase-button cav65-showcase-button--gold" href="{{ url_for('recruiting') }}"><b>REPORT TO THE 1/5 CAV</b><span>→</span></a>
         <a class="cav65-showcase-button" href="{{ url_for('organization') }}"><b>VIEW THE BATTALION</b><span>→</span></a>
@@ -55,7 +55,7 @@
       </aside>
       <div class="cav65-showcase-staff">
         <div><small>HEADQUARTERS • AUTHORIZED PERSONNEL</small><strong>STAFF ACCESS</strong><span>Separate staff credentials required.</span></div>
-        <a href="{{ url_for('staff_login') }}">OPEN STAFF LOGIN</a>
+        <a href="/staff-login" data-auth-lane="staff">OPEN STAFF LOGIN</a>
       </div>
     </div>
   </section>
@@ -71,25 +71,25 @@
     </article>
     <article class="cav65-showcase-card reveal-object">
       <div class="cav65-showcase-card__copy"><small>YOUR FORMATION</small><b>YOU ARE NOT ALONE.</b><p>Company. Platoon. Squad. Duty position. Your role matters when the battalion moves.</p><a href="{{ url_for('organization') }}">VIEW UNIT INFO <span>→</span></a></div>
-      <img src="{{ url_for('static', filename='art/public-recruiting/opsdesk.webp') }}" alt="1/5 Cavalry field headquarters desk">
+      <img src="{{ url_for('static', filename='art/public-recruiting/opsdesk-clean-v2.webp') }}" alt="1/5 Cavalry field headquarters desk">
     </article>
   </section>
 
   <section class="cav65-showcase-lower">
-    <article class="cav65-showcase-night reveal-object">
-      <header><small>A NIGHT IN THE 1/5</small><span>THIS IS HOW WE FIGHT.</span></header>
+    <article class="cav65-showcase-night cav65-recruiting-pipeline reveal-object">
+      <header><small>HOW ENLISTMENT WORKS</small><span>FROM APPLICANT TO THE LINE.</span></header>
       <div class="cav65-showcase-timeline">
-        <div><img src="{{ url_for('static', filename='art/public-recruiting/ruck.webp') }}" alt="Field gear"><b>FORMATION</b><p>Roll call. Check equipment. Listen to orders.</p></div>
+        <div><img src="{{ url_for('static', filename='art/public-overhaul/member-access-clipboard.webp') }}" alt="Recruiting application clipboard"><b>1 — BEGIN ENLISTMENT</b><p>Open your Recruiting Case, verify your Discord identity, and start the application.</p></div>
         <i>→</i>
-        <div><img src="{{ url_for('static', filename='art/public-recruiting/huey.webp') }}" alt="Airmobile helicopter"><b>MOVEMENT</b><p>Mount up. Lift off. Move into the AO.</p></div>
+        <div><img src="{{ url_for('static', filename='art/public-recruiting/journal-clean-v2.webp') }}" alt="Recruiting application paperwork"><b>2 — FILE APPLICATION</b><p>Tell Headquarters who you are, what you are looking for, and how you want to serve.</p></div>
         <i>→</i>
-        <div><img src="{{ url_for('static', filename='art/public-overhaul/combat-operations.webp') }}" alt="Combat patrol"><b>CONTACT</b><p>Find the enemy. Close with them. Destroy the threat.</p></div>
+        <div><img src="{{ url_for('static', filename='art/public-recruiting/fieldphone-clean-v2.webp') }}" alt="Headquarters communications"><b>3 — COMMAND REVIEW</b><p>Command reviews your case and may request additional information before making a decision.</p></div>
         <i>→</i>
-        <div><img src="{{ url_for('static', filename='art/public-recruiting/m60.webp') }}" alt="Machine gun position"><b>HOLD</b><p>Secure the area. Defend the position.</p></div>
+        <div><img src="{{ url_for('static', filename='art/public-recruiting/envelope.webp') }}" alt="Army personnel orders"><b>4 — REPORT IN</b><p>Once your application is submitted, Battalion Clerk brings your verified account into the Discord recruiting area. Approval then issues your BR number, Field Code, 201 File, and Welcome Packet.</p></div>
         <i>→</i>
-        <div><img src="{{ url_for('static', filename='art/public-recruiting/tent.webp') }}" alt="Field headquarters"><b>AFTER ACTION</b><p>Account for all. Write the report. Prepare for tomorrow.</p></div>
+        <div><img src="{{ url_for('static', filename='art/public-recruiting/helmet.webp') }}" alt="Vietnam combat helmet"><b>5 — JOIN THE LINE</b><p>Complete Replacement Detachment orientation, receive your assignment, and report to your company, platoon, and squad.</p></div>
       </div>
-      <a class="cav65-showcase-wide-button" href="{{ url_for('public_operations') }}">LEARN THE EXPERIENCE <span>→</span></a>
+      <a class="cav65-showcase-wide-button" href="{{ url_for('recruiting') }}">BEGIN YOUR ENLISTMENT <span>→</span></a>
     </article>
 
     <article class="cav65-showcase-sitboard reveal-object">
@@ -98,7 +98,7 @@
       <div class="cav65-showcase-sitrow"><span>REPLACEMENTS IN PROCESSING</span><b>{{ rec.processing or 0 }}</b></div>
       <div class="cav65-showcase-sitrow"><span>NEXT OPERATION</span><b>{% if next_op %}{{ next_op.operation_number or next_op.operation_code or 'POSTED' }}{% else %}STANDING BY{% endif %}</b></div>
       <div class="cav65-showcase-sitrow"><span>HEADQUARTERS WIRE</span><b>{% if latest_feed %}{{ latest_feed.kind }}{% else %}S-3{% endif %}</b></div>
-      <div class="cav65-showcase-map"><img src="{{ url_for('static', filename='art/public-recruiting/opsdesk.webp') }}" alt="Operations map table"><span>{% if next_op %}{{ next_op.title }}{% if next_op.starts_at %}<br>{{ next_op.starts_at.strftime('%m/%d/%Y • %H%M HRS') }}{% endif %}{% else %}NO FIELD MOVEMENT POSTED{% endif %}</span></div>
+      <div class="cav65-showcase-map"><img src="{{ url_for('static', filename='art/public-recruiting/opsdesk-clean-v2.webp') }}" alt="Operations map table"><span>{% if next_op %}{{ next_op.title }}{% if next_op.starts_at %}<br>{{ next_op.starts_at.strftime('%m/%d/%Y • %H%M HRS') }}{% endif %}{% else %}NO FIELD MOVEMENT POSTED{% endif %}</span></div>
       <a class="cav65-showcase-wide-button" href="{{ url_for('public_operations') }}">VIEW FULL SITUATION <span>→</span></a>
     </article>
 
@@ -117,7 +117,7 @@
 
   <section class="cav65-showcase-enlist reveal-object">
     <div class="cav65-showcase-enlist__photo"><img src="{{ url_for('static', filename='art/public-recruiting/helmet.webp') }}" alt="Vietnam-era combat helmet"></div>
-    <div><small>YOUR NAME IS NOT ON THE ROLLS YET.</small><p>The 1st Battalion, 5th Cavalry Regiment is looking for disciplined, mature and dedicated Soldiers ready to fight in an immersive Vietnam milsim experience.</p></div>
+    <div><small>CHARLIE WON'T WAIT. WHY SHOULD YOU? JOIN NOW!</small><p>The 1st Battalion, 5th Cavalry Regiment is looking for disciplined, mature, and dedicated Soldiers ready to fight in an immersive Vietnam milsim experience.</p></div>
     <a href="{{ url_for('recruiting') }}">BEGIN ENLISTMENT <span>→</span></a>
     <div class="cav65-showcase-enlist__air"><img src="{{ url_for('static', filename='art/public-recruiting/huey.webp') }}" alt="Huey helicopter"></div>
   </section>
