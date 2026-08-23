@@ -21,3 +21,28 @@ Then run:
 
 Optionally run:
 `/permissions-repair confirm:True`
+
+## Hell Let Loose: Vietnam RCON telemetry
+
+This build includes a read-only HLL: Vietnam RCON collector. The RCON password must be stored in Railway Variables and must never be committed to GitHub.
+
+Required Railway variables:
+- `HLL_RCON_ENABLED=true`
+- `HLL_RCON_HOST=64.31.40.206`
+- `HLL_RCON_PORT=7779`
+- `HLL_RCON_PASSWORD=<private RCON password>`
+
+Recommended defaults:
+- `HLL_RCON_POLL_SECONDS=5`
+- `HLL_RCON_CM_PER_METER=100`
+- `HLL_RCON_MAX_SPEED_MPS=130`
+- `HLL_RCON_RECONNECT_SECONDS=15`
+
+Discord commands:
+- `/hll-link` — Soldier self-links a 17-digit SteamID64
+- `/hll-unlink` — removes own link
+- `/hll-link-member` — staff link/repair
+- `/hll-rcon-status` — Command health check
+- `/hll-stats` — member field-service totals
+
+The first release is telemetry-only. It intentionally does not issue server-management RCON commands.

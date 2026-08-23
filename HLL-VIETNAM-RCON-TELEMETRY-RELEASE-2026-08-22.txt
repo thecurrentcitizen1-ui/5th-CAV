@@ -1,0 +1,45 @@
+1/5 CAV — HELL LET LOOSE: VIETNAM RCON TELEMETRY RELEASE
+2026-08-22
+
+PURPOSE
+Battalion Clerk now has an isolated, read-only HLL: Vietnam RCON collector. It does not replace Discord attendance, S-3 Operations, or the website as an authority. It files server telemetry that those systems can use later.
+
+LIVE DATA FILED
+- Server name, current map/layer, game mode and match timing
+- SteamID64/player identity
+- Platform/team/platoon/role ID
+- Connected sampled time
+- X/Y/Z movement-derived distance
+- Positive altitude gain (foundation for aviation records)
+- Role time and role distance ledgers
+- Combat / defense / offense / support score
+- Deaths, infantry kills, team kills, vehicle kills, vehicles destroyed
+
+MOVEMENT SAFETY
+- Unreal world units are converted with HLL_RCON_CM_PER_METER (default 100)
+- Samples after death/zero-position are not joined across respawn
+- Movement faster than HLL_RCON_MAX_SPEED_MPS (default 130 m/s / 468 km/h) is rejected as a likely teleport/respawn jump
+- This threshold preserves helicopter-scale movement while preventing obvious map jumps from inflating distance
+
+IDENTITY
+/hll-link <SteamID64> — self-link a Discord Soldier Record
+/hll-unlink — remove own link
+/hll-link-member — staff link a Soldier
+/hll-stats — view own collected totals
+/hll-rcon-status — staff health check
+
+RAILWAY VARIABLES
+HLL_RCON_ENABLED=true
+HLL_RCON_HOST=64.31.40.206
+HLL_RCON_PORT=7779
+HLL_RCON_PASSWORD=<YOUR NEW RCON PASSWORD — NEVER COMMIT>
+HLL_RCON_POLL_SECONDS=5
+HLL_RCON_CM_PER_METER=100
+HLL_RCON_MAX_SPEED_MPS=130
+HLL_RCON_RECONNECT_SECONDS=15
+
+DEPENDENCY
+HLL: Vietnam support currently uses timraay/hllrcon tag 2.0.0.0-beta-1 because the stable PyPI release line predates HLL: Vietnam. Move to stable hllrcon 2.x once published/tested.
+
+IMPORTANT
+This release deliberately does not issue RCON write/admin commands. Read telemetry first, prove reliability, then layer controlled server management on top. RCON credentials remain environment-only.

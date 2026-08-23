@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from collector import DataCollector
+from hllv_rcon import HLLVTelemetryCollector
 
 load_dotenv()
 
@@ -42,6 +43,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
+hllv = HLLVTelemetryCollector(collector)
 collector_started = False
 commands_synced = False
 
@@ -2581,6 +2583,13 @@ async def on_ready():
         await collector.start()
         collector_started = True
 
+    # HLL: Vietnam RCON is a read-only telemetry layer. A failed/unconfigured
+    # RCON connection must never prevent Discord or website automation startup.
+    try:
+        await hllv.start()
+    except Exception:
+        log.exception('[HLLV RCON STARTUP FAILED]')
+
     # Synchronize slash commands once per process. TEST_GUILD_ID wins when present
     # so new commands appear in the battalion server immediately.
     if not commands_synced:
@@ -3608,6 +3617,75 @@ async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db
     async with db.pool.acquire() as conn: v=await conn.fetchval("SELECT COALESCE(operation_rounds_default,180) FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
     return int(v or 180)
+
+# ---------------------------------------------------------------------------
+# HELL LET LOOSE: VIETNAM — RCON / TELEMETRY
+# ---------------------------------------------------------------------------
+@bot.tree.command(name='hll-link', description='Link your SteamID64 to your 1/5 CAV Soldier Record for automatic server statistics.')
+@app_commands.describe(steam_id='Your 17-digit SteamID64')
+async def hll_link(interaction:discord.Interaction, steam_id:str):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.link_personnel(interaction.guild.id,interaction.user.id,steam_id,f'DISCORD SELF-LINK:{interaction.user.id}')
+    if not result.get('ok'):
+        await interaction.followup.send(f"HLL link not filed: **{result.get('error','unknown error')}**",ephemeral=True); return
+    await interaction.followup.send(
+        f"**HLL: VIETNAM IDENTITY LINK FILED**\n{result.get('soldier')} is now linked to SteamID64 `{result.get('steam_id')}`. "
+        "Battalion Clerk will automatically file server time, distance, role time and combat statistics while you are on the unit server.",ephemeral=True)
+
+@bot.tree.command(name='hll-unlink', description='Remove your SteamID64 link from automatic HLL: Vietnam statistics.')
+async def hll_unlink(interaction:discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
+    await interaction.response.send_message('Your HLL telemetry identity link was removed.' if ok else 'No HLL telemetry link was on file.',ephemeral=True)
+
+@bot.tree.command(name='hll-link-member', description='Staff: link a Soldier to a SteamID64 for HLL: Vietnam telemetry.')
+@app_commands.describe(member='Soldier to link',steam_id='17-digit SteamID64')
+async def hll_link_member(interaction:discord.Interaction, member:discord.Member, steam_id:str):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.link_personnel(interaction.guild.id,member.id,steam_id,f'STAFF:{interaction.user.id}')
+    if not result.get('ok'):
+        await interaction.followup.send(f"Link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
+    await interaction.followup.send(f"Linked **{result.get('soldier')}** to SteamID64 `{result.get('steam_id')}`.",ephemeral=True)
+
+@bot.tree.command(name='hll-rcon-status', description='Show Battalion Clerk HLL: Vietnam RCON collector health.')
+async def hll_rcon_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    st=await hllv.status()
+    last=st.get('last_success_at')
+    last_txt=last.isoformat() if hasattr(last,'isoformat') else str(last or 'NEVER')
+    await interaction.followup.send(
+        '**HLL: VIETNAM RCON STATUS**\n'
+        f"Configured: **{'YES' if st.get('configured') else 'NO'}**\n"
+        f"Connection: **{'CURRENT' if st.get('connected') else 'NOT CURRENT'}**\n"
+        f"Server: **{st.get('server_name') or '—'}**\n"
+        f"Map / Mode: **{st.get('map_name') or '—'} / {st.get('game_mode') or '—'}**\n"
+        f"Players: **{st.get('player_count',0)}**\nLast successful sample: `{last_txt}`\n"
+        + (f"Last error: `{str(st.get('last_error'))[:700]}`" if st.get('last_error') else 'Last error: **NONE**'),ephemeral=True)
+
+@bot.tree.command(name='hll-stats', description='Show your automatically recorded HLL: Vietnam field-service statistics.')
+async def hll_stats(interaction:discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    data=await hllv.personnel_stats(interaction.guild.id,interaction.user.id)
+    if not data:
+        await interaction.followup.send('No Soldier Record is linked to your Discord account.',ephemeral=True); return
+    if not data.get('link'):
+        await interaction.followup.send('Your Soldier Record exists, but no SteamID64 is linked. Use `/hll-link` first.',ephemeral=True); return
+    a=data.get('aggregate') or {}; latest=data.get('latest') or {}
+    sec=int(a.get('seconds') or 0); h=sec//3600; m=(sec%3600)//60
+    km=float(a.get('distance') or 0)/1000.0
+    await interaction.followup.send(
+        '**HLL: VIETNAM — FIELD SERVICE STATISTICS**\n'
+        f"Matches sampled: **{int(a.get('matches') or 0)}**\nServer time: **{h}h {m}m**\nDistance traveled: **{km:.2f} km**\n"
+        f"Infantry kills: **{int(a.get('infantry_kills') or 0)}** • Deaths: **{int(a.get('deaths') or 0)}**\n"
+        f"Vehicle kills: **{int(a.get('vehicle_kills') or 0)}** • Vehicles destroyed: **{int(a.get('vehicles_destroyed') or 0)}**\n"
+        f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)
 
 if not TOKEN:
     raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables.')
