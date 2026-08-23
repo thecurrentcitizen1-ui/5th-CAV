@@ -274,6 +274,10 @@ class HLLVTelemetryCollector:
                 rejected_jump_samples INTEGER NOT NULL DEFAULT 0,
                 role_seconds JSONB NOT NULL DEFAULT '{}'::jsonb,
                 role_distance_meters JSONB NOT NULL DEFAULT '{}'::jsonb,
+                role_max_speed_mps JSONB NOT NULL DEFAULT '{}'::jsonb,
+                role_high_speed_seconds JSONB NOT NULL DEFAULT '{}'::jsonb,
+                max_observed_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
+                high_speed_seconds INTEGER NOT NULL DEFAULT 0,
                 combat_score INTEGER NOT NULL DEFAULT 0,
                 defense_score INTEGER NOT NULL DEFAULT 0,
                 offense_score INTEGER NOT NULL DEFAULT 0,
@@ -292,6 +296,16 @@ class HLLVTelemetryCollector:
                 UNIQUE(match_id, steam_id)
             )
         """)
+        # Forward-compatible observational fields. They are deliberately not called
+        # "flight time": high-speed movement is evidence for later vehicle/aviation
+        # classification, not proof of aircraft occupancy.
+        for ddl in (
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_max_speed_mps JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_high_speed_seconds JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS max_observed_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS high_speed_seconds INTEGER NOT NULL DEFAULT 0",
+        ):
+            await self.db.execute(ddl)
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_player_stats_personnel ON hll_player_match_stats(personnel_id,last_seen_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_player_stats_steam ON hll_player_match_stats(steam_id,last_seen_at DESC)")
         await self.db.execute("""
@@ -526,12 +540,14 @@ class HLLVTelemetryCollector:
         accrue_seconds = int(min(dt, RCON_POLL_SECONDS * 3)) if dt > 0 else 0
         distance_m = 0.0
         altitude_gain_m = 0.0
+        observed_speed_mps = 0.0
         rejected = 0
         if pos and alive and row.get("last_alive") and row.get("last_x") is not None and dt > 0:
             raw = math.sqrt((pos[0]-float(row["last_x"]))**2 + (pos[1]-float(row["last_y"]))**2 + (pos[2]-float(row["last_z"]))**2)
             candidate_m = raw / RCON_CM_PER_METER
             speed = candidate_m / dt
             if speed <= RCON_MAX_SPEED_MPS:
+                observed_speed_mps = max(0.0, speed)
                 distance_m = candidate_m
                 dz_m = (pos[2] - float(row["last_z"])) / RCON_CM_PER_METER
                 altitude_gain_m = max(0.0, dz_m)
@@ -539,9 +555,16 @@ class HLLVTelemetryCollector:
                 rejected = 1
         role_seconds = _json_dict(row.get("role_seconds"))
         role_distance = _json_dict(row.get("role_distance_meters"))
+        role_max_speed = _json_dict(row.get("role_max_speed_mps"))
+        role_high_speed = _json_dict(row.get("role_high_speed_seconds"))
         role_key = role_id or "UNKNOWN"
         role_seconds[role_key] = int(role_seconds.get(role_key, 0) or 0) + accrue_seconds
         role_distance[role_key] = float(role_distance.get(role_key, 0.0) or 0.0) + distance_m
+        role_max_speed[role_key] = max(float(role_max_speed.get(role_key, 0.0) or 0.0), observed_speed_mps)
+        # 15 m/s (~54 km/h) is intentionally only an observation threshold.
+        # It can represent vehicles or aircraft and is never treated as flight time.
+        high_speed_add = accrue_seconds if observed_speed_mps >= 15.0 else 0
+        role_high_speed[role_key] = int(role_high_speed.get(role_key, 0) or 0) + high_speed_add
         x, y, z = pos if pos else (None, None, None)
         await self.db.execute("""
             UPDATE hll_player_match_stats SET
@@ -549,11 +572,15 @@ class HLLVTelemetryCollector:
                 last_seen_at=$8,connected_seconds=connected_seconds+$9,distance_meters=distance_meters+$10,
                 altitude_gain_meters=altitude_gain_meters+$11,movement_samples=movement_samples+$12,rejected_jump_samples=rejected_jump_samples+$13,
                 role_seconds=$14::jsonb,role_distance_meters=$15::jsonb,
-                combat_score=$16,defense_score=$17,offense_score=$18,support_score=$19,deaths=$20,infantry_kills=$21,team_kills=$22,vehicle_kills=$23,vehicles_destroyed=$24,
-                last_x=$25,last_y=$26,last_z=$27,last_sample_at=$8,last_alive=$28,updated_at=NOW()
-            WHERE id=$29
+                role_max_speed_mps=$16::jsonb,role_high_speed_seconds=$17::jsonb,
+                max_observed_speed_mps=GREATEST(COALESCE(max_observed_speed_mps,0),$18),
+                high_speed_seconds=COALESCE(high_speed_seconds,0)+$19,
+                combat_score=$20,defense_score=$21,offense_score=$22,support_score=$23,deaths=$24,infantry_kills=$25,team_kills=$26,vehicle_kills=$27,vehicles_destroyed=$28,
+                last_x=$29,last_y=$30,last_z=$31,last_sample_at=$8,last_alive=$32,updated_at=NOW()
+            WHERE id=$33
         """, personnel_id, name, platform, team_id, platoon, platoon_index, role_id, now, accrue_seconds, distance_m,
              altitude_gain_m, 1 if distance_m > 0 else 0, rejected, json.dumps(role_seconds), json.dumps(role_distance),
+             json.dumps(role_max_speed), json.dumps(role_high_speed), observed_speed_mps, high_speed_add,
              int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0),
              int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0),
              int(_first(stats, "deaths", default=0) or 0), int(_first(stats, "infantry_kills", "infantryKills", default=0) or 0),
@@ -631,11 +658,24 @@ class HLLVTelemetryCollector:
                    COALESCE(SUM(infantry_kills),0)::bigint AS infantry_kills,
                    COALESCE(SUM(vehicle_kills),0)::bigint AS vehicle_kills,
                    COALESCE(SUM(vehicles_destroyed),0)::bigint AS vehicles_destroyed,
-                   COALESCE(SUM(deaths),0)::bigint AS deaths
+                   COALESCE(SUM(deaths),0)::bigint AS deaths,
+                   COALESCE(SUM(combat_score),0)::bigint AS combat_score,
+                   COALESCE(SUM(defense_score),0)::bigint AS defense_score,
+                   COALESCE(SUM(offense_score),0)::bigint AS offense_score,
+                   COALESCE(SUM(support_score),0)::bigint AS support_score
             FROM hll_player_match_stats WHERE personnel_id=$1
         """, person["personnel_id"])
         latest = await self.db.fetchrow("""
             SELECT s.*,m.map_name,m.game_mode,m.started_at FROM hll_player_match_stats s
             JOIN hll_match_sessions m ON m.id=s.match_id WHERE s.personnel_id=$1 ORDER BY s.last_seen_at DESC LIMIT 1
         """, person["personnel_id"])
-        return {"person": dict(person), "link": dict(link) if link else None, "aggregate": dict(agg) if agg else {}, "latest": dict(latest) if latest else None}
+        aggregate=dict(agg) if agg else {}
+        hours=float(aggregate.get("seconds") or 0)/3600.0
+        matches=int(aggregate.get("matches") or 0)
+        if hours >= 40 or matches >= 25: field_experience="VETERAN"
+        elif hours >= 15 or matches >= 10: field_experience="COMBAT TESTED"
+        elif hours >= 5 or matches >= 3: field_experience="FIELD EXPERIENCED"
+        else: field_experience="NEWLY ARRIVED"
+        aggregate["field_experience"]=field_experience
+        aggregate["score_total"]=sum(int(aggregate.get(k) or 0) for k in ("combat_score","defense_score","offense_score","support_score"))
+        return {"person": dict(person), "link": dict(link) if link else None, "aggregate": aggregate, "latest": dict(latest) if latest else None}

@@ -1,0 +1,5 @@
+HLLV SERVICE RECORD PHASE 2
+
+- Adds observational mobility fields to HLL player-match telemetry: maximum accepted speed, high-speed duration, and per-role equivalents.
+- These are research signals for later aviation/vehicle classification, never automatic flight hours.
+- Existing RCON collection, Steam linkage, match/player stats, and all prior compatibility fixes are preserved.

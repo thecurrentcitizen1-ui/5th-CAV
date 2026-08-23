@@ -3685,6 +3685,8 @@ async def hll_stats(interaction:discord.Interaction):
         f"Matches sampled: **{int(a.get('matches') or 0)}**\nServer time: **{h}h {m}m**\nDistance traveled: **{km:.2f} km**\n"
         f"Infantry kills: **{int(a.get('infantry_kills') or 0)}** • Deaths: **{int(a.get('deaths') or 0)}**\n"
         f"Vehicle kills: **{int(a.get('vehicle_kills') or 0)}** • Vehicles destroyed: **{int(a.get('vehicles_destroyed') or 0)}**\n"
+        f"Verified field experience: **{a.get('field_experience') or 'NEWLY ARRIVED'}**\n"
+        f"Total score: **{int(a.get('score_total') or 0)}**\n"
         f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)
 
 if not TOKEN:

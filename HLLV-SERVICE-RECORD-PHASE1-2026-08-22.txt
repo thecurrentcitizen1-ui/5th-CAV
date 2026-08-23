@@ -1,0 +1,5 @@
+HLL: VIETNAM SERVICE RECORD EXPANSION — PHASE 1
+
+- /hll-stats now reports Verified Field Experience and total score.
+- Collector storage/connection behavior is unchanged.
+- Field experience is derived from verified server hours/rounds only and has no promotion/award authority.
