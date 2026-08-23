@@ -11,7 +11,8 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 log = logging.getLogger("battalion-clerk.hllv-rcon")
@@ -78,6 +79,53 @@ def _text(value: Any) -> str:
         except Exception:
             pass
     return str(value)
+
+
+def _seconds(value: Any, default: int = 0) -> int:
+    """Normalize HLL/HLLV timer values to whole seconds.
+
+    HLLV RCON builds have returned timers both as numeric seconds and ISO-8601
+    durations (for example ``PT1H30M``). Accept either representation so a
+    server-side serialization change cannot stop the telemetry collector.
+    """
+    if value is None:
+        return int(default)
+    if isinstance(value, timedelta):
+        return max(0, int(value.total_seconds()))
+    if isinstance(value, bool):
+        return int(default)
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+
+    raw = str(value).strip()
+    if not raw:
+        return int(default)
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        pass
+
+    # Basic ISO-8601 duration support: PnDTnHnMnS / PTnHnMnS.
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+(?:\.\d+)?)D)?"
+        r"(?:T(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+        r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+        r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        parts = {k: float(v or 0) for k, v in match.groupdict().items()}
+        total = (
+            parts["days"] * 86400
+            + parts["hours"] * 3600
+            + parts["minutes"] * 60
+            + parts["seconds"]
+        )
+        return max(0, int(total))
+
+    log.warning("[HLLV TIMER PARSE] unrecognized timer value=%r; using %ss", raw, default)
+    return int(default)
 
 
 def _position(player: Any, data: dict) -> Optional[tuple[float, float, float]]:
@@ -347,8 +395,8 @@ class HLLVTelemetryCollector:
             "map_id": map_id,
             "map_name": map_name,
             "game_mode": game_mode,
-            "match_length": int(_first(d, "match_length", "matchLength", default=0) or 0),
-            "remaining_match_time": int(_first(d, "remaining_match_time", "remainingMatchTime", default=0) or 0),
+            "match_length": _seconds(_first(d, "match_length", "matchLength", default=0)),
+            "remaining_match_time": _seconds(_first(d, "remaining_match_time", "remainingMatchTime", default=0)),
             "allied_score": int(_first(d, "allied_score", "alliedScore", default=0) or 0),
             "axis_score": int(_first(d, "axis_score", "axisScore", default=0) or 0),
         }
