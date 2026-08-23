@@ -1,0 +1,49 @@
+1/5 CAV HLL: VIETNAM IN-GAME RECRUITING MESSAGING
+2026-08-23
+
+Website display format: WWW.5THCAVGAMING.COM
+Discord: https://discord.gg/aXMyfKgr5
+
+DEPLOYMENT / WELCOME MESSAGE
+WELCOME TO 1ST BATTALION, 5TH CAVALRY — VIETNAM 1965
+Fight with the same men. Earn your place. Build a service record that follows your tour.
+Organized Air Cavalry operations, ranks, awards, qualifications and persistent service history.
+REPORT FOR DUTY: WWW.5THCAVGAMING.COM
+DISCORD: https://discord.gg/aXMyfKgr5
+
+TOP-LEFT BROADCASTS
+00:50 / 10 seconds
+1/5 CAV IS ACCEPTING REPLACEMENTS.
+REPORT FOR DUTY: WWW.5THCAVGAMING.COM
+
+00:30:00 / 8 seconds
+YOUR TOUR DOESN’T END WHEN THE MATCH DOES.
+1/5 CAV IS RECRUITING — WWW.5THCAVGAMING.COM
+
+01:00:00 / 8 seconds
+CHARLIE WON’T WAIT. WHY SHOULD YOU?
+REPORT FOR DUTY WITH 1/5 CAV — WWW.5THCAVGAMING.COM
+
+01:30:00 / 8 seconds
+FIGHT WITH THE SAME MEN. EARN YOUR PLACE. BUILD YOUR SERVICE RECORD.
+WWW.5THCAVGAMING.COM
+
+02:00:00 / 8 seconds
+RUN THROUGH THE JUNGLE WITH A COMMUNITY THAT FIGHTS TOGETHER.
+1/5 CAV — WWW.5THCAVGAMING.COM
+
+After 120 minutes, the four 30-minute messages repeat in order. The map-start replacement notice does not repeat.
+Broadcasts are skipped when the server is empty and are explicitly cleared after their display duration.
+
+FIRST-TIME PLAYER MESSAGE
+Sent once per unique server player after a 60-second grace period. Existing players with earlier HLL telemetry are grandfathered silently so deployment does not mass-message the current community.
+
+WELCOME TO 1/5 CAV TERRITORY.
+Enjoy the fight. If you’re looking for an organized Vietnam unit, report for duty at WWW.5THCAVGAMING.COM
+
+IMPLEMENTATION
+- Uses HLLV RCON SetWelcomeMessage for deployment text.
+- Uses ServerBroadcast for top-left timed notices and clears with an empty broadcast.
+- Uses MessagePlayer for one-time first-visit recruiting message.
+- Messaging failures are isolated from telemetry; RCON stats collection continues.
+- No new Railway variable is required. HLL_RCON_RECRUITING_ENABLED is an optional kill switch and defaults true.

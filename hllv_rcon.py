@@ -40,6 +40,32 @@ RCON_RECONNECT_SECONDS = max(5, int(os.getenv("HLL_RCON_RECONNECT_SECONDS", "15"
 # not claim direct seat telemetry (HLLV RCON does not expose vehicle occupancy).
 RCON_AIRMOBILE_MIN_SPEED_MPS = max(15.0, float(os.getenv("HLL_RCON_AIRMOBILE_MIN_SPEED_MPS", "20") or 20))
 
+# 1/5 CAV in-game recruiting / server messaging.  This intentionally defaults
+# on whenever the already-enabled HLLV RCON collector is running; no additional
+# Railway variable is required for the approved unit configuration.
+RCON_RECRUITING_ENABLED = _env_bool("HLL_RCON_RECRUITING_ENABLED", True)
+RCON_RECRUITING_WEBSITE = "WWW.5THCAVGAMING.COM"
+RCON_RECRUITING_DISCORD = "https://discord.gg/aXMyfKgr5"
+RCON_FIRST_JOIN_DELAY_SECONDS = 60
+
+RCON_WELCOME_MESSAGE = (
+    "WELCOME TO 1ST BATTALION, 5TH CAVALRY — VIETNAM 1965\n"
+    "Fight with the same men. Earn your place. Build a service record that follows your tour.\n"
+    "Organized Air Cavalry operations, ranks, awards, qualifications and persistent service history.\n"
+    f"REPORT FOR DUTY: {RCON_RECRUITING_WEBSITE}\n"
+    f"DISCORD: {RCON_RECRUITING_DISCORD}"
+)
+
+# elapsed-second threshold, display duration, message.  The map-start message is
+# deliberately not part of the repeating 30-minute sequence.
+RCON_RECRUITING_BROADCASTS = (
+    (50, 10, f"1/5 CAV IS ACCEPTING REPLACEMENTS.\nREPORT FOR DUTY: {RCON_RECRUITING_WEBSITE}"),
+    (30 * 60, 8, f"YOUR TOUR DOESN’T END WHEN THE MATCH DOES.\n1/5 CAV IS RECRUITING — {RCON_RECRUITING_WEBSITE}"),
+    (60 * 60, 8, f"CHARLIE WON’T WAIT. WHY SHOULD YOU?\nREPORT FOR DUTY WITH 1/5 CAV — {RCON_RECRUITING_WEBSITE}"),
+    (90 * 60, 8, f"FIGHT WITH THE SAME MEN. EARN YOUR PLACE. BUILD YOUR SERVICE RECORD.\n{RCON_RECRUITING_WEBSITE}"),
+    (120 * 60, 8, f"RUN THROUGH THE JUNGLE WITH A COMMUNITY THAT FIGHTS TOGETHER.\n1/5 CAV — {RCON_RECRUITING_WEBSITE}"),
+)
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -274,6 +300,13 @@ class HLLVTelemetryCollector:
         self.last_error: str = ""
         self.last_server: dict = {}
         self.last_players: int = 0
+        self._welcome_applied = False
+        self._match_started_local: Optional[datetime] = None
+        self._message_match_id: Optional[int] = None
+        self._sent_broadcast_thresholds: set[int] = set()
+        self._broadcast_generation = 0
+        self._first_join_candidates: dict[str, datetime] = {}
+        self._first_join_suppressed: set[str] = set()
 
     @property
     def configured(self) -> bool:
@@ -457,6 +490,14 @@ class HLLVTelemetryCollector:
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_personnel_time ON hll_weapon_events(personnel_id,event_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_attacker_time ON hll_weapon_events(attacker_id,event_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_m16 ON hll_weapon_events(is_m16,event_at DESC)")
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS hll_first_join_messages (
+                steam_id TEXT PRIMARY KEY,
+                player_name TEXT,
+                first_messaged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                message_version TEXT NOT NULL DEFAULT '1/5-CAV-RECRUITING-V1'
+            )
+        """)
         for ddl in (
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS m16_carried_seconds INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS m16_distance_meters DOUBLE PRECISION NOT NULL DEFAULT 0"
@@ -583,6 +624,13 @@ class HLLVTelemetryCollector:
         self.last_server = server
         self.last_players = len(players)
         match_id = await self._ensure_match(server)
+        # Player-facing server messages are intentionally isolated from telemetry.
+        # Any messaging failure is logged but can never stop stats collection.
+        if RCON_RECRUITING_ENABLED:
+            try:
+                await self._run_server_messaging(match_id, server, players)
+            except Exception as exc:
+                log.warning("[HLLV SERVER MESSAGING FAILED] %s: %s", type(exc).__name__, exc)
         for player in players:
             await self._file_player(match_id, player)
         # Weapon attribution comes from the authoritative HLLV admin log.  Pull a
@@ -594,6 +642,156 @@ class HLLVTelemetryCollector:
             log.warning("[HLLV WEAPON LOG POLL FAILED] %s: %s", type(exc).__name__, exc)
         await self.db.execute("UPDATE hll_match_sessions SET last_seen_at=NOW() WHERE id=$1", match_id)
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
+
+    def _player_identity(self, player: Any) -> tuple[str, str, str]:
+        d = _dump_model(player)
+        player_id = _text(_first(d, "id", "iD", default=""))
+        steam_id = _text(_first(d, "steam_id", "steamId", "steamID", default=""))
+        if not steam_id and player_id.isdigit() and len(player_id) >= 16:
+            steam_id = player_id
+        if not player_id:
+            player_id = steam_id
+        return player_id, steam_id, _text(_first(d, "name", default=""))
+
+    def _round_elapsed_seconds(self, server: dict) -> int:
+        # Prefer the authoritative server timer when it looks usable.  Fall back
+        # to the collector's observed match start when HLLV omits total duration.
+        total = int(server.get("match_length") or 0)
+        remaining = int(server.get("remaining_match_time") or 0)
+        if total > 0 and 0 <= remaining <= total:
+            return max(0, total - remaining)
+        if self._match_started_local:
+            return max(0, int((utcnow() - self._match_started_local).total_seconds()))
+        return 0
+
+    def _scheduled_recruiting_broadcast(self, elapsed: int) -> Optional[tuple[int, int, str]]:
+        """Return the latest recruiting slot due at ``elapsed`` seconds.
+
+        The 50-second map-start notice is one-off.  The four 30-minute notices
+        then repeat every two hours without replaying the map-start notice.
+        """
+        elapsed = max(0, int(elapsed))
+        if elapsed < 50:
+            return None
+        if elapsed < 30 * 60:
+            return RCON_RECRUITING_BROADCASTS[0]
+
+        rotation = RCON_RECRUITING_BROADCASTS[1:]
+        slot_number = elapsed // (30 * 60)  # 1 at 30m, 2 at 60m, ...
+        threshold = slot_number * 30 * 60
+        template = rotation[(slot_number - 1) % len(rotation)]
+        return (threshold, template[1], template[2])
+
+    async def _run_server_messaging(self, match_id: int, server: dict, players: list[Any]):
+        if not self.rcon:
+            return
+
+        # Set the deployment/welcome message once per Battalion Clerk process.
+        # SetWelcomeMessage is persistent server text; we do not repeatedly flash it.
+        if not self._welcome_applied:
+            await self.rcon.set_welcome_message(RCON_WELCOME_MESSAGE)
+            self._welcome_applied = True
+            log.info("[HLLV WELCOME MESSAGE SET] website=%s", RCON_RECRUITING_WEBSITE)
+
+        # A fresh map/mode session gets a fresh advertising clock.  Never carry an
+        # old round's sent flags or pending clear token into the new operation.
+        if self._message_match_id != match_id:
+            self._message_match_id = match_id
+            self._sent_broadcast_thresholds.clear()
+            self._broadcast_generation += 1
+
+        # No top-left advertising when the server is empty. If Clerk comes online
+        # late in a round, send only the single latest due slot, never a backlog.
+        if players:
+            elapsed = self._round_elapsed_seconds(server)
+            due = self._scheduled_recruiting_broadcast(elapsed)
+            if due:
+                threshold, duration, message = due
+                if threshold not in self._sent_broadcast_thresholds:
+                    # Mark earlier fixed thresholds consumed so they cannot appear
+                    # later if the server timer jitters backwards.
+                    for fixed_threshold, _, _ in RCON_RECRUITING_BROADCASTS:
+                        if fixed_threshold < threshold:
+                            self._sent_broadcast_thresholds.add(fixed_threshold)
+                    await self._send_timed_broadcast(message, duration, threshold)
+
+        # One private recruiting note per genuinely new server visitor.
+        await self._message_first_time_players(match_id, players)
+
+    async def _send_timed_broadcast(self, message: str, duration: int, threshold: int):
+        self._sent_broadcast_thresholds.add(threshold)
+        self._broadcast_generation += 1
+        generation = self._broadcast_generation
+        await self.rcon.broadcast(message)
+        log.info("[HLLV RECRUITING BROADCAST] threshold=%ss duration=%ss", threshold, duration)
+
+        async def clear_later():
+            try:
+                await asyncio.sleep(max(1, int(duration)))
+                if self.rcon and generation == self._broadcast_generation:
+                    await self.rcon.broadcast("")
+                    log.info("[HLLV RECRUITING BROADCAST CLEARED] threshold=%ss", threshold)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("[HLLV RECRUITING CLEAR FAILED] %s: %s", type(exc).__name__, exc)
+
+        asyncio.create_task(clear_later(), name=f"hllv-recruiting-clear-{threshold}")
+
+    async def _message_first_time_players(self, match_id: int, players: list[Any]):
+        now = utcnow()
+        online_ids: set[str] = set()
+        for player in players:
+            player_id, steam_id, name = self._player_identity(player)
+            unique_id = steam_id or player_id
+            if not unique_id or not player_id:
+                continue
+            online_ids.add(unique_id)
+            if unique_id in self._first_join_suppressed:
+                continue
+            sent = await self.db.fetchrow("SELECT 1 FROM hll_first_join_messages WHERE steam_id=$1", unique_id)
+            if sent:
+                self._first_join_suppressed.add(unique_id)
+                self._first_join_candidates.pop(unique_id, None)
+                continue
+            if unique_id not in self._first_join_candidates:
+                # Existing telemetry from an older round means this is not a first
+                # visit; grandfather the player silently instead of advertising.
+                historical = None
+                if steam_id:
+                    historical = await self.db.fetchrow(
+                        "SELECT 1 FROM hll_player_match_stats WHERE steam_id=$1 AND match_id<>$2 LIMIT 1",
+                        steam_id, match_id
+                    )
+                if historical:
+                    await self.db.execute(
+                        "INSERT INTO hll_first_join_messages(steam_id,player_name,message_version) VALUES($1,$2,'LEGACY-SEEN') ON CONFLICT DO NOTHING",
+                        unique_id, name or None
+                    )
+                    self._first_join_suppressed.add(unique_id)
+                    continue
+                self._first_join_candidates[unique_id] = now
+                continue
+            if (now - self._first_join_candidates[unique_id]).total_seconds() < RCON_FIRST_JOIN_DELAY_SECONDS:
+                continue
+            message = (
+                "WELCOME TO 1/5 CAV TERRITORY.\n"
+                "Enjoy the fight. If you’re looking for an organized Vietnam unit, "
+                f"report for duty at {RCON_RECRUITING_WEBSITE}"
+            )
+            await self.rcon.message_player(player_id, message)
+            await self.db.execute(
+                "INSERT INTO hll_first_join_messages(steam_id,player_name,message_version) VALUES($1,$2,'1/5-CAV-RECRUITING-V1') ON CONFLICT DO NOTHING",
+                unique_id, name or None
+            )
+            self._first_join_suppressed.add(unique_id)
+            self._first_join_candidates.pop(unique_id, None)
+            log.info("[HLLV FIRST-JOIN MESSAGE] player=%s player_id=%s", name, player_id)
+
+        # Do not retain timers for players who left before the grace period.
+        for steam_id in list(self._first_join_candidates):
+            if steam_id not in online_ids:
+                self._first_join_candidates.pop(steam_id, None)
 
     async def _poll_weapon_logs(self, match_id: int):
         # RCON V2 GetAdminLog uses seconds, not minutes.  Keep a small overlap so
@@ -710,6 +908,7 @@ class HLLVTelemetryCollector:
         """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0))
         self._active_match_id = int(row["id"])
         self._active_match_signature = signature
+        self._match_started_local = utcnow()
         log.info("[HLLV MATCH OPEN] id=%s map=%s mode=%s", self._active_match_id, server.get("map_name"), server.get("game_mode"))
         return self._active_match_id
 
