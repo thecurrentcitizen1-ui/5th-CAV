@@ -1,9 +1,0 @@
-HLLV SERVICE RECORD PHASE 2
-
-- RCON-derived field-service events merged into the 201 File chronological Active Service timeline.
-- Area-of-operations/map experience ledger.
-- Primary observed HLL role and richer role ledger.
-- Operation telemetry now derives each Soldier's primary observed role and distinguishes RCON contact from 5+ minute verified contact.
-- M16 panel now shows verified field-carry observation only; server time never invents rounds fired or changes weapon condition.
-- Mobility/aviation observation layer records maximum accepted movement speed, high-speed duration, altitude gain, and per-role high-speed evidence. It explicitly does NOT file flight hours until aircraft occupancy/role mapping is verified.
-- Administrative authority remains unchanged: RCON evidence cannot grant rank, awards, qualifications, or official attendance by itself.
