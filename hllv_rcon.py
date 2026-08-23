@@ -70,6 +70,30 @@ def _first(data: dict, *names: str, default=None):
     return default
 
 
+def _json_dict(value: Any) -> dict:
+    """Return a dict from PostgreSQL JSON/JSONB regardless of codec behavior.
+
+    asyncpg can return json/jsonb columns as strings unless a custom codec is
+    installed.  Accept mappings, JSON text, Pydantic models, and empty/null
+    values so telemetry polling cannot fail merely because the DB codec differs.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw)
+            return dict(decoded) if isinstance(decoded, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    dumped = _dump_model(value)
+    return dict(dumped) if isinstance(dumped, dict) else {}
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -490,8 +514,8 @@ class HLLVTelemetryCollector:
                 altitude_gain_m = max(0.0, dz_m)
             else:
                 rejected = 1
-        role_seconds = dict(row.get("role_seconds") or {})
-        role_distance = dict(row.get("role_distance_meters") or {})
+        role_seconds = _json_dict(row.get("role_seconds"))
+        role_distance = _json_dict(row.get("role_distance_meters"))
         role_key = role_id or "UNKNOWN"
         role_seconds[role_key] = int(role_seconds.get(role_key, 0) or 0) + accrue_seconds
         role_distance[role_key] = float(role_distance.get(role_key, 0.0) or 0.0) + distance_m
