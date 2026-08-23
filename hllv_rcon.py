@@ -141,6 +141,23 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _player_identity(data: dict) -> tuple[str, str, str, str]:
+    """Return (player_key, steam_id64, platform_id, eos_id).
+
+    Existing database columns retain the historical ``steam_id`` name for
+    compatibility, but player_key may be a SteamID64, console platform ID, or
+    EOS ID. Display names are never used as the durable identity key.
+    """
+    steam_id = _text(_first(data, "steam_id", "steamId", "steamID", default="")).strip()
+    eos_id = _text(_first(data, "eos_id", "eosId", "eosID", "epic_online_services_id", "epicOnlineServicesId", default="")).strip()
+    platform_id = _text(_first(data, "platform_id", "platformId", "platform_user_id", "platformUserId", default="")).strip()
+    raw_id = _text(_first(data, "id", "iD", default="")).strip()
+    if not platform_id and raw_id and raw_id != steam_id:
+        platform_id = raw_id
+    player_key = steam_id or eos_id or platform_id
+    return player_key, steam_id, platform_id, eos_id
+
+
 def _infer_game_mode(map_id: Any) -> str:
     """Infer the human-readable HLLV mode from the layer/map id when the
     current RCON model omits gameMode.  This is based on the layer naming the
@@ -302,6 +319,9 @@ class HLLVTelemetryCollector:
                 personnel_id TEXT NOT NULL,
                 discord_user_id TEXT,
                 hll_player_name TEXT,
+                platform TEXT,
+                platform_user_id TEXT,
+                eos_id TEXT,
                 verified BOOLEAN NOT NULL DEFAULT TRUE,
                 linked_by TEXT,
                 linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -334,6 +354,8 @@ class HLLVTelemetryCollector:
                 personnel_id TEXT,
                 player_name TEXT,
                 platform TEXT,
+                platform_user_id TEXT,
+                eos_id TEXT,
                 team_id TEXT,
                 platoon TEXT,
                 platoon_index INTEGER,
@@ -375,6 +397,11 @@ class HLLVTelemetryCollector:
         # "flight time": high-speed movement is evidence for later vehicle/aviation
         # classification, not proof of aircraft occupancy.
         for ddl in (
+            "ALTER TABLE hll_personnel_links ADD COLUMN IF NOT EXISTS platform TEXT",
+            "ALTER TABLE hll_personnel_links ADD COLUMN IF NOT EXISTS platform_user_id TEXT",
+            "ALTER TABLE hll_personnel_links ADD COLUMN IF NOT EXISTS eos_id TEXT",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS platform_user_id TEXT",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS eos_id TEXT",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_max_speed_mps JSONB NOT NULL DEFAULT '{}'::jsonb",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_high_speed_seconds JSONB NOT NULL DEFAULT '{}'::jsonb",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS max_observed_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0",
@@ -853,17 +880,13 @@ class HLLVTelemetryCollector:
 
     async def _file_player(self, match_id: int, player: Any):
         d = _dump_model(player)
-        steam_id = _text(_first(d, "steam_id", "steamId", "steamID", default=""))
-        if not steam_id:
-            # Some HLLV models call this platform-specific identifier simply id.
-            candidate = _text(_first(d, "id", "iD", default=""))
-            # The web RCON response exposes both iD and steamId. Only treat long
-            # numeric IDs as SteamID64 when the dedicated field is absent.
-            if candidate.isdigit() and len(candidate) >= 16:
-                steam_id = candidate
-        if not steam_id:
+        player_key, steam_id64, platform_user_id, eos_id = _player_identity(d)
+        if not player_key:
             return
-        personnel_id = await self._personnel_id(steam_id)
+        # The historical column name is steam_id, but it now stores the durable
+        # HLL player key for Steam, Xbox, and PlayStation identities.
+        steam_id = player_key
+        personnel_id = await self._personnel_id(player_key)
         name = _text(_first(d, "name", default=""))
         platform = _text(_first(d, "platform", default=""))
         team_id = _text(_first(d, "team_id", "teamId", "team", default=""))
@@ -886,18 +909,18 @@ class HLLVTelemetryCollector:
             x, y, z = pos if pos else (None, None, None)
             await self.db.execute("""
                 INSERT INTO hll_player_match_stats(
-                    match_id,steam_id,personnel_id,player_name,platform,team_id,platoon,platoon_index,last_role_id,
+                    match_id,steam_id,personnel_id,player_name,platform,platform_user_id,eos_id,team_id,platoon,platoon_index,last_role_id,
                     combat_score,defense_score,offense_score,support_score,deaths,infantry_kills,team_kills,vehicle_kills,vehicles_destroyed,
                     last_x,last_y,last_z,last_sample_at,last_alive
-                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-            """, match_id, steam_id, personnel_id, name, platform, team_id, platoon, platoon_index, role_id,
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+            """, match_id, steam_id, personnel_id, name, platform, platform_user_id or None, eos_id or None, team_id, platoon, platoon_index, role_id,
                  int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0),
                  int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0),
                  int(_first(stats, "deaths", default=0) or 0), int(_first(stats, "infantry_kills", "infantryKills", default=0) or 0),
                  int(_first(stats, "team_kills", "teamKills", default=0) or 0), int(_first(stats, "vehicle_kills", "vehicleKills", default=0) or 0),
                  int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0), x, y, z, now, alive)
             if personnel_id:
-                await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,updated_at=NOW() WHERE steam_id=$2", name, steam_id)
+                await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,platform=COALESCE(NULLIF($2,''),platform),platform_user_id=COALESCE(NULLIF($3,''),platform_user_id),eos_id=COALESCE(NULLIF($4,''),eos_id),updated_at=NOW() WHERE steam_id=$5", name, platform, platform_user_id, eos_id, steam_id)
             return
 
         last_sample = row.get("last_sample_at")
@@ -1004,7 +1027,7 @@ class HLLVTelemetryCollector:
              int(_first(stats, "team_kills", "teamKills", default=0) or 0), int(_first(stats, "vehicle_kills", "vehicleKills", default=0) or 0),
              int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0), x, y, z, alive, row["id"])
         if personnel_id:
-            await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,updated_at=NOW() WHERE steam_id=$2", name, steam_id)
+            await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,platform=COALESCE(NULLIF($2,''),platform),platform_user_id=COALESCE(NULLIF($3,''),platform_user_id),eos_id=COALESCE(NULLIF($4,''),eos_id),updated_at=NOW() WHERE steam_id=$5", name, platform, platform_user_id, eos_id, steam_id)
 
     async def status(self) -> dict:
         if not self.db.pool:
@@ -1047,6 +1070,56 @@ class HLLVTelemetryCollector:
             return {"ok": False, "error": f"Link conflict: {exc}"}
         name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
         return {"ok": True, "personnel_id": person["personnel_id"], "soldier": name, "steam_id": steam_id}
+
+    async def link_console_personnel(self, guild_id: int, discord_user_id: int, platform: str, gamertag: str, linked_by: str) -> dict:
+        """Resolve an Xbox/PlayStation display name to the durable RCON identity
+        already observed on this server, then link it to a Soldier Record.
+        """
+        await self.collector.start()
+        platform = str(platform or "").strip().upper()
+        gamertag = str(gamertag or "").strip()
+        if platform not in {"XBOX", "PS5"}:
+            return {"ok": False, "error": "Platform must be Xbox or PlayStation 5."}
+        if not gamertag:
+            return {"ok": False, "error": "Enter the console gamertag / PSN Online ID."}
+        person = await self.db.fetchrow("""
+            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
+            FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text
+            WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1
+        """, str(guild_id), str(discord_user_id))
+        if not person:
+            return {"ok": False, "error": "No active Soldier Record is linked to that Discord account."}
+        # HLLV platform labels vary slightly by RCON/client build. Match the
+        # requested console family plus the exact visible in-game name.
+        if platform == "XBOX":
+            platform_pred = "LOWER(COALESCE(platform,'')) LIKE '%xbox%'"
+        else:
+            platform_pred = "(LOWER(COALESCE(platform,'')) LIKE '%playstation%' OR LOWER(COALESCE(platform,'')) LIKE '%ps5%' OR LOWER(COALESCE(platform,'')) LIKE '%psn%')"
+        row = await self.db.fetchrow(f"""
+            SELECT steam_id,player_name,platform,platform_user_id,eos_id,last_seen_at
+            FROM hll_player_match_stats
+            WHERE LOWER(player_name)=LOWER($1) AND {platform_pred}
+            ORDER BY last_seen_at DESC LIMIT 1
+        """, gamertag)
+        if not row:
+            return {"ok": False, "error": f"No {platform} player named '{gamertag}' has been observed by Battalion Clerk yet. Have them join the 1/5 CAV server once, then run this command again."}
+        player_key = str(row.get("steam_id") or "").strip()
+        if not player_key:
+            return {"ok": False, "error": "The server saw that player name but did not expose a stable platform identity. Try again while the player is currently in the server."}
+        try:
+            await self.db.execute("""
+                INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,hll_player_name,platform,platform_user_id,eos_id,linked_by,verified,updated_at)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,NOW())
+                ON CONFLICT(steam_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,discord_user_id=EXCLUDED.discord_user_id,
+                    hll_player_name=EXCLUDED.hll_player_name,platform=EXCLUDED.platform,platform_user_id=EXCLUDED.platform_user_id,eos_id=EXCLUDED.eos_id,
+                    linked_by=EXCLUDED.linked_by,verified=TRUE,updated_at=NOW()
+            """, player_key, person["personnel_id"], str(discord_user_id), row.get("player_name"), row.get("platform"), row.get("platform_user_id"), row.get("eos_id"), linked_by)
+            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2", person["personnel_id"], player_key)
+            await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2", person["personnel_id"], player_key)
+        except Exception as exc:
+            return {"ok": False, "error": f"Link conflict: {exc}"}
+        name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
+        return {"ok": True, "personnel_id": person["personnel_id"], "soldier": name, "player_name": row.get("player_name"), "platform": platform, "player_key": player_key}
 
     async def unlink_personnel(self, guild_id: int, discord_user_id: int) -> bool:
         person = await self.db.fetchrow("""

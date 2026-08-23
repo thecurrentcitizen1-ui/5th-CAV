@@ -1,0 +1,7 @@
+1/5 CAV BATTALION CLERK — CONSOLE GAME ID LINKING
+
+- Collector now accepts durable Steam, EOS, or platform-specific player IDs; display names are not used as durable keys.
+- Added platform_user_id and eos_id metadata to HLL telemetry/link tables.
+- Added staff command: /hll-link-console member:<Discord member> platform:<Xbox|PlayStation 5> gamertag:<exact in-game name>.
+- The console player must have appeared on the 1/5 CAV server at least once so Battalion Clerk can resolve the gamertag to a stable server identity.
+- Once linked, historical telemetry for that stable identity is attached to the Soldier Record.
