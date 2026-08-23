@@ -1,8 +1,0 @@
-{% extends 'base.html' %}
-{% block title %}M16 {{weapon.serial_number}} • {{site_name}}{% endblock %}
-{% block body_class %}page-weapon-history{% endblock %}
-{% block content %}
-<section class="staff-workspace"><article class="document-sheet"><header class="army-letterhead"><small>S-4 ARMS ROOM</small><strong>WEAPON SERVICE RECORD</strong><span>M16 SERIAL {{weapon.serial_number}} • RACK {{weapon.rack_number}}</span></header><div class="weapon-visual large"><img src="{{url_for('static',filename='art/m16-rifle-master.webp')}}" alt="M16"></div><dl class="form-grid"><dt>STATUS</dt><dd>{{weapon.status}}</dd><dt>CONDITION</dt><dd>{{weapon.condition_state}} • {{weapon.condition_percent}}%</dd><dt>LIFETIME ROUNDS</dt><dd>{{weapon.total_rounds or weapon.rounds_fired or 0}}</dd><dt>ROUNDS SINCE CLEANING</dt><dd>{{weapon.rounds_since_cleaning}}</dd></dl></article>
-<article class="document-sheet"><header><small>PROPERTY BOOK</small><b>ASSIGNMENT CONTINUITY</b></header>{% for h in history %}<div class="entry-row"><span>{{h.rank_code}} {{h.last_name|upper}}, {{h.first_name}}</span><b>{{h.issued_at}}{% if h.turned_in_at %} — {{h.turned_in_at}}{% else %} — CURRENT{% endif %}</b><small>ISSUE CONDITION {{h.condition_at_issue}}{% if h.condition_at_turn_in %} • TURN-IN {{h.condition_at_turn_in}}{% endif %}</small></div>{% endfor %}</article>
-<article class="document-sheet"><header><small>ARMS ROOM</small><b>MAINTENANCE HISTORY</b></header>{% for m in maintenance %}<div class="entry-row"><span>{{m.action_type}}</span><b>{{m.performed_at}}</b><small>{{m.condition_before}} → {{m.condition_after}} • {{m.performed_by or 'S-4'}}</small></div>{% else %}<p class="typed-empty">NO MAINTENANCE ACTIONS FILED.</p>{% endfor %}</article></section>
-{% endblock %}

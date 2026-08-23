@@ -1,9 +1,0 @@
-{% extends 'base.html' %}
-{% block title %}Welcome Packet — {{personnel.last_name}} • {{site_name}}{% endblock %}
-{% block body_class %}page-staff-welcome-packet{% endblock %}
-{% block content %}
-<section class="staff-welcome-file">
-  <header><div><small>S-1 • COMMAND VIEW</small><h1>{{personnel.rank_code}} {{personnel.last_name|upper}}, {{personnel.first_name}}</h1><p>Welcome Packet oversight. The member sees the same requirements without staff override controls.</p></div><div><b>{{packet.status|replace('_',' ')}}</b><span>{{percent}}% COMPLETE</span><a href="{{url_for('personnel_service_record',personnel_id=personnel.id)}}">OPEN 201 FILE</a></div></header>
-  {% for phase in phases %}<section class="staff-welcome-phase"><header><div><small>PHASE {{loop.index}}</small><h2>{{phase.label}}</h2></div><strong>{{phase.done}} / {{phase.total}}</strong></header>{% for task in phase.tasks %}<div class="staff-welcome-task"><span>{{'✓' if task.status in ['COMPLETE','WAIVED'] else '○'}}</span><div><b>{{task.title}}</b><small>{{task.status}}{% if task.completed_by %} • {{task.completed_by}}{% endif %}</small></div><form method="post"><input type="hidden" name="task_code" value="{{task.task_code}}">{% if task.status not in ['COMPLETE','WAIVED'] %}<button name="action" value="COMPLETE">MARK COMPLETE</button><button name="action" value="WAIVE">WAIVE</button>{% else %}<button name="action" value="RESET">RESET</button>{% endif %}</form></div>{% endfor %}</section>{% endfor %}
-</section>
-{% endblock %}

@@ -1,8 +1,0 @@
-{% extends 'base.html' %}
-{% block title %}{{section}} Workload • {{site_name}}{% endblock %}
-{% block body_class %}page-staff-workload{% endblock %}
-{% block content %}
-<section class="staff-section-hero"><div class="staff-shade"></div><div class="staff-sign"><span>HEADQUARTERS WORK CONTROL</span><h1>{{section}} WORKLOAD DESK</h1><p>Open actions, overdue work and section priorities.</p></div></section>
-<section class="staff-workspace"><article class="document-sheet"><header class="army-letterhead compact"><small>{{section}}</small><strong>SECTION WORKLOAD</strong><span>ACTION CONTROL</span></header><div class="brief-strength"><div><small>OPEN</small><b>{{workload.counts.open or 0}}</b></div><div><small>HIGH PRIORITY</small><b>{{workload.counts.urgent or 0}}</b></div><div><small>OVERDUE</small><b>{{workload.overdue_count}}</b></div></div></article>
-<article class="document-sheet"><header><small>ACTION CONTROL</small><b>OVERDUE ACTIONS</b></header>{% for a in workload.overdue %}<div class="entry-row overdue-action"><span>{{a.rank_code or ''}} {{a.last_name or ''}}</span><b>{{a.subject}}</b><small>DUE {{a.due_date}} • {{a.priority}}</small></div>{% else %}<p class="typed-empty">NO OVERDUE ACTIONS.</p>{% endfor %}</article></section>
-{% endblock %}
