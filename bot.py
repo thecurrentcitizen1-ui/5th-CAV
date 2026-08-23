@@ -3651,6 +3651,32 @@ async def hll_link_member(interaction:discord.Interaction, member:discord.Member
         await interaction.followup.send(f"Link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
     await interaction.followup.send(f"Linked **{result.get('soldier')}** to SteamID64 `{result.get('steam_id')}`.",ephemeral=True)
 
+@bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
+@app_commands.describe(message='Message to display in game (180 characters maximum)')
+async def server_message(interaction:discord.Interaction, message:str):
+    if not await require_manage_guild(interaction): return
+    clean=' '.join(str(message or '').split()).strip()
+    if not clean:
+        await interaction.response.send_message('Enter a message to send to the server.',ephemeral=True); return
+    if len(clean)>180:
+        await interaction.response.send_message(f'Message is **{len(clean)}** characters. Keep it to **180 or fewer**.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.send_manual_broadcast(clean,10)
+    if not result.get('ok'):
+        await interaction.followup.send(f"Server message was not sent: **{result.get('error','unknown error')}**",ephemeral=True); return
+    await interaction.followup.send(
+        f"**SERVER MESSAGE SENT**\nDisplayed for **{result.get('display_seconds',10)} seconds**, then it will clear automatically.\n\n{result.get('message')}",
+        ephemeral=True)
+
+@bot.tree.command(name='server-message-clear', description='Staff: immediately clear the current HLL: Vietnam server broadcast.')
+async def server_message_clear(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.clear_manual_broadcast()
+    if not result.get('ok'):
+        await interaction.followup.send(f"Server message could not be cleared: **{result.get('error','unknown error')}**",ephemeral=True); return
+    await interaction.followup.send('**SERVER MESSAGE CLEARED**',ephemeral=True)
+
 @bot.tree.command(name='hll-rcon-status', description='Show Battalion Clerk HLL: Vietnam RCON collector health.')
 async def hll_rcon_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return

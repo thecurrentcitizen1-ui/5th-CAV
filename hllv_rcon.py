@@ -653,6 +653,61 @@ class HLLVTelemetryCollector:
         self._broadcast_next_elapsed = ((elapsed // interval) + 1) * interval
         await self._send_recruiting_broadcast()
 
+    async def send_manual_broadcast(self, message: str, display_seconds: int = 10) -> dict:
+        """Send one staff-requested global server broadcast, then clear it.
+
+        This intentionally does not alter the recurring recruiting clock.  The
+        shared broadcast generation prevents an older scheduled clear task from
+        erasing a newer manual message (or vice versa).
+        """
+        text = " ".join(str(message or "").split()).strip()
+        if not text:
+            return {"ok": False, "error": "Message cannot be blank."}
+        if len(text) > 180:
+            return {"ok": False, "error": "Message is too long. Keep it to 180 characters or fewer."}
+        if not self.configured:
+            return {"ok": False, "error": "HLL: Vietnam server connection is not configured."}
+        if not self.rcon:
+            return {"ok": False, "error": "HLL: Vietnam server connection is not currently available."}
+
+        seconds = max(3, min(int(display_seconds or 10), 30))
+        self._broadcast_generation += 1
+        generation = self._broadcast_generation
+        try:
+            await self.rcon.broadcast(text)
+        except Exception as exc:
+            log.warning("[HLLV MANUAL BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
+            return {"ok": False, "error": f"Server broadcast failed: {type(exc).__name__}"}
+
+        log.info("[HLLV MANUAL BROADCAST] duration=%ss chars=%s", seconds, len(text))
+
+        async def clear_later():
+            try:
+                await asyncio.sleep(seconds)
+                if self.rcon and generation == self._broadcast_generation:
+                    await self.rcon.broadcast("")
+                    log.info("[HLLV MANUAL BROADCAST CLEARED]")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("[HLLV MANUAL BROADCAST CLEAR FAILED] %s: %s", type(exc).__name__, exc)
+
+        asyncio.create_task(clear_later(), name="hllv-manual-broadcast-clear")
+        return {"ok": True, "message": text, "display_seconds": seconds}
+
+    async def clear_manual_broadcast(self) -> dict:
+        """Immediately clear the current global server broadcast."""
+        if not self.rcon:
+            return {"ok": False, "error": "HLL: Vietnam server connection is not currently available."}
+        self._broadcast_generation += 1
+        try:
+            await self.rcon.broadcast("")
+            log.info("[HLLV MANUAL BROADCAST CLEARED BY STAFF]")
+            return {"ok": True}
+        except Exception as exc:
+            log.warning("[HLLV MANUAL BROADCAST CLEAR FAILED] %s: %s", type(exc).__name__, exc)
+            return {"ok": False, "error": f"Server broadcast clear failed: {type(exc).__name__}"}
+
     async def _send_recruiting_broadcast(self):
         self._broadcast_generation += 1
         generation = self._broadcast_generation

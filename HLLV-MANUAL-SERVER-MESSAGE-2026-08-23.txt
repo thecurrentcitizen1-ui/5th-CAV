@@ -1,0 +1,20 @@
+1/5 CAV — HLL: VIETNAM MANUAL SERVER MESSAGE
+2026-08-23
+
+Added staff-only Discord slash commands:
+  /server-message <message>
+  /server-message-clear
+
+/server-message:
+- Manage Server / Administrator permission required.
+- One-time global HLL: Vietnam broadcast.
+- 180-character maximum.
+- Displays for 10 seconds and clears automatically.
+- Does not modify or reset the existing 30-minute recruiting broadcast schedule.
+- Uses the existing live RCON connection; no new environment variables required.
+
+/server-message-clear:
+- Immediately clears the current global server broadcast.
+- Manage Server / Administrator permission required.
+
+Broadcast clear tasks use the shared generation guard so an older clear timer cannot erase a newer message.
