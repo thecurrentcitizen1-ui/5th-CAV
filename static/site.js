@@ -81,7 +81,7 @@ if(rosterSearch){ rosterSearch.addEventListener('input',()=>{ const q=rosterSear
   const openDrawer=async(url)=>{
     if(!drawer||!content||!url)return;
     drawer.classList.add('open');backdrop?.classList.add('open');drawer.setAttribute('aria-hidden','false');document.body.classList.add('staff-drawer-open');
-    content.innerHTML='<div class="drawer-loading"><b>OPENING PERSONNEL FILE…</b><span>Loading current assignment, weapon and actions.</span></div>';
+    content.innerHTML='<div class="drawer-loading"><b>OPENING PERSONNEL FILE…</b><span>Loading current assignment, weapon, and actions.</span></div>';
     try{
       const res=await fetch(url,{headers:{'X-Requested-With':'XMLHttpRequest'}});
       if(!res.ok)throw new Error(`HTTP ${res.status}`);
@@ -135,3 +135,56 @@ document.addEventListener('pointerdown', function (event) {
   window.addEventListener('pointerup', clear, { once: true });
   window.addEventListener('pointercancel', clear, { once: true });
 });
+
+
+// 2026-08-22 — 1965 interactive battalion awards record.
+(() => {
+  const parseJson = id => { try { const el=document.getElementById(id); return el ? JSON.parse(el.textContent||'[]') : []; } catch(e){ return []; } };
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  const publicData=parseJson('public-ribbon-catalog-json');
+  const publicModal=document.querySelector('[data-award-public-modal]');
+  const openPublic=code => {
+    if(!publicModal) return; const r=publicData.find(x=>x.ribbon_code===code); if(!r) return;
+    const img=publicModal.querySelector('[data-award-detail-image]');
+    if(img){ img.src=r.image_filename ? `/static/art/ribbons/${r.image_filename}` : ''; img.alt=r.ribbon_name||''; img.hidden=!r.image_filename; }
+    publicModal.querySelector('[data-award-detail-name]').textContent=r.ribbon_name||'';
+    publicModal.querySelector('[data-award-detail-type]').textContent=r.award_type_label||String(r.automation_mode||'').replaceAll('_',' ');
+    publicModal.querySelector('[data-award-detail-description]').textContent=r.description_text||r.requirement_text||'';
+    publicModal.querySelector('[data-award-detail-earning]').textContent=r.earning_text||r.requirement_text||'';
+    publicModal.querySelector('[data-award-detail-requirement]').textContent=r.requirement_text||'';
+    publicModal.setAttribute('aria-hidden','false'); document.body.classList.add('award-modal-open');
+  };
+  document.querySelectorAll('[data-award-public-card]').forEach(el=>{
+    el.addEventListener('click',()=>openPublic(el.dataset.ribbonCode));
+    el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openPublic(el.dataset.ribbonCode);}});
+  });
+  document.querySelectorAll('[data-award-public-close]').forEach(el=>el.addEventListener('click',()=>{if(publicModal)publicModal.setAttribute('aria-hidden','true');document.body.classList.remove('award-modal-open');}));
+
+  const memberData=parseJson('member-ribbon-details-json');
+  const memberModal=document.querySelector('[data-member-award-modal]');
+  const openMember=code => {
+    if(!memberModal) return; const r=memberData.find(x=>x.ribbon_code===code); if(!r) return;
+    const img=memberModal.querySelector('[data-member-award-image]');
+    if(img){img.src=r.image_filename?`/static/art/ribbons/${r.image_filename}`:'';img.alt=r.ribbon_name||'';img.hidden=!r.image_filename;}
+    memberModal.querySelector('[data-member-award-name]').textContent=r.ribbon_name||'';
+    memberModal.querySelector('[data-member-award-type]').textContent=r.award_type_label||String(r.automation_mode||'').replaceAll('_',' ');
+    memberModal.querySelector('[data-member-award-status]').textContent=r.earned ? `AUTHORIZED • ${r.earned_at||'DATE ON FILE'}${r.is_worn?' • WORN':' • NOT WORN'}` : 'NOT YET AUTHORIZED';
+    memberModal.querySelector('[data-member-award-device]').textContent=r.earned ? `${r.award_count||1} AWARD${Number(r.award_count||1)===1?'':'S'} • ${r.device_label||'NO DEVICE'}` : '';
+    memberModal.querySelector('[data-member-award-progress]').textContent=r.progress_detail||r.requirement_text||'';
+    const bar=memberModal.querySelector('[data-member-award-progress-bar]'); if(bar) bar.style.width=`${Math.max(0,Math.min(100,Number(r.progress_percent||0)))}%`;
+    memberModal.querySelector('[data-member-award-description]').textContent=r.description_text||r.requirement_text||'';
+    memberModal.querySelector('[data-member-award-earning]').textContent=r.earning_text||r.requirement_text||'';
+    memberModal.querySelector('[data-member-award-requirement]').textContent=r.requirement_text||'';
+    const hist=memberModal.querySelector('[data-member-award-history]');
+    if(hist){
+      if(r.history&&r.history.length) hist.innerHTML=r.history.map((h,i)=>`<p><b>${i+1}${i===0?'ST':i===1?'ND':i===2?'RD':'TH'} AWARD • ${esc(h.award_date||'DATE ON FILE')}</b><span>${esc(h.order_number||'')}</span><small>${esc(h.citation||'CITATION NOT ENTERED')}</small></p>`).join('');
+      else if(r.earned) hist.innerHTML=`<p><b>1ST AWARD • ${esc(r.earned_at||'DATE ON FILE')}</b><span>AUTHORIZATION FILED IN 201 RECORD</span><small>${esc(r.progress_detail||r.requirement_text||'')}</small></p>`;
+      else hist.innerHTML='<p><b>NO AWARD ON FILE</b><small>Qualification progress is shown above.</small></p>';
+    }
+    memberModal.setAttribute('aria-hidden','false');document.body.classList.add('award-modal-open');
+  };
+  document.querySelectorAll('[data-member-ribbon]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();openMember(el.dataset.memberRibbon);}));
+  document.querySelectorAll('[data-member-award-close]').forEach(el=>el.addEventListener('click',()=>{if(memberModal)memberModal.setAttribute('aria-hidden','true');document.body.classList.remove('award-modal-open');}));
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'){[publicModal,memberModal].forEach(m=>m&&m.setAttribute('aria-hidden','true'));document.body.classList.remove('award-modal-open');}});
+})();
