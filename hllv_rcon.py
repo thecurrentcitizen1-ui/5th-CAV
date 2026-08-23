@@ -105,6 +105,27 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _infer_game_mode(map_id: Any) -> str:
+    """Infer the human-readable HLLV mode from the layer/map id when the
+    current RCON model omits gameMode.  This is based on the layer naming the
+    server itself returns (warfare/offensivenva/offensiveus/domination).
+    """
+    raw = _text(map_id).strip().lower()
+    if not raw:
+        return ""
+    if "offensivenva" in raw:
+        return "NVA Offensive"
+    if "offensiveus" in raw:
+        return "US Offensive"
+    if "warfare" in raw:
+        return "Warfare"
+    if "domination" in raw:
+        return "Domination"
+    if "conquest" in raw:
+        return "Conquest"
+    return ""
+
+
 def _seconds(value: Any, default: int = 0) -> int:
     """Normalize HLL/HLLV timer values to whole seconds.
 
@@ -414,6 +435,8 @@ class HLLVTelemetryCollector:
         game_mode = _text(_first(d, "game_mode", "gameMode", default=None))
         if not game_mode:
             game_mode = _text(_first(layer_d, "game_mode", "gameMode", default=None))
+        if not game_mode:
+            game_mode = _infer_game_mode(map_id)
         return {
             "server_name": _text(_first(d, "server_name", "serverName", default="")),
             "map_id": map_id,
