@@ -7,11 +7,13 @@ are read only from environment variables and are never written to the database.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -33,6 +35,10 @@ RCON_CM_PER_METER = max(1.0, float(os.getenv("HLL_RCON_CM_PER_METER", "100") or 
 # is 468 km/h, comfortably above Vietnam-era helicopter speeds.
 RCON_MAX_SPEED_MPS = max(20.0, float(os.getenv("HLL_RCON_MAX_SPEED_MPS", "130") or 130))
 RCON_RECONNECT_SECONDS = max(5, int(os.getenv("HLL_RCON_RECONNECT_SECONDS", "15") or 15))
+# Conservative airborne-movement signature. A verified Pilot role files this as
+# Airmobile Flight Time; every other role files it as Slick Ride time. This does
+# not claim direct seat telemetry (HLLV RCON does not expose vehicle occupancy).
+RCON_AIRMOBILE_MIN_SPEED_MPS = max(15.0, float(os.getenv("HLL_RCON_AIRMOBILE_MIN_SPEED_MPS", "20") or 20))
 
 
 def utcnow() -> datetime:
@@ -45,11 +51,31 @@ def _dump_model(value: Any) -> dict:
     if isinstance(value, dict):
         return value
     if hasattr(value, "model_dump"):
+        # Current HLLV builds sometimes return ISO-8601 duration strings in a
+        # field typed as timedelta by the upstream client. Pydantic can still
+        # serialize the model, but emits one warning per 5-second poll. Suppress
+        # only those serialization warnings here; the collector normalizes the
+        # actual value through _seconds() before filing it.
         try:
-            return value.model_dump(mode="json", by_alias=False)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*serialized value may not be as expected.*",
+                    category=UserWarning,
+                    module=r"pydantic.*",
+                )
+                try:
+                    return value.model_dump(mode="json", by_alias=False, warnings=False)
+                except TypeError:
+                    return value.model_dump(mode="json", by_alias=False)
         except Exception:
             try:
-                return value.model_dump()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    try:
+                        return value.model_dump(warnings=False)
+                    except TypeError:
+                        return value.model_dump()
             except Exception:
                 pass
     if hasattr(value, "dict"):
@@ -202,6 +228,21 @@ def _nested(data: dict, *names: str) -> dict:
     return value if isinstance(value, dict) else _dump_model(value)
 
 
+def _looks_like_m16(value: Any) -> bool:
+    raw = _text(value).upper().replace("-", "").replace(" ", "")
+    return any(token in raw for token in ("M16", "XM16"))
+
+
+def _weapon_label(value: Any) -> str:
+    if value is None:
+        return ""
+    for attr in ("name", "display_name", "id", "weapon_id"):
+        candidate = getattr(value, attr, None)
+        if candidate:
+            return str(candidate)
+    return _text(value)
+
+
 def _role_label(role: Any, data: dict) -> str:
     """Best-effort human label without trusting it as authoritative.
 
@@ -294,6 +335,8 @@ class HLLVTelemetryCollector:
                 role_distance_meters JSONB NOT NULL DEFAULT '{}'::jsonb,
                 role_max_speed_mps JSONB NOT NULL DEFAULT '{}'::jsonb,
                 role_high_speed_seconds JSONB NOT NULL DEFAULT '{}'::jsonb,
+                role_airmobile_seconds JSONB NOT NULL DEFAULT '{}'::jsonb,
+                role_airmobile_distance_meters JSONB NOT NULL DEFAULT '{}'::jsonb,
                 max_observed_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
                 high_speed_seconds INTEGER NOT NULL DEFAULT 0,
                 combat_score INTEGER NOT NULL DEFAULT 0,
@@ -322,6 +365,8 @@ class HLLVTelemetryCollector:
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_high_speed_seconds JSONB NOT NULL DEFAULT '{}'::jsonb",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS max_observed_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0",
             "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS high_speed_seconds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_airmobile_seconds JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS role_airmobile_distance_meters JSONB NOT NULL DEFAULT '{}'::jsonb",
         ):
             await self.db.execute(ddl)
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_player_stats_personnel ON hll_player_match_stats(personnel_id,last_seen_at DESC)")
@@ -387,6 +432,36 @@ class HLLVTelemetryCollector:
         """)
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_personnel_time ON hll_research_samples(personnel_id,observed_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_role_time ON hll_research_samples(role_id,observed_at DESC)")
+        # Exact weapon-attribution events from the HLLV admin log.  These are
+        # separate from estimated ammunition expenditure: a KILL / TEAM KILL log
+        # proves weapon use for that event, but the game does not expose shots fired.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS hll_weapon_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_key TEXT UNIQUE NOT NULL,
+                match_id BIGINT REFERENCES hll_match_sessions(id) ON DELETE SET NULL,
+                event_at TIMESTAMPTZ NOT NULL,
+                event_type TEXT NOT NULL,
+                attacker_id TEXT,
+                personnel_id TEXT,
+                attacker_name TEXT,
+                victim_id TEXT,
+                victim_name TEXT,
+                weapon_id TEXT,
+                weapon_name TEXT,
+                is_m16 BOOLEAN NOT NULL DEFAULT FALSE,
+                raw_message TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_personnel_time ON hll_weapon_events(personnel_id,event_at DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_attacker_time ON hll_weapon_events(attacker_id,event_at DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_weapon_events_m16 ON hll_weapon_events(is_m16,event_at DESC)")
+        for ddl in (
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS m16_carried_seconds INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE hll_player_match_stats ADD COLUMN IF NOT EXISTS m16_distance_meters DOUBLE PRECISION NOT NULL DEFAULT 0"
+        ):
+            await self.db.execute(ddl)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_rcon_health (
                 id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id=1),
@@ -510,8 +585,84 @@ class HLLVTelemetryCollector:
         match_id = await self._ensure_match(server)
         for player in players:
             await self._file_player(match_id, player)
+        # Weapon attribution comes from the authoritative HLLV admin log.  Pull a
+        # short overlapping window every poll and deduplicate by deterministic key.
+        # A temporary log failure must not stop player telemetry collection.
+        try:
+            await self._poll_weapon_logs(match_id)
+        except Exception as exc:
+            log.warning("[HLLV WEAPON LOG POLL FAILED] %s: %s", type(exc).__name__, exc)
         await self.db.execute("UPDATE hll_match_sessions SET last_seen_at=NOW() WHERE id=$1", match_id)
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
+
+    async def _poll_weapon_logs(self, match_id: int):
+        # RCON V2 GetAdminLog uses seconds, not minutes.  Keep a small overlap so
+        # events near poll boundaries are not missed; event_key makes repeats safe.
+        response = await self.rcon.get_admin_log(max(20, RCON_POLL_SECONDS * 4))
+        entries = getattr(response, "entries", None)
+        if entries is None:
+            entries = _first(_dump_model(response), "entries", default=[])
+        for entry in list(entries or []):
+            await self._file_weapon_log(match_id, entry)
+
+    async def _file_weapon_log(self, match_id: int, entry: Any):
+        d = _dump_model(entry)
+        class_name = type(entry).__name__.upper()
+        raw = _text(getattr(entry, "raw_message", None) or _first(d, "raw_message", "rawMessage", "message", default=""))
+        event_type = ""
+        if "TEAMKILL" in class_name or raw.upper().startswith("TEAM KILL:"):
+            event_type = "BLUE_ON_BLUE"
+        elif "KILL" in class_name or raw.upper().startswith("KILL:"):
+            event_type = "KILL"
+        if not event_type:
+            return
+
+        attacker_id = _text(getattr(entry, "instigator_id", None) or _first(d, "instigator_id", "instigatorId", default=""))
+        attacker_name = _text(getattr(entry, "instigator_name", None) or _first(d, "instigator_name", "instigatorName", default=""))
+        victim_id = _text(getattr(entry, "victim_id", None) or _first(d, "victim_id", "victimId", default=""))
+        victim_name = _text(getattr(entry, "victim_name", None) or _first(d, "victim_name", "victimName", default=""))
+        weapon_id = _text(getattr(entry, "weapon_id", None) or _first(d, "weapon_id", "weaponId", default=""))
+        if raw and not attacker_id:
+            match = re.match(
+                r"^(?:TEAM KILL|KILL): (?P<attacker>.+)\((?:Allies|Axis)/(?P<attacker_id>\d{17}|[\da-f]{32})\) -> "
+                r"(?P<victim>.+)\((?:Allies|Axis)/(?P<victim_id>\d{17}|[\da-f]{32})\) with (?P<weapon>.+)$",
+                raw, flags=re.IGNORECASE
+            )
+            if match:
+                attacker_name = match.group("attacker")
+                attacker_id = match.group("attacker_id")
+                victim_name = match.group("victim")
+                victim_id = match.group("victim_id")
+                weapon_id = match.group("weapon")
+        weapon_name = weapon_id
+        try:
+            getter = getattr(entry, "get_weapon", None)
+            if callable(getter):
+                weapon_name = _weapon_label(getter()) or weapon_id
+        except Exception:
+            pass
+
+        ts = getattr(entry, "timestamp", None) or _first(d, "timestamp", default=None) or utcnow()
+        if not isinstance(ts, datetime):
+            try:
+                ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except Exception:
+                ts = utcnow()
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        personnel_id = await self._personnel_id(attacker_id) if attacker_id else None
+        key_material = "|".join((str(int(ts.timestamp())), event_type, attacker_id, victim_id, weapon_id, attacker_name, victim_name))
+        event_key = hashlib.sha1(key_material.encode("utf-8", "ignore")).hexdigest()
+        is_m16 = _looks_like_m16(weapon_id) or _looks_like_m16(weapon_name)
+        await self.db.execute("""
+            INSERT INTO hll_weapon_events(event_key,match_id,event_at,event_type,attacker_id,personnel_id,attacker_name,victim_id,victim_name,weapon_id,weapon_name,is_m16,raw_message)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT(event_key) DO UPDATE SET
+              match_id=COALESCE(hll_weapon_events.match_id,EXCLUDED.match_id),
+              personnel_id=COALESCE(hll_weapon_events.personnel_id,EXCLUDED.personnel_id),
+              weapon_name=COALESCE(NULLIF(EXCLUDED.weapon_name,''),hll_weapon_events.weapon_name),
+              is_m16=hll_weapon_events.is_m16 OR EXCLUDED.is_m16
+        """, event_key, match_id, ts, event_type, attacker_id or None, personnel_id, attacker_name or None, victim_id or None, victim_name or None, weapon_id or None, weapon_name or None, is_m16, raw or None)
 
     def _server_payload(self, session: Any) -> dict:
         d = _dump_model(session)
@@ -645,6 +796,8 @@ class HLLVTelemetryCollector:
         role_distance = _json_dict(row.get("role_distance_meters"))
         role_max_speed = _json_dict(row.get("role_max_speed_mps"))
         role_high_speed = _json_dict(row.get("role_high_speed_seconds"))
+        role_airmobile_seconds = _json_dict(row.get("role_airmobile_seconds"))
+        role_airmobile_distance = _json_dict(row.get("role_airmobile_distance_meters"))
         role_key = role_id or "UNKNOWN"
         role_seconds[role_key] = int(role_seconds.get(role_key, 0) or 0) + accrue_seconds
         role_distance[role_key] = float(role_distance.get(role_key, 0.0) or 0.0) + distance_m
@@ -653,6 +806,14 @@ class HLLVTelemetryCollector:
         # It can represent vehicles or aircraft and is never treated as flight time.
         high_speed_add = accrue_seconds if observed_speed_mps >= 15.0 else 0
         role_high_speed[role_key] = int(role_high_speed.get(role_key, 0) or 0) + high_speed_add
+        # Air Cav ledger: movement above the conservative aircraft-signature
+        # threshold is filed by role. Website classification later gives only the
+        # specifically verified Pilot role flight credit; every other role is a
+        # Slick Ride (passenger/gunner/crew/infantry/etc.).
+        airmobile_add = accrue_seconds if observed_speed_mps >= RCON_AIRMOBILE_MIN_SPEED_MPS else 0
+        airmobile_distance_add = distance_m if airmobile_add else 0.0
+        role_airmobile_seconds[role_key] = int(role_airmobile_seconds.get(role_key, 0) or 0) + airmobile_add
+        role_airmobile_distance[role_key] = float(role_airmobile_distance.get(role_key, 0.0) or 0.0) + airmobile_distance_add
         x, y, z = pos if pos else (None, None, None)
         # Research registry: observe every role/loadout combination, but only retain
         # high-frequency position samples for linked 1/5 CAV Soldiers. This keeps
@@ -690,14 +851,19 @@ class HLLVTelemetryCollector:
                 altitude_gain_meters=altitude_gain_meters+$11,movement_samples=movement_samples+$12,rejected_jump_samples=rejected_jump_samples+$13,
                 role_seconds=$14::jsonb,role_distance_meters=$15::jsonb,
                 role_max_speed_mps=$16::jsonb,role_high_speed_seconds=$17::jsonb,
-                max_observed_speed_mps=GREATEST(COALESCE(max_observed_speed_mps,0),$18),
-                high_speed_seconds=COALESCE(high_speed_seconds,0)+$19,
-                combat_score=$20,defense_score=$21,offense_score=$22,support_score=$23,deaths=$24,infantry_kills=$25,team_kills=$26,vehicle_kills=$27,vehicles_destroyed=$28,
-                last_x=$29,last_y=$30,last_z=$31,last_sample_at=$8,last_alive=$32,updated_at=NOW()
-            WHERE id=$33
+                role_airmobile_seconds=$18::jsonb,role_airmobile_distance_meters=$19::jsonb,
+                max_observed_speed_mps=GREATEST(COALESCE(max_observed_speed_mps,0),$20),
+                high_speed_seconds=COALESCE(high_speed_seconds,0)+$21,
+                m16_carried_seconds=COALESCE(m16_carried_seconds,0)+$22,
+                m16_distance_meters=COALESCE(m16_distance_meters,0)+$23,
+                combat_score=$24,defense_score=$25,offense_score=$26,support_score=$27,deaths=$28,infantry_kills=$29,team_kills=$30,vehicle_kills=$31,vehicles_destroyed=$32,
+                last_x=$33,last_y=$34,last_z=$35,last_sample_at=$8,last_alive=$36,updated_at=NOW()
+            WHERE id=$37
         """, personnel_id, name, platform, team_id, platoon, platoon_index, role_id, now, accrue_seconds, distance_m,
              altitude_gain_m, 1 if distance_m > 0 else 0, rejected, json.dumps(role_seconds), json.dumps(role_distance),
-             json.dumps(role_max_speed), json.dumps(role_high_speed), observed_speed_mps, high_speed_add,
+             json.dumps(role_max_speed), json.dumps(role_high_speed), json.dumps(role_airmobile_seconds), json.dumps(role_airmobile_distance),
+             observed_speed_mps, high_speed_add,
+             accrue_seconds if _looks_like_m16(loadout) else 0, distance_m if _looks_like_m16(loadout) else 0.0,
              int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0),
              int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0),
              int(_first(stats, "deaths", default=0) or 0), int(_first(stats, "infantry_kills", "infantryKills", default=0) or 0),
@@ -800,6 +966,7 @@ class HLLVTelemetryCollector:
                    COALESCE(SUM(distance_meters),0)::double precision AS distance,
                    COALESCE(SUM(altitude_gain_meters),0)::double precision AS altitude_gain,
                    COALESCE(SUM(infantry_kills),0)::bigint AS infantry_kills,
+                   COALESCE(SUM(team_kills),0)::bigint AS blue_on_blue,
                    COALESCE(SUM(vehicle_kills),0)::bigint AS vehicle_kills,
                    COALESCE(SUM(vehicles_destroyed),0)::bigint AS vehicles_destroyed,
                    COALESCE(SUM(deaths),0)::bigint AS deaths,
