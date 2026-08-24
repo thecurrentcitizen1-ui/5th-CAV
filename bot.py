@@ -2637,7 +2637,8 @@ async def on_ready():
         operation_reminder_watch.start()
     if not operation_maintenance_watch.is_running():
         operation_maintenance_watch.start()
-    hll_m16_reconcile_watch.start()
+    if not hll_m16_reconcile_watch.is_running():
+        hll_m16_reconcile_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
     if not clerk_health_watch.is_running():

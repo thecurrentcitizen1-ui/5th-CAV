@@ -1,0 +1,5 @@
+1/5 CAV — BATTALION CLERK ACTIVE SERVER M16 AUTHORITY — 2026-08-23
+
+- Linked 1/5 CAV Soldier active-server time now accrues to the M16 carry/service counters regardless of HLLV loadout-label reliability.
+- The existing 60-second website reconciliation remains active and converts completed verified five-minute blocks into the issued-rifle ledger.
+- The M16 reconciliation task start is now guarded against duplicate starts after reconnect/on_ready events.

@@ -1056,7 +1056,7 @@ class HLLVTelemetryCollector:
              altitude_gain_m, 1 if distance_m > 0 else 0, rejected, json.dumps(role_seconds), json.dumps(role_distance),
              json.dumps(role_max_speed), json.dumps(role_high_speed), json.dumps(role_airmobile_seconds), json.dumps(role_airmobile_distance),
              observed_speed_mps, high_speed_add,
-             accrue_seconds if _looks_like_m16(loadout) else 0, distance_m if _looks_like_m16(loadout) else 0.0,
+             accrue_seconds if personnel_id else 0, distance_m if personnel_id else 0.0,
              int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0),
              int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0),
              int(_first(stats, "deaths", default=0) or 0), int(_first(stats, "infantry_kills", "infantryKills", default=0) or 0),
