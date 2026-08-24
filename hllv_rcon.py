@@ -271,8 +271,17 @@ def _weapon_label(value: Any) -> str:
 
 
 HLL_KNOWN_ROLE_MAPPINGS = {
+    "0": {"name": "RIFLEMAN", "category": "INFANTRY", "mos_code": ""},
+    "3": {"name": "MEDIC", "category": "MEDICAL", "mos_code": ""},
+    "5": {"name": "SPECIALIST", "category": "INFANTRY", "mos_code": ""},
+    "6": {"name": "MACHINE GUNNER", "category": "INFANTRY", "mos_code": ""},
+    "7": {"name": "GRENADIER", "category": "INFANTRY", "mos_code": ""},
+    "8": {"name": "ENGINEER", "category": "SUPPORT", "mos_code": ""},
+    "9": {"name": "SQUAD LEADER", "category": "LEADERSHIP", "mos_code": ""},
     "11": {"name": "CREWMAN", "category": "ARMOR", "mos_code": "19K"},
     "12": {"name": "TANK COMMANDER", "category": "ARMOR", "mos_code": "19C"},
+    "16": {"name": "PILOT", "category": "AVIATION", "mos_code": ""},
+    "17": {"name": "LOGISTICS OFFICER", "category": "AVIATION", "mos_code": ""},
 }
 
 
@@ -991,8 +1000,8 @@ class HLLVTelemetryCollector:
         high_speed_add = accrue_seconds if observed_speed_mps >= 15.0 else 0
         role_high_speed[role_key] = int(role_high_speed.get(role_key, 0) or 0) + high_speed_add
         # Air Cav ledger: movement above the conservative aircraft-signature
-        # threshold is filed by role. Website classification later gives only the
-        # specifically verified Pilot role flight credit; every other role is a
+        # threshold is filed by role. Website classification gives Role 16 Pilot
+        # and Role 17 Logistics Officer flight credit; every other role remains a
         # Slick Ride (passenger/gunner/crew/infantry/etc.).
         airmobile_add = accrue_seconds if observed_speed_mps >= RCON_AIRMOBILE_MIN_SPEED_MPS else 0
         airmobile_distance_add = distance_m if airmobile_add else 0.0

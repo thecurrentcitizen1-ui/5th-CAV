@@ -1,0 +1,16 @@
+1/5 CAV BATTALION CLERK — VERIFIED ROLE MAP / AVIATION
+
+Confirmed HLLV role IDs seeded globally:
+0 Rifleman
+3 Medic
+5 Specialist
+6 Machine Gunner
+7 Grenadier
+8 Engineer
+9 Squad Leader
+11 Crewman
+12 Tank Commander
+16 Pilot
+17 Logistics Officer
+
+Air Cav classification remains evidence-based: aircraft-signature movement is recorded per role. The website classifies Role 16 Pilot and Role 17 Logistics Officer as flight-credit roles; all others are Slick Rides.
