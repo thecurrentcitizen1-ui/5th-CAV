@@ -1224,6 +1224,23 @@ class HLLVTelemetryCollector:
             JOIN hll_match_sessions m ON m.id=s.match_id WHERE s.personnel_id=$1 ORDER BY s.last_seen_at DESC LIMIT 1
         """, person["personnel_id"])
         aggregate=dict(agg) if agg else {}
+        leadership_seconds={"9":0,"12":0,"17":0}
+        role_rows=await self.db.fetch("SELECT role_seconds FROM hll_player_match_stats WHERE personnel_id=$1", person["personnel_id"])
+        for rr in role_rows or []:
+            rd=_json_dict(rr.get("role_seconds"))
+            for rid in leadership_seconds:
+                leadership_seconds[rid] += int(rd.get(rid,0) or 0)
+        aggregate["leadership_seconds"]=leadership_seconds
+        aggregate["leadership_total_seconds"]=sum(leadership_seconds.values())
+        m16=await self.db.fetchrow("""SELECT COALESCE(SUM(m16_carried_seconds),0)::bigint AS seconds,
+                    COALESCE(SUM(m16_distance_meters),0)::double precision AS distance,
+                    COUNT(*) FILTER (WHERE COALESCE(m16_carried_seconds,0)>0)::int AS rounds
+             FROM hll_player_match_stats WHERE personnel_id=$1""", person["personnel_id"])
+        m16_events=await self.db.fetchrow("""SELECT COUNT(*) FILTER(WHERE is_m16=TRUE AND event_type='KILL')::int AS kills,
+                    COUNT(*) FILTER(WHERE is_m16=TRUE AND event_type='BLUE_ON_BLUE')::int AS blue_on_blue,
+                    MAX(event_at) FILTER(WHERE is_m16=TRUE) AS last_event
+             FROM hll_weapon_events WHERE personnel_id=$1""", person["personnel_id"])
+        aggregate["m16_service"]={**(dict(m16) if m16 else {}),**(dict(m16_events) if m16_events else {})}
         hours=float(aggregate.get("seconds") or 0)/3600.0
         matches=int(aggregate.get("matches") or 0)
         if hours >= 40 or matches >= 25: field_experience="VETERAN"

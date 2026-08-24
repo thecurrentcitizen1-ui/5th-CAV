@@ -3789,11 +3789,15 @@ async def hll_stats(interaction:discord.Interaction):
     a=data.get('aggregate') or {}; latest=data.get('latest') or {}
     sec=int(a.get('seconds') or 0); h=sec//3600; m=(sec%3600)//60
     km=float(a.get('distance') or 0)/1000.0
+    lead_sec=int(a.get('leadership_total_seconds') or 0); lead_h=lead_sec//3600; lead_m=(lead_sec%3600)//60
+    m16=a.get('m16_service') or {}; m16_sec=int(m16.get('seconds') or 0); m16_h=m16_sec//3600; m16_m=(m16_sec%3600)//60
     await interaction.followup.send(
         '**HLL: VIETNAM — FIELD SERVICE STATISTICS**\n'
         f"Matches sampled: **{int(a.get('matches') or 0)}**\nServer time: **{h}h {m}m**\nDistance traveled: **{km:.2f} km**\n"
         f"Infantry kills: **{int(a.get('infantry_kills') or 0)}** • Deaths: **{int(a.get('deaths') or 0)}** • Blue on Blue: **{int(a.get('blue_on_blue') or 0)}**\n"
         f"Vehicle kills: **{int(a.get('vehicle_kills') or 0)}** • Vehicles destroyed: **{int(a.get('vehicles_destroyed') or 0)}**\n"
+        f"Leadership experience: **{lead_h}h {lead_m}m** (Squad Leader / Tank Commander / Logistics Officer)\n"
+        f"M16/XM16 service: **{m16_h}h {m16_m}m** • **{float(m16.get('distance') or 0)/1000.0:.1f} km** • **{int(m16.get('kills') or 0)} kills** • **{int(m16.get('blue_on_blue') or 0)} Blue on Blue\n"
         f"Verified field experience: **{a.get('field_experience') or 'NEWLY ARRIVED'}**\n"
         f"Total score: **{int(a.get('score_total') or 0)}**\n"
         f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)

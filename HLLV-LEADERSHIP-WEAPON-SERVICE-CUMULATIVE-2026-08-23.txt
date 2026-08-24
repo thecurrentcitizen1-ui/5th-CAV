@@ -1,0 +1,9 @@
+1/5 CAV BATTALION CLERK — LEADERSHIP + WEAPON SERVICE CUMULATIVE UPDATE
+
+- /hll-stats now reports verified leadership role time from HLL roles 9, 12, and 17.
+- /hll-stats now reports M16/XM16 verified carry time, carry distance, weapon-attributed kills, and Blue on Blue.
+- Existing role ledger remains the source of truth; no second leadership timer was created.
+- Existing M16/XM16 loadout collector and admin-log weapon event ingestion remain the source of truth.
+- No player telemetry is reset.
+- Role 16 Pilot + Role 17 Logistics Officer aviation handling remains intact.
+- Armor, console identity linking, server broadcasts, and existing RCON collection remain intact.
