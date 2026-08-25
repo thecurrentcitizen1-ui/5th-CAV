@@ -147,25 +147,21 @@ MOS_ROLE_BLUEPRINT = [
 COMPANY_ROLE_BLUEPRINT = [
     "HHC", "A Company", "B Company", "C Company",
 ]
-PLATOON_ROLE_BLUEPRINT = [
-    f"{company} Company • {platoon} Platoon"
-    for company in ("A", "B", "C")
-    for platoon in ("1st", "2nd", "3rd", "4th")
-]
-# Squad access is also company-and-platoon specific. Generic squad roles are unsafe
-# because Discord permission overwrites are additive across every role a member holds.
-SQUAD_ROLE_BLUEPRINT = [
-    f"{company} Company • {platoon} Platoon • {squad} Squad"
-    for company in ("A", "B", "C")
-    for platoon in ("1st", "2nd", "3rd", "4th")
-    for squad in ("1st", "2nd", "3rd", "4th")
-]
+# Formation roles are created ON DEMAND from the authoritative website roster.
+# Do not pre-generate every possible platoon/squad combination; that was the main
+# source of Discord role clutter. Team assignment remains website-only because
+# Company/Platoon/Squad already provide Discord access scope.
+PLATOON_ROLE_BLUEPRINT = []
+SQUAD_ROLE_BLUEPRINT = []
+TEAM_ROLE_BLUEPRINT = []
 LEGACY_ASSIGNMENT_ROLE_NAMES = {
     "1st Platoon", "2nd Platoon", "3rd Platoon", "4th Platoon",
     "1st Squad", "2nd Squad", "3rd Squad", "4th Squad",
+    "Alpha Team", "Bravo Team",
+    "Alpha Company", "A/1-5 CAV", "Bravo Company", "B/1-5 CAV",
+    "Charlie Company", "C/1-5 CAV", "HHC/1-5 CAV", "Headquarters & Headquarters Company",
 }
-# Fire-team roles stay intentionally simple: Company/Platoon/Squad roles already provide scope.
-TEAM_ROLE_BLUEPRINT = ["Alpha Team", "Bravo Team"]
+MEMBERSHIP_ROLE_BLUEPRINT = ["5th Cavalry Regiment"]
 QUALIFICATION_ROLE_BLUEPRINT = [
     "Battalion Instructor", "M16 Qualified", "Mortar Qualified", "Recon Qualified",
     "Aviation Qualified", "Armor Qualified", "Medic Qualified",
@@ -176,6 +172,7 @@ STAFF_ACCESS_ROLE_BLUEPRINT = [
 
 ROLE_SECTIONS = [
     ("──────── BATTALION COMMAND ────────", ["Command Staff"]),
+    ("──────── MEMBERSHIP ────────", MEMBERSHIP_ROLE_BLUEPRINT),
     ("──────── RECRUITING STATUS ────────", RECRUITING_STATUS_ROLE_BLUEPRINT),
     ("──────── RANK ────────", RANK_ROLE_BLUEPRINT),
     ("──────── APPOINTMENTS ────────", APPOINTMENT_ROLE_BLUEPRINT),
@@ -183,7 +180,6 @@ ROLE_SECTIONS = [
     ("──────── COMPANY ASSIGNMENT ────────", COMPANY_ROLE_BLUEPRINT),
     ("──────── PLATOON ASSIGNMENT ────────", PLATOON_ROLE_BLUEPRINT),
     ("──────── SQUAD ASSIGNMENT ────────", SQUAD_ROLE_BLUEPRINT),
-    ("──────── FIRE TEAM ────────", TEAM_ROLE_BLUEPRINT),
     ("──────── QUALIFICATIONS ────────", QUALIFICATION_ROLE_BLUEPRINT),
     ("──────── STAFF ACCESS ────────", STAFF_ACCESS_ROLE_BLUEPRINT),
 ]
@@ -315,6 +311,10 @@ def _canonical_managed_role_name(value: str) -> Optional[str]:
     for name in _all_managed_role_names():
         if _normalized_role_name(name)==wanted:
             return name
+    m=re.fullmatch(r"([ABC]) COMPANY • (1ST|2ND|3RD|4TH) PLATOON(?: • (1ST|2ND|3RD|4TH) SQUAD)?",wanted)
+    if m:
+        base=f"{m.group(1)} Company • {m.group(2).title()} Platoon"
+        return base + (f" • {m.group(3).title()} Squad" if m.group(3) else '')
     return None
 
 def _managed_role_group(guild: discord.Guild, canonical_name: str):
@@ -703,7 +703,7 @@ def structure_inventory(guild: discord.Guild):
     grouped={}
     for role in guild.roles:
         key=_normalized_role_name(role.name)
-        if key in managed_norm:
+        if key in managed_norm or _is_managed_formation_role_name(role.name):
             grouped.setdefault(key,[]).append(role)
     duplicate_roles=[{"name":key,"count":len(rows),"ids":[r.id for r in rows]} for key,rows in grouped.items() if len(rows)>1]
     missing_categories=[]; missing_channels=[]
@@ -1691,38 +1691,73 @@ def _guild_role_for_code(guild: discord.Guild, code: str, code_set):
                 if c==code and name==label: return role
     return None
 
+def _is_managed_formation_role_name(name: str) -> bool:
+    n=_normalized_role_name(name)
+    return bool(re.fullmatch(r"[ABC] COMPANY • (1ST|2ND|3RD|4TH) PLATOON(?: • (1ST|2ND|3RD|4TH) SQUAD)?", n))
+
+
+def _managed_role_category(name: str) -> str | None:
+    n=_normalized_role_name(name)
+    if name in MEMBERSHIP_ROLE_BLUEPRINT: return 'MEMBERSHIP'
+    if any(_normalized_role_name(name)==_normalized_role_name(x) for x in COMPANY_ROLE_BLUEPRINT): return 'COMPANY'
+    if re.fullmatch(r"[ABC] COMPANY • (1ST|2ND|3RD|4TH) PLATOON",n): return 'PLATOON'
+    if re.fullmatch(r"[ABC] COMPANY • (1ST|2ND|3RD|4TH) PLATOON • (1ST|2ND|3RD|4TH) SQUAD",n): return 'SQUAD'
+    if name in APPOINTMENT_ROLE_BLUEPRINT: return 'APPOINTMENT'
+    if name in QUALIFICATION_ROLE_BLUEPRINT: return 'QUALIFICATION'
+    if name in STAFF_ACCESS_ROLE_BLUEPRINT: return 'STAFF_ACCESS'
+    head=n.split(' — ',1)[0].split(' - ',1)[0].strip()
+    if head in RANK_ROLE_CODES or n in RANK_ROLE_ALIASES: return 'RANK'
+    if head in MOS_ROLE_CODES: return 'MOS'
+    if name in RECRUITING_STATUS_ROLE_BLUEPRINT: return 'RECRUITING'
+    if name in LEGACY_ASSIGNMENT_ROLE_NAMES: return 'LEGACY'
+    return None
+
+
+async def _ensure_dynamic_role(guild: discord.Guild, name: str) -> discord.Role | None:
+    role=_role_by_name(guild,name)
+    if role: return role
+    try:
+        return await guild.create_role(name=name,permissions=discord.Permissions.none(),hoist=False,mentionable=False,
+                                       reason='Battalion Clerk — website-authoritative active formation')
+    except discord.Forbidden:
+        log.warning('[FORMATION ROLE CREATE BLOCKED] guild=%s role=%s',guild.id,name)
+        return None
+
+
 async def reconcile_member_roles_from_canonical(member: discord.Member, result: dict):
-    """Website personnel row is authoritative after intake; Discord mirrors it."""
-    if not result.get('linked'): return
+    """Mirror the authoritative website record into Discord and report exactly what changed."""
+    if not result.get('linked'):
+        return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
     rank=result.get('rank_code'); mos=result.get('mos_code')
     lifecycle=str(result.get('lifecycle_state') or '').upper()
-    desired=[]
+    unit=str(result.get('unit_code') or '').upper().strip()
+    platoon=str(result.get('platoon') or '').strip()
+    squad=str(result.get('squad') or '').strip()
+    field_status=str(result.get('field_status') or '').upper().strip()
+    desired=[]; remove=[]; created=[]
     rank_role=_guild_role_for_code(member.guild,rank,RANK_ROLE_CODES)
     mos_role=_guild_role_for_code(member.guild,mos,MOS_ROLE_CODES)
     if rank_role: desired.append(rank_role)
     if mos_role: desired.append(mos_role)
     current_ranks,current_mos=_role_code_hits(member)
-    remove=[]
-    if lifecycle in {'SEPARATED','ARCHIVED'}:
-        # Separation removes only Battalion Clerk-managed personnel roles; general server membership remains untouched.
-        for code,_ in current_ranks:
-            r=_guild_role_for_code(member.guild,code,RANK_ROLE_CODES)
-            if r: remove.append(r)
-        for code,_ in current_mos:
-            r=_guild_role_for_code(member.guild,code,MOS_ROLE_CODES)
-            if r: remove.append(r)
-        managed_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
-        all_company_names={'A COMPANY','ALPHA COMPANY','A/1-5 CAV','B COMPANY','BRAVO COMPANY','B/1-5 CAV','C COMPANY','CHARLIE COMPANY','C/1-5 CAV','HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'}
-        for role in member.roles:
-            n=' '.join(role.name.upper().strip().split())
-            if n in all_company_names or role.name in PLATOON_ROLE_BLUEPRINT or role.name in SQUAD_ROLE_BLUEPRINT or role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in TEAM_ROLE_BLUEPRINT or role.name in managed_names:
-                remove.append(role)
-        try:
-            remove=list(dict.fromkeys(remove))
-            if remove: await member.remove_roles(*remove,reason='Website personnel record shows separated/archived')
-        except discord.Forbidden:
-            log.warning('[SEPARATION ROLE SYNC BLOCKED] member=%s bot role hierarchy/permissions',member.id)
-        return
+
+    company_aliases={
+        'A/1-5 CAV':{'A COMPANY','ALPHA COMPANY','A/1-5 CAV'},
+        'B/1-5 CAV':{'B COMPANY','BRAVO COMPANY','B/1-5 CAV'},
+        'C/1-5 CAV':{'C COMPANY','CHARLIE COMPANY','C/1-5 CAV'},
+        'HHC/1-5 CAV':{'HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'},
+    }
+    all_company_names=set().union(*company_aliases.values())
+    canonical_company_name={'A/1-5 CAV':'A Company','B/1-5 CAV':'B Company','C/1-5 CAV':'C Company','HHC/1-5 CAV':'HHC'}.get(unit)
+    desired_company={_normalized_role_name(canonical_company_name)} if canonical_company_name else set()
+    company_letter=unit[:1] if unit[:1] in {'A','B','C'} else None
+    pretty_platoon=platoon.title() if platoon else ''
+    pretty_squad=squad.title() if squad else ''
+    desired_platoon_name=f"{company_letter} Company • {pretty_platoon}" if company_letter and platoon else None
+    desired_squad_name=f"{company_letter} Company • {pretty_platoon} • {pretty_squad}" if company_letter and platoon and squad else None
+    is_member = bool(field_status=='ASSIGNED' and (platoon or unit.startswith('HHC')) and lifecycle not in {'SEPARATED','ARCHIVED'})
+
+    # Remove stale managed personnel roles. Protected/manual roles are never touched.
     for code,_ in current_ranks:
         if code!=rank:
             r=_guild_role_for_code(member.guild,code,RANK_ROLE_CODES)
@@ -1731,72 +1766,63 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
         if code!=mos:
             r=_guild_role_for_code(member.guild,code,MOS_ROLE_CODES)
             if r: remove.append(r)
-    # Assignment roles also mirror the canonical website record when matching roles exist.
-    unit=(result.get('unit_code') or '').upper().strip(); platoon=(result.get('platoon') or '').upper().strip(); squad=(result.get('squad') or '').upper().strip()
-    # Company assignment ends Replacement status immediately. Do not wait for
-    # platoon/squad completion or the recruiting-status watcher to catch up.
-    field_status=str(result.get('field_status') or '').upper().strip()
-    if field_status == 'ASSIGNED' and unit not in {'','1-5 CAV','REPLACEMENT DETACHMENT'}:
-        for role in member.roles:
-            if role.name in {'Prospective Replacement','Approved Replacement','Replacement Depot'}:
-                remove.append(role)
-    company_aliases={
-        'A/1-5 CAV':{'A COMPANY','ALPHA COMPANY','A/1-5 CAV'},
-        'B/1-5 CAV':{'B COMPANY','BRAVO COMPANY','B/1-5 CAV'},
-        'C/1-5 CAV':{'C COMPANY','CHARLIE COMPANY','C/1-5 CAV'},
-        'HHC/1-5 CAV':{'HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'},
-    }
-    all_company_names=set().union(*company_aliases.values())
-    desired_company=company_aliases.get(unit,set())
-    company_letter = unit[:1] if unit[:1] in {"A","B","C"} else None
-    desired_platoon_role = f"{company_letter} COMPANY • {platoon}" if company_letter and platoon else None
-    desired_squad_role = f"{company_letter} COMPANY • {platoon} • {squad}" if company_letter and platoon and squad else None
     for role in member.roles:
-        n=" ".join(role.name.upper().strip().split())
+        n=_normalized_role_name(role.name)
         if n in all_company_names and n not in desired_company: remove.append(role)
-        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in PLATOON_ROLE_BLUEPRINT) and n != desired_platoon_role: remove.append(role)
-        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in SQUAD_ROLE_BLUEPRINT) and n != desired_squad_role: remove.append(role)
-        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES): remove.append(role)
-    for role in member.guild.roles:
-        n=" ".join(role.name.upper().strip().split())
-        if n in desired_company or (desired_platoon_role and n==desired_platoon_role) or (desired_squad_role and n==desired_squad_role):
-            desired.append(role)
+        if _is_managed_formation_role_name(role.name):
+            if desired_squad_name and n==_normalized_role_name(desired_squad_name): pass
+            elif desired_platoon_name and n==_normalized_role_name(desired_platoon_name): pass
+            else: remove.append(role)
+        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES: remove.append(role)
+        if role.name=='5th Cavalry Regiment' and not is_member: remove.append(role)
 
-    # Fire-team membership is an additional assignment layer. Keep only one team role.
-    fire_team=(result.get('fire_team') or '').strip().upper()
-    desired_team_name={'ALPHA TEAM':'Alpha Team','BRAVO TEAM':'Bravo Team'}.get(fire_team)
-    for role in member.roles:
-        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in TEAM_ROLE_BLUEPRINT) and _normalized_role_name(role.name) != _normalized_role_name(desired_team_name or ''):
-            remove.append(role)
-    if desired_team_name:
-        team_role=_role_by_name(member.guild,desired_team_name)
-        if team_role is None:
-            try:
-                team_role=await member.guild.create_role(name=desired_team_name,permissions=discord.Permissions.none(),hoist=False,mentionable=False,reason='Battalion Clerk — active fire-team assignment')
-            except discord.Forbidden:
-                team_role=None
-                log.warning('[TEAM ROLE CREATE BLOCKED] guild=%s role=%s',member.guild.id,desired_team_name)
-        if team_role: desired.append(team_role)
+    # Separated/archived Soldiers retain protected Discord roles only.
+    managed_appointment_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
+    if lifecycle in {'SEPARATED','ARCHIVED'}:
+        for role in member.roles:
+            if role.name in managed_appointment_names or _managed_role_category(role.name) in {'COMPANY','PLATOON','SQUAD','MEMBERSHIP'}:
+                remove.append(role)
+        desired=[]
+    else:
+        # Company role is a display/access output of the website assignment.
+        for role in member.guild.roles:
+            if _normalized_role_name(role.name) in desired_company: desired.append(role)
+        # Only active formations get Discord roles. No unused future combinations are generated.
+        if desired_platoon_name:
+            r=await _ensure_dynamic_role(member.guild,desired_platoon_name)
+            if r: desired.append(r); created.append(r.name) if r not in member.roles else None
+        if desired_squad_name:
+            r=await _ensure_dynamic_role(member.guild,desired_squad_name)
+            if r: desired.append(r); created.append(r.name) if r not in member.roles else None
+        # Team is website-only; this intentionally removes legacy Alpha/Bravo Discord roles.
+        if is_member:
+            membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
+            if membership: desired.append(membership)
+            for role in member.roles:
+                if role.name in {'Prospective Replacement','Approved Replacement','Replacement Depot'}: remove.append(role)
 
-    # Field-leadership appointments are billets, not ranks. The website 201 File
-    # is authoritative; Battalion Clerk mirrors only this managed appointment set.
-    managed_appointment_names = {
-        "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader"
-    }
-    desired_appointment_names = set(result.get("appointment_roles") or []) & managed_appointment_names
-    for role in member.roles:
-        if role.name in managed_appointment_names and role.name not in desired_appointment_names:
-            remove.append(role)
-    for role in member.guild.roles:
-        if role.name in desired_appointment_names:
-            desired.append(role)
+        desired_appointment_names=set(result.get('appointment_roles') or []) & managed_appointment_names
+        for role in member.roles:
+            if role.name in managed_appointment_names and role.name not in desired_appointment_names: remove.append(role)
+        for role in member.guild.roles:
+            if role.name in desired_appointment_names: desired.append(role)
+
+    remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))
+    removed_names=[]; added_names=[]
     try:
-        remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))
-        if remove: await member.remove_roles(*remove,reason='Battalion personnel record is authoritative')
+        actual_remove=[r for r in remove if r in member.roles]
+        if actual_remove:
+            await member.remove_roles(*actual_remove,reason='Website personnel record is authoritative')
+            removed_names=[r.name for r in actual_remove]
         add=[r for r in desired if r not in member.roles]
-        if add: await member.add_roles(*add,reason='Synchronize authoritative battalion personnel record')
-    except discord.Forbidden:
+        if add:
+            await member.add_roles(*add,reason='Synchronize authoritative battalion personnel record')
+            added_names=[r.name for r in add]
+    except discord.Forbidden as exc:
         log.warning('[CANONICAL ROLE SYNC BLOCKED] member=%s bot role hierarchy/permissions',member.id)
+        return {'ok':False,'error':'Battalion Clerk role hierarchy/permissions blocked reconciliation','added':added_names,'removed':removed_names,'created':created}
+    return {'ok':True,'added':added_names,'removed':removed_names,'created':created,'actual_roles':member_role_names(member),
+            'expected':{'rank':rank,'mos':mos,'unit_code':unit,'platoon':platoon,'squad':squad,'fire_team':result.get('fire_team'),'member':is_member}}
 
 async def sync_personnel_identity(member: discord.Member, *, create_if_missing=False,
                                   reason="identity_sync", deliver_credentials=True):
@@ -1960,6 +1986,16 @@ async def setup_channels(interaction: discord.Interaction, confirm: bool):
 async def organization_cleanup_inventory(guild: discord.Guild):
     inv=structure_inventory(guild)
     legacy=[r for r in guild.roles if any(_normalized_role_name(r.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES)]
+    desired_dynamic=set()
+    if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
+        try:
+            data=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':guild.id})
+            for x in data.get('items',[]):
+                unit=str(x.get('unit_code') or '').upper().strip(); pl=str(x.get('platoon') or '').strip(); sq=str(x.get('squad') or '').strip(); letter=unit[:1] if unit[:1] in {'A','B','C'} else None
+                if letter and pl: desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()}"))
+                if letter and pl and sq: desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()} • {sq.title()}"))
+        except Exception: pass
+    dormant=[r for r in guild.roles if _is_managed_formation_role_name(r.name) and _normalized_role_name(r.name) not in desired_dynamic]
     duplicate_details=[]
     for item in inv.get('duplicate_managed_roles',[]):
         canonical=_canonical_managed_role_name(item['name']) or item['name']
@@ -1970,7 +2006,7 @@ async def organization_cleanup_inventory(guild: discord.Guild):
             'member_links':sum(len(r.members) for r in roles),
             'role_ids':[r.id for r in roles],
         })
-    return {'duplicates':duplicate_details,'legacy':legacy,'inventory':inv}
+    return {'duplicates':duplicate_details,'legacy':legacy,'dormant':dormant,'inventory':inv}
 
 async def run_organization_cleanup(guild: discord.Guild):
     """Consolidate duplicate managed roles without changing website personnel authority."""
@@ -2002,8 +2038,12 @@ async def run_organization_cleanup(guild: discord.Guild):
             except Exception as exc:
                 failures.append(f'MEMBER {uid}: {exc}')
 
-        # Consolidate exact managed-role aliases/case variants. Prefer the exact blueprint spelling.
-        for canonical_name in _all_managed_role_names():
+        # Consolidate exact managed-role aliases/case variants, including dynamically
+        # created active Platoon/Squad roles. Prefer canonical website-style spelling.
+        canonical_names=list(_all_managed_role_names())
+        canonical_names.extend([_canonical_managed_role_name(r.name) for r in guild.roles if _is_managed_formation_role_name(r.name)])
+        canonical_names=[x for x in dict.fromkeys(canonical_names) if x]
+        for canonical_name in canonical_names:
             group=_managed_role_group(guild,canonical_name)
             if not group: continue
             canonical=discord.utils.get(group,name=canonical_name)
@@ -2037,7 +2077,36 @@ async def run_organization_cleanup(guild: discord.Guild):
                 except Exception as exc:
                     failures.append(f'DUPLICATE {duplicate.name} ({duplicate.id}): {exc}')
 
-        # Generic Platoon/Squad roles are obsolete and unsafe for scoped permissions. Website canonical
+        # Remove unused dynamically generated formation roles when they are truly disposable.
+        # If a dormant role still owns a channel/category overwrite, preserve it and report it rather
+        # than destroying access configuration that may be needed when that formation reactivates.
+        desired_dynamic=set()
+        for snapshot in snapshots.values():
+            unit=str(snapshot.get('unit_code') or '').upper().strip(); pl=str(snapshot.get('platoon') or '').strip(); sq=str(snapshot.get('squad') or '').strip()
+            letter=unit[:1] if unit[:1] in {'A','B','C'} else None
+            if letter and pl:
+                desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()}"))
+            if letter and pl and sq:
+                desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()} • {sq.title()}"))
+        for role in list(guild.roles):
+            if not _is_managed_formation_role_name(role.name) or _normalized_role_name(role.name) in desired_dynamic:
+                continue
+            if role >= me.top_role:
+                failures.append(f'DORMANT FORMATION ABOVE CLERK {role.name} ({role.id})'); continue
+            has_overwrite=False
+            for channel in list(guild.channels):
+                if role in channel.overwrites:
+                    has_overwrite=True; break
+            if has_overwrite:
+                failures.append(f'DORMANT FORMATION PRESERVED — CHANNEL PERMISSIONS {role.name} ({role.id})')
+                continue
+            try:
+                await role.delete(reason='Battalion Clerk — remove unused website-unassigned formation role')
+                deleted.append(f'DORMANT:{role.name}:{role.id}')
+            except Exception as exc:
+                failures.append(f'DORMANT {role.name}: {exc}')
+
+        # Generic Platoon/Squad/Team roles are obsolete and unsafe for scoped permissions. Website canonical
         # assignment has already been reapplied above, so these can be removed without guessing assignments.
         for role in list(guild.roles):
             if not any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES):
@@ -2082,7 +2151,8 @@ async def organization_cleanup_command(interaction: discord.Interaction, confirm
         await interaction.followup.send(
             '**1/5 CAV ORGANIZATION CLEANUP — PREVIEW**\n'
             f"Duplicate managed name groups: **{len(preview['duplicates'])}**\n"
-            f"Obsolete generic Platoon/Squad roles: **{len(preview['legacy'])}**\n\n"
+            f"Obsolete generic Company/Platoon/Squad/Team roles: **{len(preview['legacy'])}**\n"
+            f"Dormant generated formation roles: **{len(preview.get('dormant',[]))}**\n\n"
             'No changes were made. The cleanup uses the WEBSITE personnel record as authority, suppresses temporary Discord role-change echo, preserves duplicate-role channel overwrites, then reapplies canonical roles and permissions.\n\n'
             'Run `/organization-cleanup confirm:True` to execute.',ephemeral=True)
         return
@@ -2738,6 +2808,40 @@ async def close_duty(interaction: discord.Interaction, event_id: Optional[str] =
 
 
 
+async def _publish_role_registry(guild: discord.Guild):
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    me=guild.me
+    rows=[]
+    for role in guild.roles:
+        category=_managed_role_category(role.name)
+        if not category or role.is_default(): continue
+        rows.append({'role_id':role.id,'role_name':role.name,'role_category':category,
+                     'canonical_key':_canonical_managed_role_name(role.name) or role.name,
+                     'manageable':bool(me and role < me.top_role)})
+    await web.request('POST','/internal/clerk/role-registry',json={'guild_id':guild.id,'roles':rows})
+
+
+@tasks.loop(minutes=1)
+async def clerk_heartbeat_watch():
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            pending=sum(1 for t in pending_personnel_sync.values() if not t.done())
+            await web.request('POST','/internal/clerk/heartbeat',json={
+                'component':'BATTALION_CLERK','status':'ONLINE','version':'2026.08.24-authority-control',
+                'details':{'guild_id':guild.id,'members':guild.member_count,'pending_personnel_sync':pending,
+                           'hll_collector_started':bool(collector_started)}
+            })
+            await _publish_role_registry(guild)
+        except Exception as exc:
+            log.warning('[CLERK HEARTBEAT FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@clerk_heartbeat_watch.before_loop
+async def before_clerk_heartbeat_watch():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(minutes=1)
 async def canonical_role_sync_watch():
     """Website personnel state is authoritative; process queued role mirrors safely."""
@@ -2756,11 +2860,24 @@ async def canonical_role_sync_watch():
                         except Exception: member=None
                     if not member:
                         raise RuntimeError('Discord member not found in guild')
-                    await reconcile_member_roles_from_canonical(member,item)
-                    ok=True
+                    recon=await reconcile_member_roles_from_canonical(member,item)
+                    ok=bool((recon or {}).get('ok',True))
+                    error=(recon or {}).get('error')
+                    await web.request('POST','/internal/clerk/personnel/sync-observation',json={
+                        'personnel_id':str(item.get('personnel_id')),'guild_id':guild.id,'discord_user_id':member.id,
+                        'status':'COMPLETE' if ok else 'BLOCKED','expected':(recon or {}).get('expected') or {},
+                        'actual_roles':member_role_names(member),'changes':{'added':(recon or {}).get('added',[]),'removed':(recon or {}).get('removed',[]),'created':(recon or {}).get('created',[])},
+                        'error':error,'summary':'Discord roles match the authoritative website record.' if ok else 'Discord reconciliation is blocked and requires Command review.'
+                    })
                 except Exception as exc:
                     error=str(exc)[:400]
                     log.warning('[ROLE SYNC QUEUE ITEM FAILED] queue=%s error=%s',qid,exc)
+                    try:
+                        await web.request('POST','/internal/clerk/personnel/sync-observation',json={
+                            'personnel_id':str(item.get('personnel_id')),'guild_id':guild.id,'discord_user_id':uid,
+                            'status':'FAILED','expected':{},'actual_roles':member_role_names(member) if member else [],
+                            'changes':{},'error':error,'summary':'Discord reconciliation failed.'})
+                    except Exception: pass
                 await web.request('POST',f'/internal/clerk/role-sync/{qid}/complete',json={'ok':ok,'error':error})
         except Exception as exc:
             log.warning('[CANONICAL ROLE SYNC WATCH FAILED] guild=%s error=%s',guild.id,exc)
@@ -2895,6 +3012,8 @@ async def on_ready():
         personnel_suspense_watch.start()
     if not canonical_role_sync_watch.is_running():
         canonical_role_sync_watch.start()
+    if not clerk_heartbeat_watch.is_running():
+        clerk_heartbeat_watch.start()
     if not member_record_reminder_watch.is_running():
         member_record_reminder_watch.start()
 

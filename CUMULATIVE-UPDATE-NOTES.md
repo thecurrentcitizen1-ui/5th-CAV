@@ -118,3 +118,7 @@
 - Rifleman 0→11R, Medic 3→91M, Machine Gunner 6→11M, Grenadier 7→11G, Engineer 8→12E, Squad Leader 9→11L, Crewman 11→19K, Tank Commander 12→19C, Pilot 16→67P, Logistics Officer 17→67L.
 - Specialist role 5 remains intentionally unmapped until its community MOS relationship is explicitly verified.
 - Existing `role_seconds` remains the single authoritative clock; no duplicate MOS timer was added.
+
+## 2026-08-24 — Personnel Authority / Discord Reconciliation
+- Discord mirrors Website Rank/MOS/Company/Platoon/Squad/Team/billet authority.
+- Added active-member role activation at Platoon assignment, on-demand formation roles, obsolete role cleanup, heartbeat/role registry reporting, and reconciliation observations.

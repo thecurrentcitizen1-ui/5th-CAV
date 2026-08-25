@@ -1,0 +1,13 @@
+1/5 CAV BATTALION CLERK — PERSONNEL AUTHORITY / ROLE CLEANUP OVERHAUL
+24 AUG 2026
+
+- Discord is now presentation/access only for established personnel; website record is authoritative.
+- Manual Discord role changes trigger reconciliation back to website state rather than personnel writeback.
+- Active membership role "5th Cavalry Regiment" is controlled by real Platoon assignment (or permanent HHC assignment).
+- Platoon/Squad roles are now created on demand only for active website assignments; future empty combinations are no longer pre-generated.
+- Fire Team (Alpha/Bravo) is website-only; obsolete generic Team Discord roles are removed during safe cleanup.
+- Canonical Company role is singular (A Company/B Company/C Company/HHC); aliases are obsolete cleanup targets.
+- Organization cleanup removes safe unused formation roles and preserves dormant roles that still own channel permissions.
+- Battalion Clerk publishes a one-minute heartbeat and managed role-ID registry to the website.
+- Every role reconciliation reports actual roles, added/removed roles, created roles, and exact error reason to Command Sync Control.
+- Protected/manual roles such as Admin/Command Staff are outside the formation reconciliation removal set.
