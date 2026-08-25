@@ -2093,12 +2093,18 @@ async def run_organization_cleanup(guild: discord.Guild):
                 continue
             if role >= me.top_role:
                 failures.append(f'DORMANT FORMATION ABOVE CLERK {role.name} ({role.id})'); continue
-            has_overwrite=False
+            if role.members:
+                failures.append(f'DORMANT FORMATION PRESERVED — {len(role.members)} MEMBER(S) STILL CARRY ROLE {role.name} ({role.id})')
+                continue
+            overwrite_fail=None
             for channel in list(guild.channels):
-                if role in channel.overwrites:
-                    has_overwrite=True; break
-            if has_overwrite:
-                failures.append(f'DORMANT FORMATION PRESERVED — CHANNEL PERMISSIONS {role.name} ({role.id})')
+                if role not in channel.overwrites: continue
+                try:
+                    await channel.set_permissions(role,overwrite=None,reason='Battalion Clerk — remove dormant formation permission overwrite')
+                except Exception as exc:
+                    overwrite_fail=f'{getattr(channel,"name",channel.id)}: {exc}'; break
+            if overwrite_fail:
+                failures.append(f'DORMANT FORMATION PRESERVED — PERMISSION CLEANUP FAILED {role.name} ({role.id}) {overwrite_fail}')
                 continue
             try:
                 await role.delete(reason='Battalion Clerk — remove unused website-unassigned formation role')
@@ -2153,7 +2159,7 @@ async def organization_cleanup_command(interaction: discord.Interaction, confirm
             f"Duplicate managed name groups: **{len(preview['duplicates'])}**\n"
             f"Obsolete generic Company/Platoon/Squad/Team roles: **{len(preview['legacy'])}**\n"
             f"Dormant generated formation roles: **{len(preview.get('dormant',[]))}**\n\n"
-            'No changes were made. The cleanup uses the WEBSITE personnel record as authority, suppresses temporary Discord role-change echo, preserves duplicate-role channel overwrites, then reapplies canonical roles and permissions.\n\n'
+            'No changes were made. The cleanup uses the WEBSITE personnel record as authority, suppresses temporary Discord role-change echo, preserves active-role permissions, archives truly unused formation permission overwrites, then reapplies canonical roles and permissions.\n\n'
             'Run `/organization-cleanup confirm:True` to execute.',ephemeral=True)
         return
     try:
@@ -2821,6 +2827,81 @@ async def _publish_role_registry(guild: discord.Guild):
     await web.request('POST','/internal/clerk/role-registry',json={'guild_id':guild.id,'roles':rows})
 
 
+async def _dormant_formation_inventory_rows(guild: discord.Guild):
+    me=guild.me
+    desired_counts={}
+    if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
+        data=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':guild.id})
+        for x in data.get('items',[]):
+            unit=str(x.get('unit_code') or '').upper().strip(); pl=str(x.get('platoon') or '').strip(); sq=str(x.get('squad') or '').strip(); letter=unit[:1] if unit[:1] in {'A','B','C'} else None
+            if letter and pl:
+                key=_normalized_role_name(f"{letter} Company • {pl.title()}"); desired_counts[key]=desired_counts.get(key,0)+1
+            if letter and pl and sq:
+                key=_normalized_role_name(f"{letter} Company • {pl.title()} • {sq.title()}"); desired_counts[key]=desired_counts.get(key,0)+1
+    rows=[]
+    for role in guild.roles:
+        if not _is_managed_formation_role_name(role.name): continue
+        key=_normalized_role_name(role.name); website_count=desired_counts.get(key,0)
+        overwrite_refs=[]
+        for channel in guild.channels:
+            if role in channel.overwrites:
+                overwrite_refs.append({'channel_id':channel.id,'name':getattr(channel,'name',str(channel.id)),'type':channel.__class__.__name__})
+        manageable=bool(me and role < me.top_role)
+        if website_count>0:
+            status='ACTIVE'
+        elif not manageable:
+            status='BLOCKED'
+        elif len(role.members)>0:
+            status='NEEDS_REVIEW'
+        else:
+            status='SAFE_TO_ARCHIVE'
+        rows.append({'role_id':role.id,'role_name':role.name,'canonical_key':_canonical_managed_role_name(role.name) or role.name,
+                     'member_count':len(role.members),'website_assignment_count':website_count,'overwrite_count':len(overwrite_refs),
+                     'overwrites':overwrite_refs,'status':status,'manageable':manageable})
+    return rows
+
+
+async def _publish_dormant_formation_inventory(guild: discord.Guild):
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    rows=await _dormant_formation_inventory_rows(guild)
+    await web.request('POST','/internal/clerk/dormant-formations/report',json={'guild_id':guild.id,'roles':rows})
+
+
+async def _archive_dormant_formation_role(guild: discord.Guild, role_id: int):
+    me=guild.me
+    role=guild.get_role(int(role_id))
+    if not role:
+        return {'ok':True,'summary':'Role already absent.'}
+    if not _is_managed_formation_role_name(role.name):
+        return {'ok':False,'blocked':True,'error':'Role is not a managed formation role.'}
+    if not me or role >= me.top_role:
+        return {'ok':False,'blocked':True,'error':'Role is above Battalion Clerk or cannot be managed.'}
+    # Re-read Website authority immediately before destructive work.
+    rows=await _dormant_formation_inventory_rows(guild)
+    current=next((x for x in rows if int(x['role_id'])==role.id),None)
+    if not current:
+        return {'ok':False,'blocked':True,'error':'Formation inventory could not be verified.'}
+    if current.get('website_assignment_count',0)>0:
+        return {'ok':False,'blocked':True,'error':'Website now has active personnel assigned to this formation.'}
+    if len(role.members)>0:
+        return {'ok':False,'blocked':True,'error':f'Role still has {len(role.members)} Discord member(s); reconcile personnel first.'}
+    # Remove every explicit channel/category overwrite before deleting the role. With no Website assignments
+    # and no Discord members, this cannot remove access from an active Soldier. Future reactivation will
+    # recreate the role and normal channel/permission repair can reapply the canonical overwrite.
+    for channel in list(guild.channels):
+        if role not in channel.overwrites: continue
+        try:
+            await channel.set_permissions(role,overwrite=None,reason='Battalion Clerk — archive dormant formation permission overwrite')
+        except Exception as exc:
+            return {'ok':False,'blocked':True,'error':f'Could not remove overwrite from {getattr(channel,"name",channel.id)}: {exc}'}
+    try:
+        name=role.name
+        await role.delete(reason='Battalion Clerk — archive Website-unassigned dormant formation role')
+        return {'ok':True,'summary':f'Archived dormant formation role {name}.'}
+    except Exception as exc:
+        return {'ok':False,'error':str(exc)[:400]}
+
+
 @tasks.loop(minutes=1)
 async def clerk_heartbeat_watch():
     if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
@@ -2833,12 +2914,35 @@ async def clerk_heartbeat_watch():
                            'hll_collector_started':bool(collector_started)}
             })
             await _publish_role_registry(guild)
+            await _publish_dormant_formation_inventory(guild)
         except Exception as exc:
             log.warning('[CLERK HEARTBEAT FAILED] guild=%s error=%s',guild.id,exc)
 
 
 @clerk_heartbeat_watch.before_loop
 async def before_clerk_heartbeat_watch():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def dormant_formation_cleanup_watch():
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        try:
+            data=await web.request('GET','/internal/clerk/dormant-formations/cleanup-pending',params={'guild_id':guild.id})
+            for item in data.get('items',[]):
+                cleanup_id=item.get('id'); role_id=item.get('role_id')
+                if not cleanup_id or not role_id: continue
+                result=await _archive_dormant_formation_role(guild,int(role_id))
+                await web.request('POST',f'/internal/clerk/dormant-formations/cleanup/{cleanup_id}/complete',json={
+                    'ok':bool(result.get('ok')),'blocked':bool(result.get('blocked')),'error':result.get('error')})
+            await _publish_dormant_formation_inventory(guild)
+        except Exception as exc:
+            log.warning('[DORMANT FORMATION CLEANUP WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@dormant_formation_cleanup_watch.before_loop
+async def before_dormant_formation_cleanup_watch():
     await bot.wait_until_ready()
 
 
@@ -3014,6 +3118,8 @@ async def on_ready():
         canonical_role_sync_watch.start()
     if not clerk_heartbeat_watch.is_running():
         clerk_heartbeat_watch.start()
+    if not dormant_formation_cleanup_watch.is_running():
+        dormant_formation_cleanup_watch.start()
     if not member_record_reminder_watch.is_running():
         member_record_reminder_watch.start()
 

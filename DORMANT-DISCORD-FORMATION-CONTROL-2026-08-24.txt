@@ -1,0 +1,10 @@
+DORMANT DISCORD FORMATION CONTROL — 24 AUG 2026
+
+- Adds Command/S-1 Dormant Formations inventory to Personnel Sync Control.
+- Website authority remains mandatory: active Website assignments can never be archived.
+- SAFE TO ARCHIVE requires zero Website assignments, zero Discord members, and a manageable role.
+- Channel/category permission overwrites are inventoried before cleanup.
+- Safe archival removes dormant overwrites first, then deletes the unused role.
+- If a role gains a Website assignment, gains a Discord member, moves above Battalion Clerk, or an overwrite cannot be safely removed, cleanup is blocked.
+- Adds queued Website -> Battalion Clerk archival workflow and automation ledger results.
+- Existing /organization-cleanup now safely removes permission overwrites for truly dormant zero-member roles instead of preserving every dormant role forever.
