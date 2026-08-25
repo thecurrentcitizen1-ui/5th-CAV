@@ -271,17 +271,19 @@ def _weapon_label(value: Any) -> str:
 
 
 HLL_KNOWN_ROLE_MAPPINGS = {
-    "0": {"name": "RIFLEMAN", "category": "INFANTRY", "mos_code": ""},
-    "3": {"name": "MEDIC", "category": "MEDICAL", "mos_code": ""},
+    # Confirmed role IDs are also mapped to the community battlefield MOS so
+    # verified role_seconds can drive MOS proficiency without a second timer.
+    "0": {"name": "RIFLEMAN", "category": "INFANTRY", "mos_code": "11R"},
+    "3": {"name": "MEDIC", "category": "MEDICAL", "mos_code": "91M"},
     "5": {"name": "SPECIALIST", "category": "INFANTRY", "mos_code": ""},
-    "6": {"name": "MACHINE GUNNER", "category": "INFANTRY", "mos_code": ""},
-    "7": {"name": "GRENADIER", "category": "INFANTRY", "mos_code": ""},
-    "8": {"name": "ENGINEER", "category": "SUPPORT", "mos_code": ""},
-    "9": {"name": "SQUAD LEADER", "category": "LEADERSHIP", "mos_code": ""},
+    "6": {"name": "MACHINE GUNNER", "category": "INFANTRY", "mos_code": "11M"},
+    "7": {"name": "GRENADIER", "category": "INFANTRY", "mos_code": "11G"},
+    "8": {"name": "ENGINEER", "category": "SUPPORT", "mos_code": "12E"},
+    "9": {"name": "SQUAD LEADER", "category": "LEADERSHIP", "mos_code": "11L"},
     "11": {"name": "CREWMAN", "category": "ARMOR", "mos_code": "19K"},
     "12": {"name": "TANK COMMANDER", "category": "ARMOR", "mos_code": "19C"},
-    "16": {"name": "PILOT", "category": "AVIATION", "mos_code": ""},
-    "17": {"name": "LOGISTICS OFFICER", "category": "AVIATION", "mos_code": ""},
+    "16": {"name": "PILOT", "category": "AVIATION", "mos_code": "67P"},
+    "17": {"name": "LOGISTICS OFFICER", "category": "AVIATION", "mos_code": "67L"},
 }
 
 

@@ -70,6 +70,9 @@ announcement_end_sent = set()
 # lets Battalion Clerk read the member's complete role set before opening the 201 File.
 PERSONNEL_ROLE_SETTLE_SECONDS = 30
 pending_personnel_sync: Dict[Tuple[int, int], asyncio.Task] = {}
+# Members in this set are undergoing Battalion Clerk managed-role maintenance.
+# on_member_update must not echo transient cleanup states back into the website.
+role_sync_suppressed_members = set()
 
 RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","2LT","1LT","CPT","MAJ","LTC"}
 MOS_ROLE_CODES = {"00C","11L","11R","11G","11M","91M","12E","76S","11S","11N","19C","19K","67L","67P","67C","67G","11O","11A","11T"}
@@ -289,9 +292,55 @@ for _company in ("A", "B", "C"):
 
 
 
-def _role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]:
-    return discord.utils.get(guild.roles, name=name)
+def _normalized_role_name(value: str) -> str:
+    return " ".join(str(value or "").upper().strip().split())
 
+def _role_by_name(guild: discord.Guild, name: str) -> Optional[discord.Role]:
+    """Resolve managed roles case/spacing-insensitively so cosmetic duplicates are not created."""
+    wanted=_normalized_role_name(name)
+    exact=discord.utils.get(guild.roles,name=name)
+    if exact:
+        return exact
+    return next((r for r in guild.roles if _normalized_role_name(r.name)==wanted),None)
+
+
+def _all_managed_role_names():
+    names=[]
+    for divider,roles in ROLE_SECTIONS:
+        names.append(divider); names.extend(roles)
+    return names
+
+def _canonical_managed_role_name(value: str) -> Optional[str]:
+    wanted=_normalized_role_name(value)
+    for name in _all_managed_role_names():
+        if _normalized_role_name(name)==wanted:
+            return name
+    return None
+
+def _managed_role_group(guild: discord.Guild, canonical_name: str):
+    wanted=_normalized_role_name(canonical_name)
+    return [r for r in guild.roles if _normalized_role_name(r.name)==wanted]
+
+def _merge_overwrites(a: discord.PermissionOverwrite, b: discord.PermissionOverwrite):
+    allow_a,deny_a=a.pair(); allow_b,deny_b=b.pair()
+    deny=discord.Permissions(deny_a.value | deny_b.value)
+    allow=discord.Permissions((allow_a.value | allow_b.value) & ~deny.value)
+    return discord.PermissionOverwrite.from_pair(allow,deny)
+
+async def _preserve_duplicate_role_overwrites(guild: discord.Guild, canonical: discord.Role, duplicate: discord.Role):
+    """Copy any duplicate-role channel/category overwrite onto the canonical role before deletion."""
+    failures=[]
+    for channel in guild.channels:
+        if duplicate not in channel.overwrites:
+            continue
+        try:
+            dup_ow=channel.overwrites_for(duplicate)
+            canonical_ow=channel.overwrites_for(canonical)
+            await channel.set_permissions(canonical,overwrite=_merge_overwrites(canonical_ow,dup_ow),
+                                          reason='Battalion Clerk — preserve access while consolidating duplicate managed role')
+        except Exception as exc:
+            failures.append(f'{channel.name}: {exc}')
+    return failures
 
 def _member_access_roles(guild: discord.Guild):
     # A recognized rank is the basic battalion-member access token. Staff roles
@@ -650,6 +699,13 @@ def structure_inventory(guild: discord.Guild):
     for divider,roles in ROLE_SECTIONS:
         expected_roles.append(divider); expected_roles.extend(roles)
     missing_roles=[name for name in expected_roles if not _role_by_name(guild,name)]
+    managed_norm={_normalized_role_name(x) for x in expected_roles}|{_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES}
+    grouped={}
+    for role in guild.roles:
+        key=_normalized_role_name(role.name)
+        if key in managed_norm:
+            grouped.setdefault(key,[]).append(role)
+    duplicate_roles=[{"name":key,"count":len(rows),"ids":[r.id for r in rows]} for key,rows in grouped.items() if len(rows)>1]
     missing_categories=[]; missing_channels=[]
     for spec in CHANNEL_BLUEPRINT:
         cat=discord.utils.get(guild.categories,name=spec["category"])
@@ -661,6 +717,7 @@ def structure_inventory(guild: discord.Guild):
             if not discord.utils.get(collection,name=name):
                 missing_channels.append(f"{spec['category']} / {name} ({kind})")
     return {"missing_roles":missing_roles,"missing_categories":missing_categories,"missing_channels":missing_channels,
+            "duplicate_managed_roles":duplicate_roles,
             "expected_roles":len(expected_roles),"expected_categories":len(CHANNEL_BLUEPRINT),
             "expected_channels":sum(len(x["channels"]) for x in CHANNEL_BLUEPRINT)}
 
@@ -1697,9 +1754,9 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     for role in member.roles:
         n=" ".join(role.name.upper().strip().split())
         if n in all_company_names and n not in desired_company: remove.append(role)
-        if role.name in PLATOON_ROLE_BLUEPRINT and n != desired_platoon_role: remove.append(role)
-        if role.name in SQUAD_ROLE_BLUEPRINT and n != desired_squad_role: remove.append(role)
-        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES: remove.append(role)
+        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in PLATOON_ROLE_BLUEPRINT) and n != desired_platoon_role: remove.append(role)
+        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in SQUAD_ROLE_BLUEPRINT) and n != desired_squad_role: remove.append(role)
+        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES): remove.append(role)
     for role in member.guild.roles:
         n=" ".join(role.name.upper().strip().split())
         if n in desired_company or (desired_platoon_role and n==desired_platoon_role) or (desired_squad_role and n==desired_squad_role):
@@ -1709,10 +1766,10 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     fire_team=(result.get('fire_team') or '').strip().upper()
     desired_team_name={'ALPHA TEAM':'Alpha Team','BRAVO TEAM':'Bravo Team'}.get(fire_team)
     for role in member.roles:
-        if role.name in TEAM_ROLE_BLUEPRINT and role.name != desired_team_name:
+        if any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in TEAM_ROLE_BLUEPRINT) and _normalized_role_name(role.name) != _normalized_role_name(desired_team_name or ''):
             remove.append(role)
     if desired_team_name:
-        team_role=discord.utils.get(member.guild.roles,name=desired_team_name)
+        team_role=_role_by_name(member.guild,desired_team_name)
         if team_role is None:
             try:
                 team_role=await member.guild.create_role(name=desired_team_name,permissions=discord.Permissions.none(),hoist=False,mentionable=False,reason='Battalion Clerk — active fire-team assignment')
@@ -1900,6 +1957,156 @@ async def setup_channels(interaction: discord.Interaction, confirm: bool):
         await interaction.followup.send(f'Channel setup failed: `{exc}`',ephemeral=True)
 
 
+async def organization_cleanup_inventory(guild: discord.Guild):
+    inv=structure_inventory(guild)
+    legacy=[r for r in guild.roles if any(_normalized_role_name(r.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES)]
+    duplicate_details=[]
+    for item in inv.get('duplicate_managed_roles',[]):
+        canonical=_canonical_managed_role_name(item['name']) or item['name']
+        roles=_managed_role_group(guild,canonical)
+        duplicate_details.append({
+            'canonical':canonical,
+            'count':len(roles),
+            'member_links':sum(len(r.members) for r in roles),
+            'role_ids':[r.id for r in roles],
+        })
+    return {'duplicates':duplicate_details,'legacy':legacy,'inventory':inv}
+
+async def run_organization_cleanup(guild: discord.Guild):
+    """Consolidate duplicate managed roles without changing website personnel authority."""
+    me=guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        raise RuntimeError('Battalion Clerk needs Manage Roles permission.')
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        raise RuntimeError('Website connection is required; cleanup will not run without canonical personnel data.')
+
+    canonical_data=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':guild.id})
+    snapshots={int(x['discord_user_id']):x for x in canonical_data.get('items',[]) if x.get('discord_user_id')}
+    touched=set(); migrated=0; deleted=[]; renamed=[]; preserved_permissions=0; failures=[]
+
+    # Freeze Discord->website role echo for every linked Soldier while the canonical website state is reapplied.
+    for uid in snapshots:
+        role_sync_suppressed_members.add((guild.id,uid)); touched.add(uid)
+    try:
+        # First restore every linked member from the WEBSITE snapshot. This prevents duplicate roles
+        # from becoming the source of truth during the maintenance window.
+        for uid,snapshot in snapshots.items():
+            member=guild.get_member(uid)
+            if not member:
+                try: member=await guild.fetch_member(uid)
+                except Exception: member=None
+            if not member: continue
+            try:
+                await reconcile_member_roles_from_canonical(member,snapshot)
+                migrated+=1
+            except Exception as exc:
+                failures.append(f'MEMBER {uid}: {exc}')
+
+        # Consolidate exact managed-role aliases/case variants. Prefer the exact blueprint spelling.
+        for canonical_name in _all_managed_role_names():
+            group=_managed_role_group(guild,canonical_name)
+            if not group: continue
+            canonical=discord.utils.get(group,name=canonical_name)
+            if canonical is None:
+                manageable=[r for r in group if r < me.top_role]
+                canonical=(manageable[0] if manageable else group[0])
+                if canonical < me.top_role:
+                    try:
+                        old=canonical.name
+                        await canonical.edit(name=canonical_name,reason='Battalion Clerk — normalize managed role display name')
+                        renamed.append(f'{old} -> {canonical_name}')
+                    except Exception as exc:
+                        failures.append(f'RENAME {canonical.name}: {exc}')
+            for duplicate in list(group):
+                if duplicate.id==canonical.id: continue
+                if duplicate >= me.top_role:
+                    failures.append(f'DUPLICATE ABOVE CLERK {duplicate.name} ({duplicate.id})')
+                    continue
+                # Preserve any custom/category permission references before moving members and deleting.
+                errs=await _preserve_duplicate_role_overwrites(guild,canonical,duplicate)
+                if not errs: preserved_permissions += 1
+                else: failures.extend([f'OVERWRITE {duplicate.name}: {x}' for x in errs])
+                try:
+                    members=list(duplicate.members)
+                    for member in members:
+                        role_sync_suppressed_members.add((guild.id,member.id)); touched.add(member.id)
+                        if canonical not in member.roles:
+                            await member.add_roles(canonical,reason='Battalion Clerk — consolidate duplicate managed role')
+                    await duplicate.delete(reason='Battalion Clerk — duplicate managed role consolidated into canonical role')
+                    deleted.append(f'DUPLICATE:{duplicate.name}:{duplicate.id}')
+                except Exception as exc:
+                    failures.append(f'DUPLICATE {duplicate.name} ({duplicate.id}): {exc}')
+
+        # Generic Platoon/Squad roles are obsolete and unsafe for scoped permissions. Website canonical
+        # assignment has already been reapplied above, so these can be removed without guessing assignments.
+        for role in list(guild.roles):
+            if not any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES):
+                continue
+            if role >= me.top_role:
+                failures.append(f'LEGACY ABOVE CLERK {role.name} ({role.id})'); continue
+            try:
+                await role.delete(reason='Battalion Clerk — remove obsolete generic formation role after canonical migration')
+                deleted.append(f'LEGACY:{role.name}:{role.id}')
+            except Exception as exc:
+                failures.append(f'LEGACY {role.name}: {exc}')
+
+        # Reapply canonical roles one final time and rebuild channel overwrites to ensure automation,
+        # website syncing, and assignment-based Discord access finish in a known-good state.
+        for uid,snapshot in snapshots.items():
+            member=guild.get_member(uid)
+            if member:
+                try: await reconcile_member_roles_from_canonical(member,snapshot)
+                except Exception as exc: failures.append(f'FINAL MEMBER {uid}: {exc}')
+        roles=await build_battalion_roles(guild)
+        channels=await build_battalion_channels(guild)
+        failures.extend(roles.get('failed',[])); failures.extend(channels.get('failed',[]))
+    finally:
+        # Keep suppression through the Discord event burst, then resume normal syncing. The website has
+        # remained authoritative for the entire operation and no transient role state is written back.
+        await asyncio.sleep(2)
+        for uid in touched:
+            role_sync_suppressed_members.discard((guild.id,uid))
+
+    inv=structure_inventory(guild)
+    return {'canonical_members':len(snapshots),'members_reconciled':migrated,'deleted':deleted,'renamed':renamed,
+            'preserved_permissions':preserved_permissions,'failures':failures,'inventory':inv}
+
+
+@bot.tree.command(name='organization-cleanup', description='Safely consolidate duplicate 1/5 CAV roles using the website as authority.')
+@app_commands.describe(confirm='Set True to migrate members, preserve permissions, and remove safe duplicate/legacy managed roles')
+async def organization_cleanup_command(interaction: discord.Interaction, confirm: bool=False):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    preview=await organization_cleanup_inventory(interaction.guild)
+    if not confirm:
+        await interaction.followup.send(
+            '**1/5 CAV ORGANIZATION CLEANUP — PREVIEW**\n'
+            f"Duplicate managed name groups: **{len(preview['duplicates'])}**\n"
+            f"Obsolete generic Platoon/Squad roles: **{len(preview['legacy'])}**\n\n"
+            'No changes were made. The cleanup uses the WEBSITE personnel record as authority, suppresses temporary Discord role-change echo, preserves duplicate-role channel overwrites, then reapplies canonical roles and permissions.\n\n'
+            'Run `/organization-cleanup confirm:True` to execute.',ephemeral=True)
+        return
+    try:
+        result=await run_organization_cleanup(interaction.guild)
+    except Exception as exc:
+        await interaction.followup.send(f'**ORGANIZATION CLEANUP ABORTED**\n`{exc}`\nNo blind cleanup was attempted.',ephemeral=True); return
+    inv=result['inventory']
+    msg=(
+        '**1/5 CAV ORGANIZATION CLEANUP COMPLETE**\n'
+        f"Website-linked Soldiers read: **{result['canonical_members']}**\n"
+        f"Canonical member reconciliations: **{result['members_reconciled']}**\n"
+        f"Roles normalized/renamed: **{len(result['renamed'])}**\n"
+        f"Duplicate/legacy roles removed: **{len(result['deleted'])}**\n"
+        f"Duplicate permission sets preserved: **{result['preserved_permissions']}**\n"
+        f"Remaining duplicate managed role groups: **{len(inv.get('duplicate_managed_roles',[]))}**\n"
+        f"Failures requiring review: **{len(result['failures'])}**\n\n"
+        '**WEBSITE AUTHORITY PRESERVED** — the cleanup never derives Company/Platoon/Squad/Team from a temporary Discord role state.'
+    )
+    if result['failures']:
+        msg += '\n\n**Review**\n'+'\n'.join(f"• {x}" for x in result['failures'][:12])
+    await interaction.followup.send(msg,ephemeral=True)
+
+
 @bot.tree.command(name='battalion-setup', description='Build all 1/5 CAV roles, categories, channels, dividers, and access scopes.')
 @app_commands.describe(confirm='Set to True to build the complete server structure')
 async def battalion_setup(interaction: discord.Interaction, confirm: bool):
@@ -1933,10 +2140,14 @@ async def structure_status(interaction: discord.Interaction):
     lines=["**1/5 CAV DISCORD STRUCTURE STATUS**",
            f"Expected role items: **{inv['expected_roles']}** — Missing: **{len(inv['missing_roles'])}**",
            f"Expected categories: **{inv['expected_categories']}** — Missing: **{len(inv['missing_categories'])}**",
-           f"Expected channels: **{inv['expected_channels']}** — Missing: **{len(inv['missing_channels'])}**"]
+           f"Expected channels: **{inv['expected_channels']}** — Missing: **{len(inv['missing_channels'])}**",
+           f"Duplicate managed role names: **{len(inv.get('duplicate_managed_roles',[]))}**"]
     if inv['missing_roles']: lines.append("\n**Missing Roles**\n"+"\n".join(f"• {x}" for x in inv['missing_roles'][:10]))
     if inv['missing_categories']: lines.append("\n**Missing Categories**\n"+"\n".join(f"• {x}" for x in inv['missing_categories'][:10]))
     if inv['missing_channels']: lines.append("\n**Missing Channels**\n"+"\n".join(f"• {x}" for x in inv['missing_channels'][:10]))
+    if inv.get('duplicate_managed_roles'):
+        lines.append("\n**Duplicate Managed Roles**\n"+"\n".join(f"• {x['name']} — {x['count']} COPIES" for x in inv['duplicate_managed_roles'][:10]))
+        lines.append("\nRun `/organization-cleanup` for a no-change preview, then `/organization-cleanup confirm:True` for website-authoritative consolidation.")
     await interaction.response.send_message("\n".join(lines),ephemeral=True)
 
 
@@ -2170,6 +2381,35 @@ async def welcome_channel_clear(interaction: discord.Interaction):
         'Configured welcome channel cleared. Battalion Clerk will fall back to `#welcome-to-the-1-5` if that standard channel exists.',
         ephemeral=True,
     )
+
+@bot.tree.command(name='welcome-preview', description='Preview the exact new-member welcome and approval messages without issuing anything.')
+async def welcome_preview(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    site=WEBSITE_BASE_URL or 'https://5thcavgaming.com'
+    public_preview=WELCOME_MESSAGE.format(member_mention='@NEW-SOLDIER')
+    credential_preview=build_recruit_credentials_message(
+        {'case_number':'RC-PREVIEW'},
+        {'roster_number':'BR-PREVIEW','field_code':'FIELD-CODE-PREVIEW','weapon_serial':'1847002'},
+        site=site,
+    )
+    packet_note=(
+        "**WEBSITE WELCOME PACKET**\n"
+        f"{site}/welcome-packet\n"
+        "Command can preview the exact read-only member packet from Website → S-1 Personnel → Welcome Packet / Onboarding → MEMBER VIEW.\n"
+        "This preview sends nothing, creates no credentials, changes no roles, and completes no onboarding tasks."
+    )
+    chunks=[
+        "**WELCOME DELIVERY PREVIEW — NOTHING HAS BEEN ISSUED**\n\n**1. PUBLIC JOIN NOTICE**\n"+public_preview,
+        "**2. APPROVAL / PRIVATE CREDENTIAL DM**\n"+credential_preview,
+        "**3. MEMBER WEBSITE PACKET**\n"+packet_note,
+    ]
+    for i,text in enumerate(chunks):
+        text=text[:1950]
+        if i==0:
+            await interaction.followup.send(text,ephemeral=True)
+        else:
+            await interaction.followup.send(text,ephemeral=True)
 
 @bot.tree.command(name='operation-reminder-channel', description='Assign the channel that receives automatic reminders for scheduled Operations.')
 @app_commands.describe(channel='Text channel for Operation reminders')
@@ -2797,19 +3037,13 @@ async def auto_join_approved_recruit(guild: discord.Guild, case: dict) -> Option
         return None
 
 
-async def deliver_recruit_credentials(member: discord.Member, case: dict, provision: dict) -> bool:
-    if case.get('credentials_sent_at') or provision.get('credentials_already_sent'):
-        return True
+def build_recruit_credentials_message(case: dict, provision: dict, *, site: str | None = None) -> str:
+    """Build the exact approval/credential DM used for live delivery and Command preview."""
     roster=provision.get('roster_number') or ((provision.get('roster') or {}).get('roster_number') if isinstance(provision.get('roster'),dict) else None)
     field_code=provision.get('field_code')
-    if not roster or not field_code:
-        err='Provisioning completed but plaintext Battle Roster credentials were not available for delivery'
-        log.warning('[RECRUIT CREDENTIAL HOLD] case=%s %s',case.get('case_number'),err)
-        await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':False,'error':err})
-        return False
     weapon_line=f"\nIssued M16: **{provision.get('weapon_serial')}**" if provision.get('weapon_serial') else "\nIssued M16: **Pending S-4 issue**"
-    site=WEBSITE_BASE_URL or 'the battalion website'
-    message=(
+    site=site or WEBSITE_BASE_URL or 'the battalion website'
+    return (
         "**APPLICATION APPROVED — 1/5 CAV REPLACEMENT DETACHMENT**\n"
         f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. You have been entered into the 1/5 Cavalry Discord and your Replacement Detachment 201 File is open.\n\n"
         "**YOUR WEBSITE ACCESS**\n"
@@ -2821,6 +3055,19 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         "Your Welcome Packet explains Replacement Detachment, walks you through the battalion systems, and updates automatically when S-1 issues your permanent assignment. Complete each required item as you go.\n\n"
         "You are now attached to the **Replacement Detachment**. Discord will notify you when your packet or assignment advances; the battalion Website remains the official personnel record."
     )
+
+
+async def deliver_recruit_credentials(member: discord.Member, case: dict, provision: dict) -> bool:
+    if case.get('credentials_sent_at') or provision.get('credentials_already_sent'):
+        return True
+    roster=provision.get('roster_number') or ((provision.get('roster') or {}).get('roster_number') if isinstance(provision.get('roster'),dict) else None)
+    field_code=provision.get('field_code')
+    if not roster or not field_code:
+        err='Provisioning completed but plaintext Battle Roster credentials were not available for delivery'
+        log.warning('[RECRUIT CREDENTIAL HOLD] case=%s %s',case.get('case_number'),err)
+        await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':False,'error':err})
+        return False
+    message=build_recruit_credentials_message(case,provision)
     try:
         await member.send(message)
         await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':True})
@@ -3053,7 +3300,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     await collector.upsert_member(after)
     if not after.bot:
         if before_roles != after_roles:
-            schedule_personnel_role_sync(after, reason="discord_roles_settled")
+            if (after.guild.id,after.id) in role_sync_suppressed_members:
+                log.info('[ROLE SYNC SUPPRESSED] member=%s cleanup maintenance in progress',after.id)
+            else:
+                schedule_personnel_role_sync(after, reason="discord_roles_settled")
         else:
             # Username/display-name changes can safely update an existing link immediately;
             # they do not trigger creation of a new personnel record.

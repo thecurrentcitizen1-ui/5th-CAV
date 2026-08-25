@@ -90,3 +90,31 @@
 - Approved recruits are provisioned through the website Replacement Detachment endpoint without waiting for Discord rank/MOS/formation roles.
 - Approved Replacement role remains during S-1 processing and is cleared when the website Recruiting Case reaches ENLISTED after final release.
 - Battalion Clerk is now the notification/role-mirroring layer for this workflow, not the personnel-creation authority.
+
+
+2026-08-24 ORGANIZATION ROLE NORMALIZATION
+- Case/spacing-insensitive managed Discord role lookup and duplicate managed-role reporting. See ORGANIZATION-DISCORD-ROLE-NORMALIZATION-2026-08-24.txt.
+
+## 2026-08-24 — Website-Authoritative Discord Organization Cleanup
+- Added `/organization-cleanup` preview and `/organization-cleanup confirm:True` execution flow.
+- Cleanup reads the complete canonical linked personnel roster from the website before changing managed Discord roles.
+- Discord-to-website role-change echo is temporarily suppressed for affected members during maintenance so transient migration states cannot overwrite Company/Platoon/Squad/Team assignments.
+- Duplicate managed roles are consolidated case/spacing-insensitively; exact blueprint spelling is preferred.
+- Members are migrated to the canonical role before a duplicate is removed.
+- Duplicate-role channel/category overwrites are merged onto the surviving canonical role before deletion.
+- Obsolete generic Platoon/Squad roles are removed only after canonical website assignments have been reapplied.
+- Canonical personnel roles and approved channel permissions are reapplied after cleanup.
+- `/structure-status` now directs administrators to the safe cleanup workflow when duplicate managed roles are found.
+
+## 2026-08-24 — Welcome Delivery Preview
+- Added `/welcome-preview` for Manage Server / Administrator users.
+- Preview uses the same `WELCOME_MESSAGE` constant as live public join notices.
+- Refactored the live approval credential DM through `build_recruit_credentials_message()` and reuses that exact builder for preview.
+- Preview uses placeholder credentials only and sends nothing to a recruit.
+- No roles, website records, credentials, or Welcome Packet milestones are changed by preview.
+
+## 2026-08-24 — MOS Role Mapping Authority
+- Confirmed HLL: Vietnam role IDs now seed their corresponding 1/5 Cavalry battlefield MOS codes where the mapping is unambiguous.
+- Rifleman 0→11R, Medic 3→91M, Machine Gunner 6→11M, Grenadier 7→11G, Engineer 8→12E, Squad Leader 9→11L, Crewman 11→19K, Tank Commander 12→19C, Pilot 16→67P, Logistics Officer 17→67L.
+- Specialist role 5 remains intentionally unmapped until its community MOS relationship is explicitly verified.
+- Existing `role_seconds` remains the single authoritative clock; no duplicate MOS timer was added.

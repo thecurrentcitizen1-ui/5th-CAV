@@ -1,0 +1,12 @@
+1/5 CAV DISCORD ORGANIZATION CLEANUP — SAFETY MODEL
+
+1. Website personnel records remain authoritative.
+2. /organization-cleanup with no confirmation is preview-only.
+3. /organization-cleanup confirm:True fetches canonical linked personnel first.
+4. Role-change echo is suppressed during the migration window.
+5. Canonical Company/Platoon/Squad/Team/appointment roles are applied from website data.
+6. Duplicate members and channel overwrites are migrated to the surviving canonical role.
+7. Duplicate and obsolete generic formation roles are removed only when the Clerk can manage them.
+8. Approved channel/category permission blueprints are reapplied.
+9. Canonical member roles are reconciled again before role syncing resumes.
+10. Any role above the Battalion Clerk in the Discord hierarchy is reported instead of being deleted.

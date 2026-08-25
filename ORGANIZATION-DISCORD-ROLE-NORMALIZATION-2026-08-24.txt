@@ -1,0 +1,7 @@
+1/5 CAV DISCORD ORGANIZATION ROLE NORMALIZATION — 24 AUG 2026
+
+- Managed role lookup is now case/spacing-insensitive, preventing Battalion Clerk from creating a second managed role solely because capitalization differs.
+- Strict company/platoon/squad role blueprints remain authoritative.
+- Legacy generic 1st/2nd/3rd Platoon and Squad aliases remain removable by the existing strict-access migration.
+- /structure-status now reports duplicate managed role names explicitly so Command can identify existing duplicate Discord roles.
+- Website remains authoritative for established personnel assignment; Discord mirrors the canonical record.
