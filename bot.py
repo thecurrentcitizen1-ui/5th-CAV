@@ -3010,6 +3010,8 @@ async def on_ready():
         applicant_intake_watch.start()
     if not recruit_status_watch.is_running():
         recruit_status_watch.start()
+    if not credential_resend_watch.is_running():
+        credential_resend_watch.start()
     if not approved_recruit_watch.is_running():
         approved_recruit_watch.start()
     if not welcome_packet_watch.is_running():
@@ -3450,7 +3452,7 @@ def build_recruit_credentials_message(case: dict, provision: dict, *, site: str 
     site=site or WEBSITE_BASE_URL or 'the battalion website'
     return (
         "**APPLICATION APPROVED — REPORT FOR DUTY**\n"
-        f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Your Soldier Record is open and you are attached to **Replacement Detachment** while S-1 processes your permanent assignment.\n\n"
+        f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Your Soldier Record is open and you are attached to **Replacement Detachment** while you complete your Welcome Packet. Permanent Company / Platoon assignment follows after Command accepts that packet.\n\n"
         "**WEBSITE ACCESS**\n"
         f"Website: {site}\n"
         f"Battle Roster Number: **{roster}**\n"
@@ -3462,7 +3464,8 @@ def build_recruit_credentials_message(case: dict, provision: dict, *, site: str 
 
 
 async def deliver_recruit_credentials(member: discord.Member, case: dict, provision: dict) -> bool:
-    if case.get('credentials_sent_at') or provision.get('credentials_already_sent'):
+    resend_pending=bool(case.get('credentials_resend_pending') or provision.get('credentials_resend_pending'))
+    if (case.get('credentials_sent_at') and not resend_pending) or provision.get('credentials_already_sent'):
         return True
     roster=provision.get('roster_number') or ((provision.get('roster') or {}).get('roster_number') if isinstance(provision.get('roster'),dict) else None)
     field_code=provision.get('field_code')
@@ -3472,6 +3475,9 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':False,'error':err})
         return False
     message=build_recruit_credentials_message(case,provision)
+    if resend_pending:
+        message=("**BATTALION HEADQUARTERS — LOGIN INFORMATION REISSUED**\n"
+                 "Command requested another copy of your Website login information. Use the credentials below; if your Field Code was rotated, the older code is no longer valid.\n\n" + message)
     try:
         await member.send(message)
         await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':True})
@@ -3559,9 +3565,61 @@ async def recruit_status_watch():
             log.warning('[RECRUIT STATUS WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
-@tasks.loop(minutes=1)
+async def process_approved_recruit_case(guild: discord.Guild, case: dict, member: discord.Member | None = None) -> bool:
+    """Complete one approved recruit accession and deliver login credentials once.
+
+    This is shared by the fast approval watcher and on_member_join so a recruit
+    who is already in Discord receives credentials within seconds of approval,
+    while a recruit who joins after approval receives them during the join event.
+    """
+    member=member or await auto_join_approved_recruit(guild,case)
+    if not member:
+        return False
+    await collector.upsert_member(member)
+    await ensure_recruit_status_role(member,approved=True)
+    try:
+        provision=await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/provision",json={
+            'guild_id':guild.id,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name,'ensure_credentials':True
+        })
+    except Exception as exc:
+        log.warning('[APPROVED REPLACEMENT PROVISION FAILED] member=%s case=%s error=%s',member.id,case.get('case_number'),exc)
+        return False
+    delivered=await deliver_recruit_credentials(member,case,provision)
+    if delivered:
+        try:
+            await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':'APPROVED_AWAITING_PROCESSING','guild_id':guild.id})
+        except Exception as exc:
+            log.warning('[APPROVAL STATUS NOTIFY FILE FAILED] case=%s error=%s',case.get('case_number'),exc)
+    return delivered
+
+
+@tasks.loop(seconds=10)
+async def credential_resend_watch():
+    """Staff-requested credential recovery queue; works for Replacement and already-enlisted Soldiers."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            data=await web.request('GET','/internal/clerk/recruiting/credential-resends',params={'guild_id':guild.id})
+            for case in data.get('cases',[]):
+                member=guild.get_member(int(case.get('discord_user_id') or 0))
+                if not member:
+                    log.warning('[CREDENTIAL RESEND HOLD] case=%s Discord member not present',case.get('case_number'))
+                    continue
+                try:
+                    provision=await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/resend-credentials",json={'guild_id':guild.id,'discord_user_id':member.id})
+                except Exception as exc:
+                    log.warning('[CREDENTIAL RESEND PREP FAILED] case=%s error=%s',case.get('case_number'),exc)
+                    continue
+                await deliver_recruit_credentials(member,case,provision)
+        except Exception as exc:
+            log.warning('[CREDENTIAL RESEND WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@tasks.loop(seconds=10)
 async def approved_recruit_watch():
-    """One authoritative approval pipeline: join -> role -> provision -> credential DM."""
+    """Near-immediate approval pipeline: join -> role -> provision -> credential DM."""
     if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
     for guild in bot.guilds:
         if GUILD_ID and guild.id != GUILD_ID:
@@ -3569,24 +3627,7 @@ async def approved_recruit_watch():
         try:
             data=await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':guild.id})
             for case in data.get('cases',[]):
-                member=await auto_join_approved_recruit(guild,case)
-                if not member:
-                    continue
-                await collector.upsert_member(member)
-                await ensure_recruit_status_role(member,approved=True)
-                try:
-                    provision=await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/provision",json={
-                        'guild_id':guild.id,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name,'ensure_credentials':True
-                    })
-                except Exception as exc:
-                    log.warning('[APPROVED REPLACEMENT PROVISION FAILED] member=%s case=%s error=%s',member.id,case.get('case_number'),exc)
-                    continue
-                delivered=await deliver_recruit_credentials(member,case,provision)
-                if delivered:
-                    try:
-                        await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':'APPROVED_AWAITING_PROCESSING','guild_id':guild.id})
-                    except Exception as exc:
-                        log.warning('[APPROVAL STATUS NOTIFY FILE FAILED] case=%s error=%s',case.get('case_number'),exc)
+                await process_approved_recruit_case(guild,case)
         except Exception as exc:
             log.warning('[APPROVED RECRUIT WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
@@ -3614,7 +3655,11 @@ async def on_member_join(member: discord.Member):
             try:
                 if case:
                     if approved:
-                        msg=None  # approved_recruit_watch sends the single approval + credential package
+                        # Resume the approved accession immediately on guild join rather than
+                        # waiting for the periodic watcher. Delivery remains idempotent via
+                        # credentials_sent_at on the Recruiting Case.
+                        await process_approved_recruit_case(member.guild,case,member=member)
+                        msg=None
                     elif status=='MORE_INFO_REQUIRED':
                         status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL else "your Recruiting Case status page"
                         msg=f"**1/5 CAV — BATTALION HEADQUARTERS**\nYour verified application requires more information. Respond at: {status_url}"
