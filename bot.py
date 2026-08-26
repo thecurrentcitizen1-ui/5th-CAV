@@ -1105,8 +1105,8 @@ async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
           f"Estimated End: {ends}\n"
           f"Operation Voice: {duty}\n"
           f"Official Credit Requirement: **{credit_minutes} qualifying minutes**\n"
-          f"M16 Expenditure: **300 rounds/hour while verified in Operation voice**\n\n"
-          "Battalion Clerk has armed attendance, reminders, and weapon tracking for this Operation.")
+          f"M16 Service: **tracked from verified HLL server activity while the rifle is issued**\n\n"
+          "Battalion Clerk has armed attendance, reminders, HLL telemetry, and issued-weapon tracking for this Operation.")
     await channel.send(body[:2000])
     return channel.id
 
@@ -1361,12 +1361,6 @@ async def operation_maintenance_watch():
     try:
         result=await web.request('POST','/internal/clerk/operations/maintenance',json={})
         summary=result.get('summary') or {}
-        try:
-            voice_reconcile=await web.request('POST','/internal/clerk/weapons/reconcile-voice-rounds',json={})
-            if int(voice_reconcile.get('rounds_applied') or 0):
-                log.info('[VOICE M16 RECONCILE] sessions=%s blocks=%s rounds=%s',voice_reconcile.get('sessions',0),voice_reconcile.get('blocks_checked',0),voice_reconcile.get('rounds_applied',0))
-        except Exception as exc:
-            log.warning('[VOICE M16 RECONCILE FAILED] %s',exc)
         if int(summary.get('rounds_applied') or 0) or int(summary.get('completed_operations') or 0) or int(summary.get('archived_operations') or 0) or int(summary.get('weapon_timestamp_repairs') or 0):
             log.info('[OPERATION MAINTENANCE] attendance=%s participation=%s full=%s rounds=%s completed=%s archived=%s weapon_ts_repairs=%s weapon_counters=%s',
                      summary.get('attendance_rows',0),summary.get('participation_rows',0),summary.get('full_credit',0),
@@ -1611,48 +1605,16 @@ async def close_session(member: discord.Member, ended_at: datetime, reason: str)
         'recovered_after_restart': bool(session.get('recovered')),
     }
     await collector.record_event('voice_session', payload)
-    try:
-        await send_activity_weapon_round_blocks(member.guild.id,member.id,int(session['channel_id']),started_at,ended_at)
-    except Exception as exc:
-        log.warning('[VOICE CLOSE M16 CREDIT FAILED] member=%s error=%s',member.id,exc)
     return payload
 
 
 async def send_activity_weapon_round_blocks(guild_id:int, member_id:int, channel_id:int, started:datetime, ended:datetime):
-    """Apply completed five-minute M16 blocks for configured Activity voice.
+    """Legacy compatibility no-op. Discord voice is attendance evidence only.
 
-    Scheduled OPERATION voice is excluded here because its attendance pipeline
-    already applies the same 300 rounds/hour weapon effect. The website endpoint
-    is idempotent, so live flushes and final session close can safely overlap.
+    M16 rounds/field service are derived exclusively from verified HLL server
+    telemetry. Keeping this helper prevents stale callers from raising errors.
     """
-    if ended <= started or not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        return 0
-    try:
-        await collector.start()
-        qualifying=await collector.db.fetchrow('SELECT 1 FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2',int(guild_id),int(channel_id))
-        if not qualifying:
-            return 0
-        if guild_id not in duty_channel_bindings:
-            try: await load_duty_bindings(guild_id)
-            except Exception: pass
-        if duty_type_for_channel(guild_id,channel_id)=="OPERATION":
-            return 0
-        blocks=max(0,int((ended-started).total_seconds())//300)
-        applied=0
-        start_epoch=int(started.timestamp())
-        for idx in range(1,blocks+1):
-            key=f"VOICE:{guild_id}:{member_id}:{channel_id}:{start_epoch}:{idx}"
-            occurred_at=(started+timedelta(seconds=idx*300)).isoformat()
-            result=await web.request('POST','/internal/clerk/weapons/voice-rounds',json={
-                'guild_id':guild_id,'discord_user_id':member_id,'channel_id':channel_id,
-                'seconds':300,'source_key':key,'source_type':'DISCORD ACTIVITY VOICE','occurred_at':occurred_at,
-                'remarks':'Automatic M16 expenditure from configured Activity voice: 25 rounds / 5 verified minutes.'
-            })
-            applied+=int(result.get('applied') or 0)
-        return applied
-    except Exception as exc:
-        log.warning('[ACTIVITY M16 ROUND CREDIT FAILED] guild=%s member=%s channel=%s error=%s',guild_id,member_id,channel_id,exc)
-        return 0
+    return 0
 
 
 async def load_duty_bindings(guild_id: int):
@@ -3058,6 +3020,10 @@ async def on_ready():
     if not getattr(bot, '_helpdesk_views_registered', False):
         bot.add_view(HelpDeskPanelView())
         bot.add_view(HelpDeskTicketView())
+        bot.add_view(RecruitApplicationStartView())
+        bot.add_view(RecruitPart1View())
+        bot.add_view(RecruitPart2View())
+        bot.add_view(RecruitPart3View())
         bot._helpdesk_views_registered = True
 
     if not collector_started:
@@ -3199,7 +3165,205 @@ async def activity_channel_status(interaction: discord.Interaction):
     if not await require_manage_guild(interaction): return
     await collector.start(); rows=await collector.db.fetch("SELECT channel_id,channel_name FROM activity_voice_channels WHERE guild_id=$1 ORDER BY channel_name",interaction.guild.id)
     text='\n'.join(f'• <#{r["channel_id"]}> — {r["channel_name"]}' for r in rows) or 'No activity voice channels are configured.'
-    await interaction.response.send_message('**QUALIFYING ACTIVITY VOICE CHANNELS**\n'+text+'\n\nActivity voice also drives the issued M16 at 300 rounds/hour in completed five-minute blocks. It does not award operation or training credit by itself.',ephemeral=True)
+    await interaction.response.send_message('**QUALIFYING ACTIVITY VOICE CHANNELS**\n'+text+'\n\nActivity voice is attendance evidence only. Issued M16 field service and estimated expenditure come exclusively from verified HLL server telemetry.',ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# DISCORD-FIRST RECRUITING APPLICATION
+# Uses buttons + modals rather than message-content parsing, so Battalion Clerk
+# does not require the privileged Message Content intent. Each modal writes its
+# answers to the Website immediately, making the application resumable.
+# ---------------------------------------------------------------------------
+
+RECRUIT_PLATFORM_ALIASES={
+    'STEAM':'STEAM','PC':'STEAM','STEAM / PC':'STEAM',
+    'XBOX':'XBOX','XBOX SERIES X':'XBOX','XBOX SERIES S':'XBOX',
+    'PS5':'PS5','PLAYSTATION':'PS5','PLAYSTATION 5':'PS5','PSN':'PS5'
+}
+active_recruit_interviews=set()
+
+
+def _recruit_ephemeral(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None
+
+
+def _recruit_guild_id(user: discord.abc.User) -> int:
+    if GUILD_ID: return GUILD_ID
+    for guild in bot.guilds:
+        if guild.get_member(user.id): return guild.id
+    return bot.guilds[0].id if bot.guilds else 0
+
+
+async def _recruit_save(user, step:int, answers:dict):
+    gid=_recruit_guild_id(user)
+    if not gid: raise RuntimeError('Battalion Discord guild is unavailable')
+    return await web.request('POST','/internal/clerk/recruiting/intake/save',json={
+        'guild_id':gid,'discord_user_id':user.id,'current_step':step,'answers':answers
+    })
+
+
+class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
+    age=discord.ui.TextInput(label='Age (optional)',required=False,max_length=2,placeholder='Leave blank if you prefer')
+    timezone_name=discord.ui.TextInput(label='Time zone',max_length=60,placeholder='Example: Eastern / EDT')
+    game_platform=discord.ui.TextInput(label='Platform',max_length=30,placeholder='STEAM, XBOX, or PS5')
+    game_identity=discord.ui.TextInput(label='SteamID64 / Gamertag / PSN ID',max_length=100,placeholder='Steam must be the 17-digit SteamID64')
+    hll_experience=discord.ui.TextInput(label='HLL / HLL: Vietnam experience',max_length=80,placeholder='New / Some / Experienced / Very experienced')
+
+    async def on_submit(self, interaction:discord.Interaction):
+        platform=RECRUIT_PLATFORM_ALIASES.get(str(self.game_platform.value).strip().upper())
+        identity=str(self.game_identity.value).strip()
+        if not platform:
+            await interaction.response.send_message('Platform must be **STEAM**, **XBOX**, or **PS5**. Press Part 1 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+        if platform=='STEAM' and not (identity.isdigit() and len(identity)==17):
+            await interaction.response.send_message('Steam players must enter a **17-digit SteamID64**. Press Part 1 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+        age=str(self.age.value).strip()
+        if age and not age.isdigit():
+            await interaction.response.send_message('Age must be a number or left blank. Press Part 1 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+        try:
+            await _recruit_save(interaction.user,2,{
+                'age':age,'timezone_name':str(self.timezone_name.value).strip(),'game_platform':platform,
+                'game_identity':identity,'hll_experience':str(self.hll_experience.value).strip()
+            })
+            await interaction.response.send_message('**PART 1 FILED.** Continue with duty preferences.',view=RecruitPart2View())
+        except Exception as exc:
+            await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
+
+
+class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — Part 2 of 3'):
+    role_interest=discord.ui.TextInput(label='Preferred duty / role',max_length=100,placeholder='Example: Rifleman / Infantry')
+    looking_for=discord.ui.TextInput(label='Why do you want assignment to 1/5 CAV?',style=discord.TextStyle.paragraph,max_length=1000)
+    play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Casual organized / Milsim / Competitive / Mixed')
+    follows_chain=discord.ui.TextInput(label='Will you follow the chain of command?',max_length=5,placeholder='YES or NO')
+    participation=discord.ui.TextInput(label='Typical participation',max_length=100,placeholder='Example: Multiple times per week')
+
+    async def on_submit(self, interaction:discord.Interaction):
+        chain=str(self.follows_chain.value).strip().upper()
+        if chain not in {'YES','Y','NO','N'}:
+            await interaction.response.send_message('Chain of command answer must be **YES** or **NO**. Press Part 2 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+        try:
+            await _recruit_save(interaction.user,3,{
+                'role_interest':str(self.role_interest.value).strip(),'looking_for':str(self.looking_for.value).strip(),
+                'play_style':str(self.play_style.value).strip(),'follows_chain':'YES' if chain in {'YES','Y'} else 'NO',
+                'participation':str(self.participation.value).strip()
+            })
+            await interaction.response.send_message('**PART 2 FILED.** One final section remains.',view=RecruitPart3View())
+        except Exception as exc:
+            await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
+
+
+class RecruitFinalModal(discord.ui.Modal, title='1/5 CAV Application — Part 3 of 3'):
+    recruited_by=discord.ui.TextInput(label='Recruited by active member?',required=False,max_length=100,placeholder='Name / Discord mention, or NONE')
+    applicant_notes=discord.ui.TextInput(label='Additional information for HQ',required=False,style=discord.TextStyle.paragraph,max_length=1000,placeholder='Optional')
+
+    async def on_submit(self, interaction:discord.Interaction):
+        await interaction.response.defer(thinking=True)
+        try:
+            await _recruit_save(interaction.user,4,{
+                'recruited_by':str(self.recruited_by.value).strip() or 'NONE',
+                'applicant_notes':str(self.applicant_notes.value).strip()
+            })
+            gid=_recruit_guild_id(interaction.user)
+            result=await web.request('POST','/internal/clerk/recruiting/intake/submit',json={'guild_id':gid,'discord_user_id':interaction.user.id})
+            case=result.get('case') or {}
+            if result.get('existing_case'):
+                text=f"**APPLICATION ALREADY ON FILE — {case.get('case_number','RECRUITING CASE')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+            else:
+                text=(f"**1/5 CAV — APPLICATION FILED**\nRecruiting Case **{case.get('case_number')}** has been forwarded to Battalion Headquarters.\n"
+                      f"Status: **AWAITING COMMAND REVIEW**\n\nYou do **not** need to submit another application on the website.")
+                if result.get('status_url'): text+=f"\nCase status: {result['status_url']}"
+            await interaction.followup.send(text)
+            try:
+                guild=bot.get_guild(gid); member=guild.get_member(interaction.user.id) if guild else None
+                if member: await ensure_recruit_status_role(member,approved=False)
+            except Exception as exc:
+                log.warning('[DISCORD APPLICATION ROLE FAILED] user=%s error=%s',interaction.user.id,exc)
+        except Exception as exc:
+            await interaction.followup.send(f'**APPLICATION NOT FILED**\n{str(exc)[:500]}\nYour completed sections were saved. Press **Begin / Resume Application** again to retry.')
+
+
+class RecruitPart1View(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='PART 1 — IDENTITY & EXPERIENCE',style=discord.ButtonStyle.primary,custom_id='recruit_apply_part1')
+    async def part1(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await interaction.response.send_modal(RecruitBasicsModal())
+
+
+class RecruitPart2View(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='PART 2 — DUTY PREFERENCES',style=discord.ButtonStyle.primary,custom_id='recruit_apply_part2')
+    async def part2(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await interaction.response.send_modal(RecruitPreferencesModal())
+
+
+class RecruitPart3View(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='PART 3 — FINAL & SUBMIT',style=discord.ButtonStyle.success,custom_id='recruit_apply_part3')
+    async def part3(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await interaction.response.send_modal(RecruitFinalModal())
+
+
+async def _begin_or_resume_recruit_application(interaction:discord.Interaction):
+    user=interaction.user; gid=_recruit_guild_id(user)
+    if not gid:
+        await interaction.response.send_message('The battalion Discord server is unavailable right now. Please try again later.',ephemeral=_recruit_ephemeral(interaction)); return
+    try:
+        data=await web.request('POST','/internal/clerk/recruiting/intake/start',json={
+            'guild_id':gid,'discord_user_id':user.id,'username':getattr(user,'name',str(user)),
+            'display_name':getattr(user,'display_name',getattr(user,'name',str(user)))
+        })
+    except Exception as exc:
+        await interaction.response.send_message(f'Recruiting intake is temporarily unavailable: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction)); return
+    if data.get('existing_member'):
+        await interaction.response.send_message('Your Discord account is already linked to an active 1/5 Cavalry Soldier Record. No application is required.',ephemeral=_recruit_ephemeral(interaction)); return
+    if data.get('existing_case'):
+        case=data.get('case') or {}; url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL and case.get('public_token') else None
+        text=f"**APPLICATION ALREADY ON FILE — {case.get('case_number')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+        if url: text+=f"\n{url}"
+        await interaction.response.send_message(text,ephemeral=_recruit_ephemeral(interaction)); return
+    draft=data.get('draft') or {}; step=max(1,min(3,int(draft.get('current_step') or 1)))
+    views={1:RecruitPart1View,2:RecruitPart2View,3:RecruitPart3View}
+    await interaction.response.send_message(
+        f"**1/5 CAV — RECRUITING OFFICE**\nYour application is {'ready to resume' if draft.get('answers') else 'ready to begin'}. "
+        f"Complete Part **{step} of 3** below. Each completed section is saved automatically.",view=views[step](),ephemeral=_recruit_ephemeral(interaction))
+
+
+class RecruitExistingApplicationModal(discord.ui.Modal, title='Link Existing 1/5 CAV Application'):
+    case_number=discord.ui.TextInput(label='Application / Case Number',max_length=40,placeholder='Example: RC-...')
+    verification_code=discord.ui.TextInput(label='Verification Code',max_length=40,placeholder='Code shown on your website application receipt')
+
+    async def on_submit(self, interaction:discord.Interaction):
+        await interaction.response.defer(thinking=True,ephemeral=_recruit_ephemeral(interaction))
+        gid=_recruit_guild_id(interaction.user)
+        try:
+            result=await web.request('POST','/internal/clerk/recruiting/intake/connect-existing',json={
+                'guild_id':gid,'discord_user_id':interaction.user.id,'username':getattr(interaction.user,'name',str(interaction.user)),
+                'case_number':str(self.case_number.value).strip(),'verification_code':str(self.verification_code.value).strip()
+            })
+            case=result.get('case') or {}
+            url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL and case.get('public_token') else None
+            text=f"**APPLICATION LOCATED — {case.get('case_number')}**\nYour Discord account is now attached to the existing Recruiting Case.\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+            if url: text+=f"\n{url}"
+            await interaction.followup.send(text,ephemeral=_recruit_ephemeral(interaction))
+            guild=bot.get_guild(gid); member=guild.get_member(interaction.user.id) if guild else None
+            if member: await ensure_recruit_status_role(member,approved=False)
+        except Exception as exc:
+            await interaction.followup.send(f"**APPLICATION COULD NOT BE LINKED**\n{str(exc)[:500]}\nCheck the case number and verification code from your website application receipt.",ephemeral=_recruit_ephemeral(interaction))
+
+
+class RecruitApplicationStartView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='BEGIN APPLICATION',style=discord.ButtonStyle.success,custom_id='recruit_apply_start')
+    async def start_application(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await _begin_or_resume_recruit_application(interaction)
+
+    @discord.ui.button(label='I ALREADY APPLIED',style=discord.ButtonStyle.secondary,custom_id='recruit_apply_existing')
+    async def existing_application(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await interaction.response.send_modal(RecruitExistingApplicationModal())
+
+
+@bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry enlistment application in Discord.')
+async def discord_apply(interaction:discord.Interaction):
+    await _begin_or_resume_recruit_application(interaction)
+
 
 @bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
 async def application_status(interaction: discord.Interaction):
@@ -3207,10 +3371,26 @@ async def application_status(interaction: discord.Interaction):
         await interaction.response.send_message("Run this command inside the 1/5 Cav Discord server.",ephemeral=True); return
     data=await recruiting_status_for(interaction.user)
     if not data.get('exists'):
+        try:
+            draft=await web.request('GET','/internal/clerk/recruiting/intake/status',params={'guild_id':interaction.guild.id,'discord_user_id':interaction.user.id})
+        except Exception:
+            draft={}
+        if draft.get('exists') and draft.get('draft'):
+            step=max(1,min(3,int((draft.get('draft') or {}).get('current_step') or 1)))
+            await interaction.response.send_message(f"**APPLICATION DRAFT IN PROGRESS**\nResume at Part **{step} of 3** with **/apply**.",ephemeral=True); return
         app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website"
-        await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Apply at {app_url}",ephemeral=True); return
+        await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Use **/apply** here in Discord or apply at {app_url}",ephemeral=True); return
     case=data.get('case') or {}
-    await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{str(case.get('status')).replace('_',' ')}**",ephemeral=True)
+    status=str(case.get('status') or '').upper()
+    if status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
+        next_step=f"**NEXT STEP:** Report for Duty — {WEBSITE_BASE_URL}/report-for-duty" if WEBSITE_BASE_URL else '**NEXT STEP:** Use Member Access and Report for Duty.'
+    elif status=='ENLISTED':
+        next_step='**NEXT STEP:** Open your normal Member Dashboard.'
+    elif status=='MORE_INFO_REQUIRED':
+        next_step='**NEXT STEP:** Respond to the Headquarters request on your Recruiting Case status page.'
+    else:
+        next_step='**NEXT STEP:** No action required. Battalion Clerk will notify you when Command acts.'
+    await interaction.response.send_message(f"**{case.get('case_number')}**\nStatus: **{status.replace('_',' ')}**\n{next_step}",ephemeral=True)
 
 async def _fetch_guild_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
     member=guild.get_member(user_id)
@@ -3269,16 +3449,15 @@ def build_recruit_credentials_message(case: dict, provision: dict, *, site: str 
     weapon_line=f"\nIssued M16: **{provision.get('weapon_serial')}**" if provision.get('weapon_serial') else "\nIssued M16: **Pending S-4 issue**"
     site=site or WEBSITE_BASE_URL or 'the battalion website'
     return (
-        "**APPLICATION APPROVED — 1/5 CAV REPLACEMENT DETACHMENT**\n"
-        f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. You have been entered into the 1/5 Cavalry Discord and your Replacement Detachment 201 File is open.\n\n"
-        "**YOUR WEBSITE ACCESS**\n"
+        "**APPLICATION APPROVED — REPORT FOR DUTY**\n"
+        f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Your Soldier Record is open and you are attached to **Replacement Detachment** while S-1 processes your permanent assignment.\n\n"
+        "**WEBSITE ACCESS**\n"
         f"Website: {site}\n"
         f"Battle Roster Number: **{roster}**\n"
         f"Field Code: **{field_code}**" + weapon_line + "\n\n"
-        "Use **Member Access** on the public homepage and enter the Battle Roster Number and Field Code exactly as shown. Keep these credentials private.\n\n"
-        f"**YOUR NEXT STEP — OPEN YOUR WELCOME PACKET**\n{site}/welcome-packet\n"
-        "Your Welcome Packet explains Replacement Detachment, walks you through the battalion systems, and updates automatically when S-1 issues your permanent assignment. Complete each required item as you go.\n\n"
-        "You are now attached to the **Replacement Detachment**. Discord will notify you when your packet or assignment advances; the battalion Website remains the official personnel record."
+        "Keep these credentials private. Use **Member Access** on the website once, then follow the single next-step screen.\n\n"
+        f"**REPORT FOR DUTY**\n{site}/report-for-duty\n"
+        "That page shows your account verification, Welcome Packet progress, and permanent assignment status in one place. Discord/game identity verification happens automatically whenever possible."
     )
 
 
@@ -3448,14 +3627,30 @@ async def on_member_join(member: discord.Member):
                              "You now hold **Applicant — Awaiting Review** while Battalion Headquarters reviews your application. No verification code is required. You do not need to keep checking the website; Battalion Clerk will DM you when Command acts on your case.")
                 else:
                     app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
-                    msg=("**1/5 CAV — REPLACEMENT DETACHMENT**\nNo enlistment application is linked to this Discord account yet. "
-                         f"Complete your application at: {app_url}\n\nOn the website, use **Verify with Discord**. It requests basic identity only; no verification code is required.")
+                    msg=("**WELCOME TO THE 1/5 CAVALRY RECRUITING OFFICE**\n"
+                         "If you're here to enlist, Battalion Clerk can process the application privately in Discord.\n\n"
+                         "Choose **BEGIN APPLICATION** below, or choose **I ALREADY APPLIED** to attach this Discord account to an application you already filed on the website.\n\n"
+                         f"Website option: {app_url}")
                 if msg:
-                    await member.send(msg)
+                    if not case:
+                        await member.send(msg,view=RecruitApplicationStartView())
+                    else:
+                        await member.send(msg)
                 if msg and case and status not in {'ENLISTED'}:
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':status,'guild_id':member.guild.id})
             except discord.Forbidden:
                 log.warning('[RECRUIT DM BLOCKED] member=%s',member.id)
+                # Safe public fallback: never ask application questions in-channel; only
+                # tell the recruit how to open the private Discord application themselves.
+                try:
+                    welcome=await get_welcome_channel(member.guild)
+                    if welcome:
+                        await welcome.send(
+                            f"{member.mention} Battalion Clerk could not open a private DM. Use **/apply** in this server to begin the private enlistment application, or enable server-member DMs and run **/apply**.",
+                            allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False),
+                        )
+                except Exception as fallback_exc:
+                    log.warning('[RECRUIT DM FALLBACK FAILED] member=%s error=%s',member.id,fallback_exc)
             except Exception as exc:
                 log.warning('[RECRUIT JOIN STATUS FILE FAILED] member=%s error=%s',member.id,exc)
     await collector.record_event('member_join', {
@@ -3968,8 +4163,8 @@ async def live_activity_credit_watch():
             if elapsed<300: continue
             channel_id=int(session.get('channel_id') or 0)
             if not await collector.db.fetchrow('SELECT 1 FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2',gid,channel_id): continue
-            # Weapon use begins after the first complete five-minute block.
-            await send_activity_weapon_round_blocks(gid,uid,channel_id,session['started_at'],now)
+            # Discord voice contributes community/readiness attendance only.
+            # Issued M16 service is authoritative from verified HLL telemetry.
             # Readiness/activity credit retains the existing ten-minute threshold.
             if elapsed<600: continue
             link=await collector.db.fetchrow("""SELECT p.id::text personnel_id FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1""",str(gid),str(uid))
@@ -4103,12 +4298,12 @@ async def post_operation_report_channel(interaction:discord.Interaction, channel
     await set_report_channel(interaction.guild_id,'POST_OPERATION',channel.id)
     await interaction.response.send_message(f'Post-operation processing reports will be posted to {channel.mention}.',ephemeral=True)
 
-@bot.tree.command(name='operation-rounds-default', description='Legacy setting; live M16 expenditure is automatic at 300 rounds/hour.')
+@bot.tree.command(name='operation-rounds-default', description='Legacy setting; M16 field service now comes from verified HLL server telemetry.')
 async def operation_rounds_default(interaction:discord.Interaction, rounds:app_commands.Range[int,0,1000]):
     if not await require_manage_guild(interaction): return
     await ensure_clerk_settings_table(); db=collector.db
     await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_rounds_default,updated_at) VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_rounds_default=EXCLUDED.operation_rounds_default,updated_at=NOW()""",str(interaction.guild_id),rounds)
-    await interaction.response.send_message('Live M16 expenditure is now automatic at **300 rounds/hour** from verified voice time. This legacy value is retained only for older records.',ephemeral=True)
+    await interaction.response.send_message('M16 field service is now automatic from **verified HLL server telemetry**. Discord voice does not advance the rifle record. This legacy setting is retained only for older records.',ephemeral=True)
 
 async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db

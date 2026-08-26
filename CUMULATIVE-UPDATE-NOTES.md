@@ -141,3 +141,31 @@ Historical release/audit TXT files and Python cache artifacts were removed from 
 - If a console identity has not yet appeared on the server, the command files a PENDING identity claim; Battalion Clerk auto-verifies it on first matching server appearance, so the Soldier does not need to run `/hll-link-console`.
 - Existing identity conflicts and pending-claim conflicts are blocked rather than silently reassigned.
 - Existing `/hll-link-member` and `/hll-link-console-member` commands are retained for compatibility.
+
+## 2026-08-25 — Reliability correction
+- Removed legacy Discord voice M16 reconciliation from periodic operation maintenance.
+- Updated Operation scheduled notice wording to describe HLL-server-authoritative issued-weapon tracking.
+- No change to approved HLL telemetry, identity linking, Discord personnel synchronization, or Operation reminder scheduling.
+
+
+## Discord-first recruiting application — 25 AUG 2026
+- New Discord members without an active Soldier Record or Recruiting Case receive a private **BEGIN / RESUME APPLICATION** button.
+- `/apply` provides the same intake manually at any time.
+- Three Discord modals collect the same core application fields as the public website without requiring Message Content intent.
+- Each section saves immediately to a resumable Website-authoritative draft.
+- Final submission creates a normal `recruiting_cases` row with `application_source=DISCORD`; Command reviews it in the existing Recruiting Control queue.
+- Existing Discord-linked Soldiers are blocked from applying; active applications are detected rather than duplicated; game identity duplicates are rejected.
+- SteamID64 / Xbox / PS5 identity continues through the existing approval-time auto-link and telemetry verification automation.
+- Website remains the authoritative Recruiting Case system; Battalion Clerk is only the Discord intake interface.
+
+- All remaining live Activity-voice M16 callers removed; Discord voice is attendance/readiness evidence only.
+
+
+## 2026-08-25 — Simplified Recruit Join / Report for Duty Pipeline (BATTALION CLERK)
+- Unified recruit-facing flow: Join → Apply → Command Review → Report for Duty → Welcome Packet → Permanent Assignment → Member Dashboard.
+- Discord join now offers BEGIN APPLICATION and I ALREADY APPLIED.
+- Existing website applications can be attached safely with case number + verification code.
+- Approval communication is consolidated into one credential + Report for Duty message.
+- Welcome Packet reduced to six meaningful member certifications plus two automatic identity checks.
+- New Report for Duty page provides one recruit status view and automatically hands assigned Soldiers to the normal dashboard.
+- Existing Recruiting Case, approval, identity, Replacement Detachment, Discord sync, and 201 File systems remain authoritative underneath.
