@@ -4138,6 +4138,51 @@ async def hll_unlink(interaction:discord.Interaction):
     ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
     await interaction.response.send_message('Your HLL game identity link was removed.' if ok else 'No HLL telemetry link was on file.',ephemeral=True)
 
+@bot.tree.command(name='hll-link-soldier', description='Command: manually link a Soldier SteamID64 or console gamer tag.')
+@app_commands.describe(
+    member='Soldier whose HLL identity should be linked',
+    platform='Game platform',
+    game_id='SteamID64, Xbox Gamertag, or PSN Online ID exactly as used in-game'
+)
+@app_commands.choices(platform=[
+    app_commands.Choice(name='Steam / PC', value='STEAM'),
+    app_commands.Choice(name='Xbox', value='XBOX'),
+    app_commands.Choice(name='PlayStation 5', value='PS5'),
+])
+async def hll_link_soldier(interaction:discord.Interaction, member:discord.Member, platform:app_commands.Choice[str], game_id:str):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await hllv.staff_link_identity(
+        interaction.guild.id, member.id, platform.value, game_id,
+        f'COMMAND MANUAL LINK:{interaction.user.id}'
+    )
+    if not result.get('ok'):
+        await interaction.followup.send(
+            f"**HLL IDENTITY LINK FAILED**\nSoldier: {member.mention}\n"
+            f"Platform: **{platform.name}**\nReason: **{result.get('error','unknown error')}**",
+            ephemeral=True
+        ); return
+    status=str(result.get('status') or 'VERIFIED').upper()
+    identity=result.get('identity') or game_id
+    if status == 'PENDING':
+        await interaction.followup.send(
+            f"**HLL IDENTITY FILED — PENDING VERIFICATION**\n"
+            f"Soldier: **{result.get('soldier')}**\n"
+            f"Platform: **{platform.name}**\n"
+            f"Identity: `{identity}`\n\n"
+            "Battalion Clerk has saved the link. The Soldier does **not** need to run a Discord link command. "
+            "The first time this exact console account is observed on the 1/5 CAV server, the claim will automatically become **VERIFIED**.",
+            ephemeral=True
+        ); return
+    await interaction.followup.send(
+        f"**HLL IDENTITY LINKED — VERIFIED**\n"
+        f"Soldier: **{result.get('soldier')}**\n"
+        f"Platform: **{platform.name}**\n"
+        f"Identity: `{identity}`\n\n"
+        "Battalion Clerk will use this identity for automatic HLL service telemetry.",
+        ephemeral=True
+    )
+
 @bot.tree.command(name='hll-link-member', description='Staff: link a Soldier to a SteamID64 for HLL: Vietnam telemetry.')
 @app_commands.describe(member='Soldier to link',steam_id='17-digit SteamID64')
 async def hll_link_member(interaction:discord.Interaction, member:discord.Member, steam_id:str):

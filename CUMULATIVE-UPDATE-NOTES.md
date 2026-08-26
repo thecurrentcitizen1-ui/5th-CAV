@@ -122,3 +122,22 @@
 ## 2026-08-24 — Personnel Authority / Discord Reconciliation
 - Discord mirrors Website Rank/MOS/Company/Platoon/Squad/Team/billet authority.
 - Added active-member role activation at Platoon assignment, on-demand formation roles, obsolete role cleanup, heartbeat/role registry reporting, and reconciliation observations.
+
+## Clean GitHub package — 2026-08-24
+Historical release/audit TXT files and Python cache artifacts were removed from this package. Runtime code and current configuration remain intact.
+
+## 2026-08-25 — Recruiting Game Identity Auto-Link
+- Added automatic processing of Website-filed `hll_identity_claims`.
+- SteamID64 claims are linked without requiring `/hll-link`.
+- Xbox/PS5 claims are matched against exact observed in-game names and platform telemetry, then linked automatically after first server appearance.
+- Existing `/hll-link` and `/hll-link-console` commands remain available as repair/fallback tools.
+- Duplicate/competing links are rejected and left visible as conflicts rather than silently reassigned.
+
+## 2026-08-25 — Command Manual HLL Identity Link
+- Added `/hll-link-soldier` as the consolidated Command/Staff repair command.
+- Inputs: Soldier Discord member, platform (Steam/PC, Xbox, PS5), and SteamID64/Gamertag/PSN ID.
+- SteamID64 links validate and verify immediately using the same personnel-link table as automatic recruiting approval.
+- Console identities verify immediately if the exact account has already been observed by Battalion Clerk telemetry.
+- If a console identity has not yet appeared on the server, the command files a PENDING identity claim; Battalion Clerk auto-verifies it on first matching server appearance, so the Soldier does not need to run `/hll-link-console`.
+- Existing identity conflicts and pending-claim conflicts are blocked rather than silently reassigned.
+- Existing `/hll-link-member` and `/hll-link-console-member` commands are retained for compatibility.
