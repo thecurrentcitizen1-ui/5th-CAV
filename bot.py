@@ -754,8 +754,9 @@ async def recruiting_status_for(member: discord.Member):
         return {'ok':False,'exists':False}
 
 async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
-    # Approved applicants physically enter the Replacement Depot holding status until
-    # rank/MOS/company/platoon/squad assignment is complete.
+    # Approved applicants enter Replacement Depot and are recognized immediately as
+    # members of the 5th Cavalry Regiment. Formation/rank/MOS roles still wait for the
+    # authoritative Website assignment after Welcome Packet acceptance.
     desired_name='Replacement Depot' if approved else 'Prospective Replacement'
     desired=discord.utils.get(member.guild.roles,name=desired_name)
     remove=[discord.utils.get(member.guild.roles,name=n) for n in RECRUITING_STATUS_ROLE_BLUEPRINT if n!=desired_name]
@@ -763,7 +764,15 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
     try:
         remove=[r for r in remove if r and r in member.roles]
         if remove: await member.remove_roles(*remove,reason='Recruiting case status synchronization')
-        if desired and desired not in member.roles: await member.add_roles(desired,reason='Recruiting case status synchronization')
+        add=[]
+        if desired and desired not in member.roles:
+            add.append(desired)
+        if approved:
+            membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
+            if membership and membership not in member.roles:
+                add.append(membership)
+        if add:
+            await member.add_roles(*add,reason='Recruiting case status synchronization')
     except discord.Forbidden:
         log.warning('[RECRUIT ROLE SYNC BLOCKED] member=%s',member.id)
 
@@ -1770,7 +1779,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             elif desired_platoon_name and n==_normalized_role_name(desired_platoon_name): pass
             else: remove.append(role)
         if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
-        if role.name=='5th Cavalry Regiment' and not is_member: remove.append(role)
+        if role.name=='5th Cavalry Regiment' and not (is_member or discord.utils.get(member.roles,name='Replacement Depot')): remove.append(role)
 
     # Separated/archived Soldiers retain protected Discord roles only.
     managed_appointment_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
@@ -1791,9 +1800,10 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             r=await _ensure_dynamic_role(member.guild,desired_squad_name)
             if r: desired.append(r); created.append(r.name) if r not in member.roles else None
         # Team is website-only; this intentionally removes legacy Alpha/Bravo Discord roles.
-        if is_member:
+        if is_member or discord.utils.get(member.roles,name='Replacement Depot'):
             membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
             if membership: desired.append(membership)
+        if is_member:
             for role in member.roles:
                 if role.name in set(RECRUITING_STATUS_ROLE_BLUEPRINT)|LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
 

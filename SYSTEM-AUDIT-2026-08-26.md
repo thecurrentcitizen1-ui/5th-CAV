@@ -18,3 +18,5 @@ External deployment prerequisites remain: DISCORD_TOKEN, GUILD_ID, WEBSITE_BASE_
 - The recovery watcher works for Replacement and already-enlisted Soldiers and does not alter personnel assignment or recruit roles.
 - Resend uses the current pending plaintext credential when available; Field Code rotation occurs only after explicit Command authorization on the Website.
 - Successful/failed delivery is reported to the Website, where a permanent credential-delivery event is recorded.
+
+- 2026-08-26: Approved recruits now receive both Replacement Depot and 5th Cavalry Regiment immediately on approval. Canonical personnel sync preserves 5th Cavalry Regiment through onboarding and removes only Replacement Depot after permanent assignment.
