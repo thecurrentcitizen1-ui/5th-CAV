@@ -112,8 +112,12 @@ RANK_ROLE_BLUEPRINT = [
 ]
 
 RECRUITING_STATUS_ROLE_BLUEPRINT = [
-    "Prospective Replacement", "Approved Replacement", "Replacement Depot",
+    "Prospective Replacement", "Replacement Depot",
 ]
+# Old transitional recruiting role from the pre-Welcome-Packet workflow.
+# Never create/assign it again; Battalion Clerk removes it from members and
+# deletes the empty role when hierarchy permissions allow.
+LEGACY_RECRUITING_STATUS_ROLE_NAMES = {"Approved Replacement"}
 
 APPOINTMENT_ROLE_BLUEPRINT = [
     "Battalion Commander", "Battalion Executive Officer",
@@ -641,6 +645,7 @@ def _managed_role_names():
     # Include legacy generic platoon/squad roles so a clean reset can remove the old
     # pre-strict-access structure before rebuilding assignment-specific roles.
     names.extend(sorted(LEGACY_ASSIGNMENT_ROLE_NAMES))
+    names.extend(sorted(LEGACY_RECRUITING_STATUS_ROLE_NAMES))
     return list(dict.fromkeys(names))
 
 
@@ -699,7 +704,7 @@ def structure_inventory(guild: discord.Guild):
     for divider,roles in ROLE_SECTIONS:
         expected_roles.append(divider); expected_roles.extend(roles)
     missing_roles=[name for name in expected_roles if not _role_by_name(guild,name)]
-    managed_norm={_normalized_role_name(x) for x in expected_roles}|{_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES}
+    managed_norm={_normalized_role_name(x) for x in expected_roles}|{_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES}|{_normalized_role_name(x) for x in LEGACY_RECRUITING_STATUS_ROLE_NAMES}
     grouped={}
     for role in guild.roles:
         key=_normalized_role_name(role.name)
@@ -754,6 +759,7 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
     desired_name='Replacement Depot' if approved else 'Prospective Replacement'
     desired=discord.utils.get(member.guild.roles,name=desired_name)
     remove=[discord.utils.get(member.guild.roles,name=n) for n in RECRUITING_STATUS_ROLE_BLUEPRINT if n!=desired_name]
+    remove += [discord.utils.get(member.guild.roles,name=n) for n in LEGACY_RECRUITING_STATUS_ROLE_NAMES]
     try:
         remove=[r for r in remove if r and r in member.roles]
         if remove: await member.remove_roles(*remove,reason='Recruiting case status synchronization')
@@ -763,13 +769,40 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
 
 
 async def clear_recruit_status_roles(member: discord.Member):
-    roles=[discord.utils.get(member.guild.roles,name=name) for name in RECRUITING_STATUS_ROLE_BLUEPRINT]
+    roles=[discord.utils.get(member.guild.roles,name=name) for name in [*RECRUITING_STATUS_ROLE_BLUEPRINT,*LEGACY_RECRUITING_STATUS_ROLE_NAMES]]
     roles=[role for role in roles if role and role in member.roles]
     if not roles: return
     try:
         await member.remove_roles(*roles,reason='Recruiting case closed or converted')
     except discord.Forbidden:
         log.warning('[RECRUIT ROLE CLEAR BLOCKED] member=%s',member.id)
+
+async def cleanup_legacy_recruiting_status_role(guild: discord.Guild):
+    """Remove the obsolete Approved Replacement role without touching unrelated roles."""
+    removed_from=[]; deleted=[]; failed=[]
+    me=guild.me
+    for legacy_name in LEGACY_RECRUITING_STATUS_ROLE_NAMES:
+        role=discord.utils.get(guild.roles,name=legacy_name)
+        if not role:
+            continue
+        # First strip the obsolete role from every member. Their canonical state will
+        # be restored by recruit/personnel reconciliation as Prospective Replacement,
+        # Replacement Depot, or full battalion membership.
+        for member in list(role.members):
+            try:
+                if me and me.guild_permissions.manage_roles and role < me.top_role:
+                    await member.remove_roles(role,reason='Battalion Clerk — retire obsolete recruiting status role')
+                    removed_from.append(str(member.id))
+            except Exception as exc:
+                failed.append(f'MEMBER {member.id}: {exc}')
+        try:
+            if me and me.guild_permissions.manage_roles and role < me.top_role and not role.members:
+                await role.delete(reason='Battalion Clerk — remove obsolete Approved Replacement role')
+                deleted.append(legacy_name)
+        except Exception as exc:
+            failed.append(f'ROLE {legacy_name}: {exc}')
+    return {'removed_from':removed_from,'deleted':deleted,'failed':failed}
+
 
 def validate_personnel_roles(member: discord.Member):
     ranks,mos=_role_code_hits(member)
@@ -1671,6 +1704,7 @@ def _managed_role_category(name: str) -> str | None:
     if head in RANK_ROLE_CODES or n in RANK_ROLE_ALIASES: return 'RANK'
     if head in MOS_ROLE_CODES: return 'MOS'
     if name in RECRUITING_STATUS_ROLE_BLUEPRINT: return 'RECRUITING'
+    if name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: return 'LEGACY'
     if name in LEGACY_ASSIGNMENT_ROLE_NAMES: return 'LEGACY'
     return None
 
@@ -1735,7 +1769,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             if desired_squad_name and n==_normalized_role_name(desired_squad_name): pass
             elif desired_platoon_name and n==_normalized_role_name(desired_platoon_name): pass
             else: remove.append(role)
-        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES: remove.append(role)
+        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
         if role.name=='5th Cavalry Regiment' and not is_member: remove.append(role)
 
     # Separated/archived Soldiers retain protected Discord roles only.
@@ -1761,7 +1795,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
             if membership: desired.append(membership)
             for role in member.roles:
-                if role.name in {'Prospective Replacement','Approved Replacement','Replacement Depot'}: remove.append(role)
+                if role.name in set(RECRUITING_STATUS_ROLE_BLUEPRINT)|LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
 
         desired_appointment_names=set(result.get('appointment_roles') or []) & managed_appointment_names
         for role in member.roles:
@@ -3006,6 +3040,19 @@ async def welcome_packet_watch():
 
 @bot.event
 async def on_ready():
+    # Retire the pre-Welcome-Packet Approved Replacement Discord role. This is
+    # idempotent and only touches the explicitly named legacy managed role.
+    if not getattr(bot, '_legacy_recruit_role_cleanup_done', False):
+        for guild in bot.guilds:
+            if GUILD_ID and guild.id != GUILD_ID:
+                continue
+            try:
+                result=await cleanup_legacy_recruiting_status_role(guild)
+                if result.get('deleted') or result.get('removed_from'):
+                    log.info('[LEGACY RECRUIT ROLE CLEANUP] guild=%s result=%s',guild.id,result)
+            except Exception:
+                log.exception('[LEGACY RECRUIT ROLE CLEANUP FAILED] guild=%s',guild.id)
+        bot._legacy_recruit_role_cleanup_done=True
     if not applicant_intake_watch.is_running():
         applicant_intake_watch.start()
     if not recruit_status_watch.is_running():
