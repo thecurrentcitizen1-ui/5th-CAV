@@ -57,3 +57,7 @@ The first release is telemetry-only. It intentionally does not issue server-mana
 
 ### Command dashboards supported by this build
 The Website now exposes an Accession Pipeline, Promotion Board, Personnel Sync repair controls, and System Health repair center. Battalion Clerk consumes the existing authoritative queues and additionally delivers award/promotion DMs and closed-operation AAR reminders.
+
+## Discord channel-routing maintenance
+
+Use `/discord-routing-reset confirmation:RESET DISCORD ROUTING` before reorganizing Discord channels. The reset pauses automatic Website/Battalion Clerk channel delivery and clears route bindings without touching personnel or existing Discord structure. Reassign channels using the normal routing commands, verify with `/discord-routing-status`, then use `/discord-routing-resume confirm:RESUME DISCORD ROUTING`.

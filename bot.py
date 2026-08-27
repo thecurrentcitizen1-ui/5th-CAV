@@ -938,6 +938,7 @@ async def ensure_clerk_settings_table():
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_channel_id TEXT")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_minutes TEXT DEFAULT '1440,120,30'")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS seeding_channel_id TEXT")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS discord_routing_paused BOOLEAN NOT NULL DEFAULT FALSE")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_seeding_notices (
         guild_id TEXT NOT NULL,
         notice_date DATE NOT NULL,
@@ -976,6 +977,59 @@ async def ensure_clerk_settings_table():
     """)
 
 
+async def discord_routing_is_paused(guild_id:int)->bool:
+    """Persistent safety switch for Website/Battalion Clerk -> Discord channel delivery."""
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None):
+        return False
+    async with db.pool.acquire() as conn:
+        value=await conn.fetchval("SELECT COALESCE(discord_routing_paused,FALSE) FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
+    return bool(value)
+
+async def set_discord_routing_paused(guild_id:int, paused:bool):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None):
+        raise RuntimeError('PostgreSQL is not available for Battalion Clerk settings.')
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,discord_routing_paused,updated_at)
+        VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE
+        SET discord_routing_paused=EXCLUDED.discord_routing_paused,updated_at=NOW()""",str(guild_id),bool(paused))
+
+async def reset_discord_routing(guild_id:int):
+    """Clear outbound channel mappings only; preserve personnel, roles, links and website records."""
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None):
+        raise RuntimeError('PostgreSQL is not available for Battalion Clerk settings.')
+    # Pause FIRST so fallback channel resolution cannot deliver during reconfiguration.
+    await set_discord_routing_paused(guild_id,True)
+    await db.execute("""UPDATE clerk_guild_settings SET
+        orders_channel_id=NULL,
+        operation_duty_channel_id=NULL,
+        welcome_channel_id=NULL,
+        operation_reminder_channel_id=NULL,
+        seeding_channel_id=NULL,
+        updated_at=NOW()
+        WHERE guild_id=$1""",str(guild_id))
+    await db.execute("DELETE FROM clerk_order_routes WHERE guild_id=$1",str(guild_id))
+    await db.execute("DELETE FROM clerk_report_channels WHERE guild_id=$1",str(guild_id))
+    # Historical sent-notice rows are intentionally retained; they are audit/history, not routes.
+    cleared_duty=[]
+    for event_type in ('TRAINING','OPERATION','MEETING'):
+        try:
+            await web.request('DELETE','/internal/clerk/channels',json={'guild_id':guild_id,'event_type':event_type})
+            cleared_duty.append(event_type)
+        except Exception as exc:
+            log.warning('[DISCORD ROUTING RESET] duty clear failed guild=%s type=%s error=%s',guild_id,event_type,exc)
+    duty_channel_bindings[guild_id]={}
+    active_event_channels.pop(guild_id,None)
+    # Cancel any pending voice-credit chunks tied to the old duty stations for this guild.
+    for key in list(duty_voice_presence):
+        if key[0]==guild_id:
+            duty_voice_presence.pop(key,None)
+    return {'paused':True,'duty_channels_cleared':cleared_duty}
+
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
 SEEDING_STOP_POPULATION = 40
@@ -997,6 +1051,7 @@ async def set_seeding_channel(guild_id:int, channel_id:int):
         SET seeding_channel_id=EXCLUDED.seeding_channel_id,updated_at=NOW()""",str(guild_id),str(channel_id))
 
 async def get_seeding_channel_id(guild_id:int)->Optional[int]:
+    if await discord_routing_is_paused(guild_id): return None
     await ensure_clerk_settings_table()
     db=getattr(collector,'db',None)
     if not db or not getattr(db,'pool',None): return None
@@ -1042,6 +1097,7 @@ async def set_orders_channel(guild_id: int, channel_id: int):
 
 
 async def get_orders_channel_id(guild_id: int) -> Optional[int]:
+    if await discord_routing_is_paused(guild_id): return None
     await ensure_clerk_settings_table()
     db = getattr(collector, 'db', None)
     if not db or not getattr(db, 'pool', None):
@@ -1062,6 +1118,7 @@ async def set_operation_duty_channel(guild_id: int, channel_id: int):
                         ON CONFLICT(guild_id) DO UPDATE SET operation_duty_channel_id=EXCLUDED.operation_duty_channel_id,updated_at=NOW()""",str(guild_id),str(channel_id))
 
 async def get_operation_duty_channel_id(guild_id: int) -> Optional[int]:
+    if await discord_routing_is_paused(guild_id): return None
     await ensure_clerk_settings_table()
     db=getattr(collector,'db',None)
     if not db or not getattr(db,'pool',None): return None
@@ -1078,6 +1135,7 @@ async def set_operation_reminder_channel(guild_id:int,channel_id:int):
       str(guild_id),str(channel_id))
 
 async def get_operation_reminder_channel_id(guild_id:int)->Optional[int]:
+    if await discord_routing_is_paused(guild_id): return None
     await ensure_clerk_settings_table()
     db=getattr(collector,'db',None)
     if not db or not getattr(db,'pool',None): return None
@@ -1169,6 +1227,7 @@ async def mark_operation_schedule_notice_sent(guild_id:int,event:dict,channel_id
 
 async def resolve_operation_notice_channel(guild:discord.Guild):
     """Use configured Operation notices first, then safe automatic fallbacks."""
+    if await discord_routing_is_paused(guild.id): return None
     candidate_ids=[]
     for getter in (get_operation_reminder_channel_id,get_orders_channel_id,get_operation_duty_channel_id):
         try:
@@ -1255,6 +1314,7 @@ async def clear_welcome_channel(guild_id: int):
         await db.execute("UPDATE clerk_guild_settings SET welcome_channel_id=NULL, updated_at=NOW() WHERE guild_id=$1", str(guild_id))
 
 async def get_welcome_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    if await discord_routing_is_paused(guild.id): return None
     await ensure_clerk_settings_table()
     db = getattr(collector, 'db', None)
     channel_id = None
@@ -1301,6 +1361,7 @@ async def clear_order_route(guild_id: int, order_type: str):
         await db.execute("DELETE FROM clerk_order_routes WHERE guild_id=$1 AND order_type=$2", str(guild_id), order_type.upper())
 
 async def get_order_routes(guild_id: int):
+    if await discord_routing_is_paused(guild_id): return {}
     await ensure_clerk_settings_table()
     db = getattr(collector, 'db', None)
     if not db or not getattr(db, 'pool', None): return {}
@@ -1723,6 +1784,9 @@ async def send_activity_weapon_round_blocks(guild_id:int, member_id:int, channel
 
 
 async def load_duty_bindings(guild_id: int):
+    if await discord_routing_is_paused(guild_id):
+        duty_channel_bindings[guild_id]={}
+        return []
     data = await web.request('GET', '/internal/clerk/channels', params={'guild_id': guild_id})
     duty_channel_bindings[guild_id] = {
         row['event_type']: int(row['channel_id'])
@@ -2498,6 +2562,66 @@ async def operation_duty_watch():
 @operation_duty_watch.before_loop
 async def before_operation_duty_watch():
     await bot.wait_until_ready()
+
+@bot.tree.command(name='discord-routing-reset', description='Pause and clear all Website/Battalion Clerk -> Discord channel routing without deleting personnel.')
+@app_commands.describe(confirmation='Type RESET DISCORD ROUTING exactly')
+async def discord_routing_reset_command(interaction:discord.Interaction, confirmation:str):
+    if not await require_manage_guild(interaction): return
+    if confirmation.strip().upper()!='RESET DISCORD ROUTING':
+        await interaction.response.send_message(
+            'RESET ABORTED. Type `RESET DISCORD ROUTING` exactly. Nothing was changed.',ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        result=await reset_discord_routing(interaction.guild_id)
+        await interaction.followup.send(
+            '**DISCORD ROUTING RESET COMPLETE — DELIVERY PAUSED**\n\n'
+            'Cleared: welcome channel, battalion orders, operation reminders, S-3 duty-roster route, personnel-order routes, report/helpdesk routes, seeding route, and Training/Operation/Meeting duty-channel bindings.\n\n'
+            '**NOT TOUCHED:** Website personnel records, 201 Files, ranks, assignments, Discord links, roles, HLL telemetry, ribbons, promotions, credentials, or existing Discord channels.\n\n'
+            'You may now move/rename channels and reassign routes with the normal setup commands. '
+            'When finished, run `/discord-routing-status` and then `/discord-routing-resume confirm:RESUME DISCORD ROUTING`.',ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'Discord routing reset failed: `{str(exc)[:600]}`',ephemeral=True)
+
+@bot.tree.command(name='discord-routing-status', description='Show whether Website/Battalion Clerk -> Discord delivery is paused and which routes are assigned.')
+async def discord_routing_status_command(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await ensure_clerk_settings_table(); db=collector.db
+    paused=await discord_routing_is_paused(interaction.guild_id)
+    async with db.pool.acquire() as conn:
+        row=await conn.fetchrow("""SELECT orders_channel_id,operation_duty_channel_id,welcome_channel_id,
+            operation_reminder_channel_id,seeding_channel_id FROM clerk_guild_settings WHERE guild_id=$1""",str(interaction.guild_id))
+        order_count=await conn.fetchval("SELECT COUNT(*) FROM clerk_order_routes WHERE guild_id=$1",str(interaction.guild_id))
+        report_count=await conn.fetchval("SELECT COUNT(*) FROM clerk_report_channels WHERE guild_id=$1",str(interaction.guild_id))
+    duty=await web.request('GET','/internal/clerk/channels',params={'guild_id':interaction.guild_id})
+    def show(cid):
+        if not cid: return 'NOT ASSIGNED'
+        ch=interaction.guild.get_channel(int(cid))
+        return ch.mention if ch else f'MISSING CHANNEL `{cid}`'
+    row=dict(row) if row else {}
+    await interaction.response.send_message(
+        f"**DISCORD ROUTING CONTROL**\nDelivery: **{'PAUSED' if paused else 'ACTIVE'}**\n"
+        f"Welcome: {show(row.get('welcome_channel_id'))}\n"
+        f"Battalion Orders: {show(row.get('orders_channel_id'))}\n"
+        f"Operation Reminders: {show(row.get('operation_reminder_channel_id'))}\n"
+        f"S-3 Duty Rosters: {show(row.get('operation_duty_channel_id'))}\n"
+        f"Seeding: {show(row.get('seeding_channel_id'))}\n"
+        f"Personnel-order routes: **{int(order_count or 0)}**\n"
+        f"Report/helpdesk routes: **{int(report_count or 0)}**\n"
+        f"Duty voice bindings: **{len(duty.get('channels',[]))}**\n\n"
+        'While **PAUSED**, automatic routed Discord delivery is suppressed even if a fallback channel exists.',ephemeral=True)
+
+@bot.tree.command(name='discord-routing-resume', description='Resume Website/Battalion Clerk -> Discord delivery after channel routes are reassigned.')
+@app_commands.describe(confirm='Type RESUME DISCORD ROUTING exactly')
+async def discord_routing_resume_command(interaction:discord.Interaction, confirm:str):
+    if not await require_manage_guild(interaction): return
+    if confirm.strip().upper()!='RESUME DISCORD ROUTING':
+        await interaction.response.send_message('RESUME ABORTED. Type `RESUME DISCORD ROUTING` exactly.',ephemeral=True); return
+    await set_discord_routing_paused(interaction.guild_id,False)
+    try: await load_duty_bindings(interaction.guild_id)
+    except Exception: log.exception('[DISCORD ROUTING RESUME] duty reload failed')
+    await interaction.response.send_message(
+        '**DISCORD ROUTING ACTIVE** — Website/Battalion Clerk automatic Discord delivery has resumed using the channels you assigned.',ephemeral=True)
 
 @bot.tree.command(name='welcome-channel', description='Set the channel where Battalion Clerk welcomes newly arrived personnel.')
 @app_commands.describe(channel='Public text channel that receives new-member reporting notices')
@@ -4068,6 +4192,7 @@ async def set_report_channel(guild_id:int, report_type:str, channel_id:int):
         ON CONFLICT(guild_id,report_type) DO UPDATE SET channel_id=EXCLUDED.channel_id,updated_at=NOW()""",str(guild_id),report_type.upper(),str(channel_id))
 
 async def get_report_channel(guild:discord.Guild, report_type:str):
+    if await discord_routing_is_paused(guild.id): return None
     await ensure_clerk_settings_table(); db=getattr(collector,'db',None)
     if not db or not getattr(db,'pool',None): return None
     async with db.pool.acquire() as conn:
