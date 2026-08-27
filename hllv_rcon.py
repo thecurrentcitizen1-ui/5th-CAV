@@ -1132,6 +1132,51 @@ class HLLVTelemetryCollector:
             await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,platform=COALESCE(NULLIF($2,''),platform),platform_user_id=COALESCE(NULLIF($3,''),platform_user_id),eos_id=COALESCE(NULLIF($4,''),eos_id),updated_at=NOW() WHERE steam_id=$5", name, platform, platform_user_id, eos_id, steam_id)
         return (personnel_id,accrue_seconds)
 
+
+    async def _vip_call(self, names, *args):
+        """Call the installed hllrcon VIP primitive without hard-coding one library patch.
+
+        HLL RCON V2 defines Add VIP, Remove VIP, Get VIPs and Set VIP Slot Count.
+        hllrcon releases have used slightly different Python method names, so this
+        probes only known semantic variants and fails closed when none are exposed.
+        """
+        if not self.rcon:
+            raise RuntimeError("HLL RCON is not connected")
+        for name in names:
+            fn=getattr(self.rcon,name,None)
+            if callable(fn):
+                return await fn(*args)
+        raise RuntimeError("Installed hllrcon build does not expose the required VIP command")
+
+    async def get_vip_ids(self) -> set[str]:
+        response=await self._vip_call(("get_vip_ids","get_vips","get_vip_players"))
+        data=_dump_model(response)
+        values=[]
+        if isinstance(response,(list,tuple,set)):
+            values=list(response)
+        elif data:
+            values=_first(data,"players","vips","vip_ids","vipIds","ids",default=[]) or []
+        out=set()
+        for value in values:
+            item=_dump_model(value)
+            pid=_text(_first(item,"player_id","playerId","id","steam_id","steamId",default=value if isinstance(value,str) else "")).strip()
+            if pid: out.add(pid)
+        return out
+
+    async def add_vip(self, player_id: str, comment: str = "1/5 CAV"):
+        player_id=str(player_id or "").strip()
+        if not player_id: raise ValueError("player_id required")
+        return await self._vip_call(("add_vip","vip_add"),player_id,str(comment or "1/5 CAV")[:120])
+
+    async def remove_vip(self, player_id: str):
+        player_id=str(player_id or "").strip()
+        if not player_id: raise ValueError("player_id required")
+        return await self._vip_call(("remove_vip","vip_remove","delete_vip"),player_id)
+
+    async def set_vip_slot_count(self, count: int):
+        count=max(0,int(count))
+        return await self._vip_call(("set_vip_slot_count","set_vip_slots","set_vip_slots_num"),count)
+
     async def status(self) -> dict:
         if not self.db.pool:
             return {"configured": self.configured, "connected": False, "error": "DATABASE_URL unavailable"}

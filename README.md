@@ -48,3 +48,12 @@ Discord commands:
 - `/hll-stats` — member field-service totals
 
 The first release is telemetry-only. It intentionally does not issue server-management RCON commands.
+
+
+## 2026-08-26 Command Operating System
+- Career notice delivery worker sends Website-authoritative AWARD and PROMOTION DMs exactly once.
+- Operation lifecycle review worker surfaces completed operations awaiting AAR filing.
+- Existing personnel role sync, progression, recruiting, telemetry and seeding workers remain unchanged.
+
+### Command dashboards supported by this build
+The Website now exposes an Accession Pipeline, Promotion Board, Personnel Sync repair controls, and System Health repair center. Battalion Clerk consumes the existing authoritative queues and additionally delivers award/promotion DMs and closed-operation AAR reminders.

@@ -35,6 +35,8 @@ CLERK_SYNC_KEY = os.getenv('CLERK_SYNC_KEY', '').strip()
 BATTALION_TIMEZONE = os.getenv('BATTALION_TIMEZONE', 'America/New_York').strip()
 VOICE_FLUSH_SECONDS = max(60, int(os.getenv('VOICE_FLUSH_SECONDS', '300') or 300))
 DUTY_TYPES = ('TRAINING', 'OPERATION', 'MEETING')
+HLL_VIP_SYNC_ENABLED = str(os.getenv('HLL_VIP_SYNC_ENABLED','true')).strip().lower() in {'1','true','yes','on','enabled'}
+HLL_VIP_RESERVED_SLOTS = max(0,int(os.getenv('HLL_VIP_RESERVED_SLOTS','2') or 2))
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -3109,6 +3111,66 @@ async def welcome_packet_watch():
             log.warning('[WELCOME PACKET WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
+
+
+@tasks.loop(minutes=1)
+async def career_notice_delivery_watch():
+    """Deliver Website-authoritative award and promotion notices exactly once."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/member-notifications/pending',params={'guild_id':guild.id})
+            for item in data.get('notifications',[]):
+                uid=item.get('discord_user_id'); ok=False; error=None
+                member=guild.get_member(int(uid or 0)) if uid else None
+                if not member and uid:
+                    try: member=await guild.fetch_member(int(uid))
+                    except Exception: member=None
+                kind=str(item.get('notification_type') or 'NOTICE').upper()
+                if member:
+                    if kind=='AWARD':
+                        msg=(f"**HEADQUARTERS — AWARD ORDERS ISSUED**\n{item.get('title') or 'An award has been filed.'}\n"
+                             f"{item.get('message') or 'The award is now part of your permanent 201 File.'}\n\n"
+                             f"**VIEW AWARD RECORD:** {WEBSITE_BASE_URL}/my-201-file#awards")
+                    else:
+                        msg=(f"**HEADQUARTERS — PROMOTION ORDERS**\n{item.get('title') or 'Your rank record has changed.'}\n"
+                             f"{item.get('message') or 'Your permanent service record has been updated.'}\n\n"
+                             f"**VIEW CAREER RECORD:** {WEBSITE_BASE_URL}/my-201-file#career")
+                    try: await member.send(msg[:1900]); ok=True
+                    except discord.Forbidden: error='Discord direct messages are disabled or blocked for this member'
+                    except Exception as exc: error=str(exc)[:500]
+                else: error='Linked Discord member not found in guild'
+                await web.request('POST',f"/internal/clerk/member-notifications/{item.get('id')}/delivered",json={'ok':ok,'error':error})
+        except Exception as exc:
+            log.warning('[CAREER NOTICE DELIVERY FAILED] guild=%s error=%s',guild.id,exc)
+
+@career_notice_delivery_watch.before_loop
+async def before_career_notice_delivery_watch():
+    await bot.wait_until_ready()
+
+@tasks.loop(minutes=5)
+async def operation_lifecycle_review_watch():
+    """Surface closed operations that still need an AAR; operational credit remains Website-authoritative."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/operations/lifecycle-pending',params={'guild_id':guild.id})
+            for op in data.get('operations',[]):
+                key=f"AAR-REVIEW:{op.get('id')}"
+                if not await _notice_once(guild.id,str(op.get('id')),'OPERATION_AAR_REVIEW',key): continue
+                channel=await resolve_operation_notice_channel(guild)
+                if channel:
+                    await channel.send((f"**S-3 — OPERATION CLOSED / AAR REQUIRED**\n"
+                                        f"**{op.get('operation_number') or 'OPERATION'} — {op.get('title')}**\n"
+                                        f"Verified attendance and service credit have been reconciled. S-3 should review the record and file the After Action Report on the battalion website.")[:1900])
+        except Exception as exc: log.warning('[OPERATION LIFECYCLE REVIEW FAILED] guild=%s error=%s',guild.id,exc)
+
+@operation_lifecycle_review_watch.before_loop
+async def before_operation_lifecycle_review_watch():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     # Retire the pre-Welcome-Packet Approved Replacement Discord role. This is
@@ -3156,6 +3218,8 @@ async def on_ready():
         await hllv.start()
     except Exception:
         log.exception('[HLLV RCON STARTUP FAILED]')
+    if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
+        hll_vip_sync_watch.start()
 
     # Synchronize slash commands once per process. TEST_GUILD_ID wins when present
     # so new commands appear in the battalion server immediately.
@@ -3188,6 +3252,10 @@ async def on_ready():
         hll_m16_reconcile_watch.start()
     if not progression_reconcile_watch.is_running():
         progression_reconcile_watch.start()
+    if not career_notice_delivery_watch.is_running():
+        career_notice_delivery_watch.start()
+    if not operation_lifecycle_review_watch.is_running():
+        operation_lifecycle_review_watch.start()
     if not seeding_message_watch.is_running():
         seeding_message_watch.start()
     if not personnel_orders_watch.is_running():
@@ -4433,6 +4501,47 @@ async def personnel_suspense_watch():
             log.warning('[PERSONNEL SUSPENSE WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 @tasks.loop(minutes=5)
+async def hll_vip_sync_watch():
+    """Mirror active assigned Soldiers into the game VIP list.
+
+    Removal is restricted to IDs previously recorded as Clerk-managed so manual
+    server VIPs are never deleted by reconciliation.
+    """
+    if not HLL_VIP_SYNC_ENABLED or not WEBSITE_BASE_URL or not CLERK_SYNC_KEY or not GUILD_ID:
+        return
+    status=await hllv.status()
+    if not status.get('connected'):
+        return
+    try:
+        await collector.db.execute("""CREATE TABLE IF NOT EXISTS hll_clerk_managed_vips (player_id TEXT PRIMARY KEY,personnel_id TEXT,comment TEXT,managed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        roster=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':GUILD_ID})
+        desired={}
+        for item in roster.get('items',[]):
+            pid=str(item.get('hll_player_id') or '').strip()
+            if pid and item.get('vip_eligible'):
+                desired[pid]=item
+        actual=await hllv.get_vip_ids()
+        managed_rows=await collector.db.fetch("SELECT player_id FROM hll_clerk_managed_vips")
+        managed={str(r.get('player_id') or '').strip() for r in managed_rows if r.get('player_id')}
+        for pid,item in desired.items():
+            if pid not in actual:
+                await hllv.add_vip(pid,item.get('vip_comment') or '1/5 CAV')
+            await collector.db.execute("""INSERT INTO hll_clerk_managed_vips(player_id,personnel_id,comment,managed_at,updated_at) VALUES($1,$2,$3,NOW(),NOW()) ON CONFLICT(player_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,comment=EXCLUDED.comment,updated_at=NOW()""",pid,str(item.get('personnel_id') or ''),str(item.get('vip_comment') or '1/5 CAV'))
+        for pid in sorted(managed-set(desired)):
+            if pid in actual:
+                await hllv.remove_vip(pid)
+            await collector.db.execute("DELETE FROM hll_clerk_managed_vips WHERE player_id=$1",pid)
+        await hllv.set_vip_slot_count(HLL_VIP_RESERVED_SLOTS)
+        log.info('[HLL VIP SYNC] desired=%s actual_before=%s managed=%s reserved_slots=%s',len(desired),len(actual),len(managed),HLL_VIP_RESERVED_SLOTS)
+    except Exception:
+        log.exception('[HLL VIP SYNC FAILED]')
+
+@hll_vip_sync_watch.before_loop
+async def before_hll_vip_sync_watch():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=5)
 async def progression_reconcile_watch():
     """Keep HLL telemetry connected to readiness, MOS, ribbons and promotion worksheets.
 
@@ -4742,6 +4851,17 @@ async def server_message_clear(interaction:discord.Interaction):
     if not result.get('ok'):
         await interaction.followup.send(f"Server message could not be cleared: **{result.get('error','unknown error')}**",ephemeral=True); return
     await interaction.followup.send('**SERVER MESSAGE CLEARED**',ephemeral=True)
+
+@bot.tree.command(name='hll-vip-sync', description='Command staff: reconcile active 1/5 Cav Soldiers with the HLL VIP whitelist.')
+async def hll_vip_sync_command(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        await hll_vip_sync_watch()
+        await interaction.followup.send(f'VIP reconciliation requested. Reserved VIP slots: **{HLL_VIP_RESERVED_SLOTS}**. Manual VIPs not managed by Battalion Clerk are protected.',ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'VIP reconciliation failed: `{exc}`',ephemeral=True)
+
 
 @bot.tree.command(name='hll-rcon-status', description='Show Battalion Clerk HLL: Vietnam RCON collector health.')
 async def hll_rcon_status(interaction:discord.Interaction):
