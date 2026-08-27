@@ -16,6 +16,7 @@ import re
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("battalion-clerk.hllv-rcon")
 
@@ -30,6 +31,8 @@ RCON_HOST = os.getenv("HLL_RCON_HOST", "").strip()
 RCON_PORT = int(os.getenv("HLL_RCON_PORT", "7779") or 7779)
 RCON_PASSWORD = os.getenv("HLL_RCON_PASSWORD", "")
 RCON_POLL_SECONDS = max(3, int(os.getenv("HLL_RCON_POLL_SECONDS", "5") or 5))
+SEEDING_TIMEZONE = ZoneInfo("America/New_York")
+SEEDING_STOP_PLAYERS = max(1, int(os.getenv("HLL_SEED_READY_PLAYERS", "40") or 40))
 RCON_CM_PER_METER = max(1.0, float(os.getenv("HLL_RCON_CM_PER_METER", "100") or 100))
 # Preserve helicopter movement while rejecting respawn/teleport jumps. 130 m/s
 # is 468 km/h, comfortably above Vietnam-era helicopter speeds.
@@ -453,6 +456,17 @@ class HLLVTelemetryCollector:
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_player_stats_personnel ON hll_player_match_stats(personnel_id,last_seen_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_player_stats_steam ON hll_player_match_stats(steam_id,last_seen_at DESC)")
         await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS hll_seeding_service (
+                personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+                service_date DATE NOT NULL,
+                credited_seconds INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(personnel_id,service_date)
+            )
+        """)
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_seeding_service_person ON hll_seeding_service(personnel_id,service_date DESC)")
+        await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_role_mappings (
                 role_id TEXT PRIMARY KEY,
                 observed_label TEXT,
@@ -686,8 +700,14 @@ class HLLVTelemetryCollector:
             await self._run_recruiting_broadcast(match_id, server, players)
         except Exception as exc:
             log.warning("[HLLV RECRUITING BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
+        seeding_now = self._is_seeding_credit_window(len(players))
+        seeding_credits=[]
         for player in players:
-            await self._file_player(match_id, player)
+            filed=await self._file_player(match_id, player)
+            if seeding_now and filed and filed[0] and int(filed[1] or 0)>0:
+                seeding_credits.append((filed[0],int(filed[1] or 0)))
+        if seeding_credits:
+            await self._file_seeding_credit(seeding_credits)
         try:
             await self._reconcile_pending_identity_claims()
         except Exception as exc:
@@ -701,6 +721,28 @@ class HLLVTelemetryCollector:
             log.warning("[HLLV WEAPON LOG POLL FAILED] %s: %s", type(exc).__name__, exc)
         await self.db.execute("UPDATE hll_match_sessions SET last_seen_at=NOW() WHERE id=$1", match_id)
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
+
+    def _is_seeding_credit_window(self, player_count: int) -> bool:
+        """Credit only the configured nightly seeding period while population is below 40."""
+        now_et=utcnow().astimezone(SEEDING_TIMEZONE)
+        minutes=now_et.hour*60+now_et.minute
+        return 20*60 <= minutes <= 21*60+30 and int(player_count or 0) < SEEDING_STOP_PLAYERS
+
+    async def _file_seeding_credit(self, credits: list[tuple[str,int]]):
+        now_et=utcnow().astimezone(SEEDING_TIMEZONE)
+        service_date=now_et.date()
+        combined={}
+        for pid,seconds in credits:
+            if pid and seconds>0:
+                combined[str(pid)]=combined.get(str(pid),0)+int(seconds)
+        for pid,seconds in combined.items():
+            await self.db.execute("""
+                INSERT INTO hll_seeding_service(personnel_id,service_date,credited_seconds,first_seen_at,last_seen_at)
+                VALUES($1::uuid,$2,$3,NOW(),NOW())
+                ON CONFLICT(personnel_id,service_date) DO UPDATE SET
+                  credited_seconds=hll_seeding_service.credited_seconds+EXCLUDED.credited_seconds,
+                  last_seen_at=NOW()
+            """,pid,service_date,seconds)
 
     def _round_elapsed_seconds(self, server: dict) -> int:
         """Best-effort elapsed round time for the 30-minute broadcast clock."""
@@ -981,7 +1023,7 @@ class HLLVTelemetryCollector:
                  int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0), x, y, z, now, alive)
             if personnel_id:
                 await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,platform=COALESCE(NULLIF($2,''),platform),platform_user_id=COALESCE(NULLIF($3,''),platform_user_id),eos_id=COALESCE(NULLIF($4,''),eos_id),updated_at=NOW() WHERE steam_id=$5", name, platform, platform_user_id, eos_id, steam_id)
-            return
+            return (personnel_id,0)
 
         last_sample = row.get("last_sample_at")
         dt = max(0.0, (now - last_sample).total_seconds()) if last_sample else 0.0
@@ -1088,6 +1130,7 @@ class HLLVTelemetryCollector:
              int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0), x, y, z, alive, row["id"])
         if personnel_id:
             await self.db.execute("UPDATE hll_personnel_links SET hll_player_name=$1,platform=COALESCE(NULLIF($2,''),platform),platform_user_id=COALESCE(NULLIF($3,''),platform_user_id),eos_id=COALESCE(NULLIF($4,''),eos_id),updated_at=NOW() WHERE steam_id=$5", name, platform, platform_user_id, eos_id, steam_id)
+        return (personnel_id,accrue_seconds)
 
     async def status(self) -> dict:
         if not self.db.pool:

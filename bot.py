@@ -935,6 +935,16 @@ async def ensure_clerk_settings_table():
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_rounds_default INTEGER DEFAULT 180")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_channel_id TEXT")
     await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS operation_reminder_minutes TEXT DEFAULT '1440,120,30'")
+    await db.execute("ALTER TABLE clerk_guild_settings ADD COLUMN IF NOT EXISTS seeding_channel_id TEXT")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_seeding_notices (
+        guild_id TEXT NOT NULL,
+        notice_date DATE NOT NULL,
+        slot_time TEXT NOT NULL,
+        channel_id TEXT,
+        player_count INTEGER,
+        sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(guild_id,notice_date,slot_time)
+    )""")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_operation_reminder_notices (
         guild_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
@@ -962,6 +972,57 @@ async def ensure_clerk_settings_table():
             PRIMARY KEY (guild_id, order_type)
         )
     """)
+
+
+SEEDING_TIMEZONE = ZoneInfo('America/New_York')
+SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
+SEEDING_STOP_POPULATION = 40
+SEEDING_MESSAGE = (
+    "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
+    "Server population is low.\n"
+    "All available 1/5 Cav personnel are requested in-country to help establish the line. "
+    "Earn credit time for the Seeding Ribbon and Medal!\n\n"
+    "**GET IN THE FIGHT.**"
+)
+
+async def set_seeding_channel(guild_id:int, channel_id:int):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None):
+        raise RuntimeError('PostgreSQL is not available for Battalion Clerk settings.')
+    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,seeding_channel_id,updated_at)
+        VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE
+        SET seeding_channel_id=EXCLUDED.seeding_channel_id,updated_at=NOW()""",str(guild_id),str(channel_id))
+
+async def get_seeding_channel_id(guild_id:int)->Optional[int]:
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return None
+    async with db.pool.acquire() as conn:
+        value=await conn.fetchval("SELECT seeding_channel_id FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
+    return int(value) if value else None
+
+async def clear_seeding_channel(guild_id:int):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return
+    await db.execute("UPDATE clerk_guild_settings SET seeding_channel_id=NULL,updated_at=NOW() WHERE guild_id=$1",str(guild_id))
+
+async def seeding_notice_already_sent(guild_id:int, notice_date, slot_time:str)->bool:
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None): return False
+    async with db.pool.acquire() as conn:
+        value=await conn.fetchval("SELECT 1 FROM clerk_seeding_notices WHERE guild_id=$1 AND notice_date=$2 AND slot_time=$3",str(guild_id),notice_date,slot_time)
+    return bool(value)
+
+async def record_seeding_notice(guild_id:int, notice_date, slot_time:str, channel_id:int, player_count:int):
+    await ensure_clerk_settings_table()
+    db=getattr(collector,'db',None)
+    await db.execute("""INSERT INTO clerk_seeding_notices(guild_id,notice_date,slot_time,channel_id,player_count,sent_at)
+        VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT(guild_id,notice_date,slot_time) DO NOTHING""",
+        str(guild_id),notice_date,slot_time,str(channel_id),int(player_count))
+
 
 
 async def set_orders_channel(guild_id: int, channel_id: int):
@@ -3125,6 +3186,10 @@ async def on_ready():
         operation_maintenance_watch.start()
     if not hll_m16_reconcile_watch.is_running():
         hll_m16_reconcile_watch.start()
+    if not progression_reconcile_watch.is_running():
+        progression_reconcile_watch.start()
+    if not seeding_message_watch.is_running():
+        seeding_message_watch.start()
     if not personnel_orders_watch.is_running():
         personnel_orders_watch.start()
     if not clerk_health_watch.is_running():
@@ -4265,9 +4330,9 @@ async def live_activity_credit_watch():
             if elapsed<300: continue
             channel_id=int(session.get('channel_id') or 0)
             if not await collector.db.fetchrow('SELECT 1 FROM activity_voice_channels WHERE guild_id=$1 AND channel_id=$2',gid,channel_id): continue
-            # Discord voice contributes community/readiness attendance only.
-            # Issued M16 service is authoritative from verified HLL telemetry.
-            # Readiness/activity credit retains the existing ten-minute threshold.
+            # Discord voice contributes community attendance evidence only.
+            # Readiness, inactivity, MOS progression and M16 field service are
+            # authoritative from verified HLL server telemetry.
             if elapsed<600: continue
             link=await collector.db.fetchrow("""SELECT p.id::text personnel_id FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1""",str(gid),str(uid))
             if not link: continue
@@ -4278,9 +4343,6 @@ async def live_activity_credit_watch():
                 if elapsed>int(existing['duration_seconds'] or 0): await collector.db.execute('UPDATE personnel_activity_credit SET duration_seconds=$1,credited=TRUE WHERE id=$2',elapsed,existing['id'])
             else:
                 await collector.db.execute("""INSERT INTO personnel_activity_credit(personnel_id,source,source_reference,activity_type,activity_date,duration_seconds,credited) VALUES($1::uuid,'DISCORD_VOICE',$2,'COMMUNITY ACTIVITY',CURRENT_DATE,$3,TRUE)""",pid,ref,elapsed)
-            if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
-                try: await web.request('POST','/internal/clerk/readiness/recheck',json={'personnel_id':pid})
-                except Exception as exc: log.warning('[LIVE ACTIVITY READINESS FAILED] member=%s error=%s',uid,exc)
         except Exception as exc:
             log.warning('[LIVE ACTIVITY CREDIT FAILED] guild=%s member=%s error=%s',gid,uid,exc)
 
@@ -4294,20 +4356,20 @@ async def inactivity_watch():
         log.warning('[WEAPON INACTIVITY REFRESH FAILED] error=%s',exc)
     for guild in bot.guilds:
         await ensure_clerk_settings_table()
-        async with db.pool.acquire() as conn:
-            cfg=await conn.fetchrow("SELECT COALESCE(inactivity_warning_days,7) w,COALESCE(inactivity_s1_days,14) s,COALESCE(inactivity_property_days,21) p,COALESCE(inactivity_command_days,30) c FROM clerk_guild_settings WHERE guild_id=$1",str(guild.id))
-        w,s1,prop,cmd=(int(cfg['w']),int(cfg['s']),int(cfg['p']),int(cfg['c'])) if cfg else (7,14,21,30)
-        rows=await db.fetch("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.activity_last_seen_at,p.activity_last_duty_at,p.created_at,p.duty_status,p.loa_expected_return_date,w.discord_user_id,
-            EXTRACT(DAY FROM NOW()-COALESCE(p.activity_last_seen_at,p.activity_last_duty_at,p.created_at))::int AS inactive_days
-            FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text AND w.guild_id::text=$1
-            WHERE COALESCE(p.lifecycle_state,'') NOT IN ('SEPARATED','ARCHIVED')""",str(guild.id))
+        # Inactivity is now read from the Website's HLL-authoritative activity model.
+        # Discord voice/member timestamps can no longer keep an inactive Soldier current.
+        try:
+            payload=await web.request('GET','/internal/clerk/automation/server-inactivity',params={'guild_id':guild.id})
+            rows=payload.get('items') or []
+        except Exception as exc:
+            log.warning('[SERVER INACTIVITY SNAPSHOT FAILED] guild=%s error=%s',guild.id,exc)
+            continue
+        w,s1,prop,cmd=(7,14,21,30)
         for r in rows:
-            # Authorized leave/absence pauses inactivity escalation until the expected return date.
-            if str(r.get('duty_status') or '').upper() == 'LEAVE':
-                expected=r.get('loa_expected_return_date')
-                if expected is None or expected >= __import__('datetime').date.today():
-                    continue
-            days=int(r['inactive_days'] or 0); pid=r['id']; member=guild.get_member(int(r['discord_user_id']))
+            if r.get('excused'):
+                continue
+            days=int(r.get('days') or 0); pid=r.get('personnel_id')
+            uid=r.get('discord_user_id'); member=guild.get_member(int(uid)) if str(uid or '').isdigit() else None
             name=f"{r['rank_code'] or ''} {r['first_name'] or ''} {r['last_name'] or ''}".strip()
             if days>=cmd:
                 key=f'CMD:{days//7}'
@@ -4329,7 +4391,7 @@ async def inactivity_watch():
                     await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Inactivity review — {name}',__import__('json').dumps({'inactive_days':days,'stage':'DEFICIENT'}),f'INACTIVE-S1:{pid}')
             elif days>=w and member:
                 if await _notice_once(guild.id,pid,'INACTIVITY_MEMBER',f'WARN:{days//7}'):
-                    try: await member.send(f'**1/5 CAV — ACTIVITY NOTICE**\nYour Soldier Record shows **{days} days** since qualifying battalion activity. Join an approved activity voice channel or participate in official battalion duty to return to current status. Simply opening the website does not reset inactivity. Continued inactivity will be referred to S-1.')
+                    try: await member.send(f'**1/5 CAV — ACTIVITY NOTICE**\nYour Soldier Record shows **{days} days** since verified HLL server activity. Join the 1/5 Cav HLL server and record verified game time to return to current status. Discord voice and simply opening the Website do not reset inactivity. Continued inactivity will be referred to S-1.')
                     except discord.Forbidden: pass
 
 
@@ -4369,6 +4431,58 @@ async def personnel_suspense_watch():
                 await ch.send(f"**PERSONNEL ACTION SUSPENSE — {a.get('owning_section') or 'STAFF'}**\n{soldier}\n**{a.get('subject') or a.get('action_type') or 'Personnel Action'}** — {timing}\nPriority: **{a.get('priority') or 'ROUTINE'}** • Status: **{a.get('status') or 'OPEN'}**")
         except Exception as exc:
             log.warning('[PERSONNEL SUSPENSE WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+@tasks.loop(minutes=5)
+async def progression_reconcile_watch():
+    """Keep HLL telemetry connected to readiness, MOS, ribbons and promotion worksheets.
+
+    The RCON collector owns raw server facts.  The Website owns progression policy.
+    This worker simply asks the Website to reconcile every active Soldier from the
+    latest durable telemetry.  It is idempotent and never auto-promotes anyone.
+    """
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        result=await web.request('POST','/internal/clerk/progression/recheck',json={})
+        errors=int(result.get('error_count') or 0)
+        if errors:
+            log.warning('[PROGRESSION RECONCILE] checked=%s readiness=%s mos=%s ribbons=%s awarded=%s promo=%s errors=%s',
+                        result.get('checked'),result.get('readiness_rechecked'),result.get('mos_rechecked'),
+                        result.get('ribbons_rechecked'),result.get('ribbons_awarded'),
+                        result.get('promotion_paths_rechecked'),errors)
+        else:
+            log.info('[PROGRESSION RECONCILE] checked=%s readiness=%s mos=%s ribbons=%s awarded=%s promo=%s',
+                     result.get('checked'),result.get('readiness_rechecked'),result.get('mos_rechecked'),
+                     result.get('ribbons_rechecked'),result.get('ribbons_awarded'),
+                     result.get('promotion_paths_rechecked'))
+    except Exception as exc:
+        log.warning('[PROGRESSION RECONCILE FAILED] error=%s',exc)
+
+@progression_reconcile_watch.before_loop
+async def before_progression_reconcile_watch():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name='progression-audit', description='Staff: force a live HLL progression reconciliation and show the result.')
+async def progression_audit(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        result=await web.request('POST','/internal/clerk/progression/recheck',json={})
+        errors=int(result.get('error_count') or 0)
+        await interaction.followup.send(
+            '**HLL PROGRESSION AUDIT**\n'
+            f"Soldiers checked: **{result.get('checked',0)}**\n"
+            f"Readiness reconciled: **{result.get('readiness_rechecked',0)}**\n"
+            f"MOS proficiency reconciled: **{result.get('mos_rechecked',0)}**\n"
+            f"Ribbon records checked: **{result.get('ribbons_rechecked',0)}**\n"
+            f"New automatic ribbons filed: **{result.get('ribbons_awarded',0)}**\n"
+            f"Promotion worksheets checked: **{result.get('promotion_paths_rechecked',0)}**\n"
+            f"Errors: **{errors}**",
+            ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'Progression audit failed: `{str(exc)[:500]}`',ephemeral=True)
+
 
 @bot.tree.command(name='promotion-report-channel', description='Assign the channel for promotion-eligibility summaries.')
 async def promotion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
@@ -4522,6 +4636,86 @@ async def hll_link_console_member(interaction:discord.Interaction, member:discor
     await interaction.followup.send(
         f"Linked **{result.get('soldier')}** to **{platform.name}** player **{result.get('player_name')}**. "
         "Battalion Clerk will now attach that player's server service record to the Soldier Record.", ephemeral=True)
+
+
+@tasks.loop(minutes=1)
+async def seeding_message_watch():
+    """Post the controlled nightly seeding call at 20:00, 20:30, 21:00 and 21:30 Eastern.
+
+    A slot is only sent once, only when RCON has a current population sample, and only
+    while the server population is below the live/stop threshold. Starting the bot a few
+    minutes after a slot safely catches up that slot without duplicating earlier notices.
+    """
+    now_et=datetime.now(SEEDING_TIMEZONE)
+    if now_et.hour < 20 or (now_et.hour > 21) or (now_et.hour == 21 and now_et.minute > 30):
+        return
+    elapsed=now_et.hour*60+now_et.minute
+    eligible=[(h,m) for h,m in SEEDING_SLOTS if h*60+m <= elapsed]
+    if not eligible: return
+    # Only consider the most recent elapsed slot; older missed slots are not spammed on restart.
+    hour,minute=eligible[-1]
+    slot=f'{hour:02d}:{minute:02d}'
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        channel_id=await get_seeding_channel_id(guild.id)
+        if not channel_id: continue
+        if await seeding_notice_already_sent(guild.id,now_et.date(),slot): continue
+        try:
+            st=await hllv.status()
+            # Never announce based on stale/unavailable telemetry.
+            if not st.get('configured') or not st.get('connected'):
+                log.warning('[SEEDING] skipped slot=%s guild=%s because HLL RCON is not current',slot,guild.id)
+                continue
+            population=int(st.get('player_count') or 0)
+            if population >= SEEDING_STOP_POPULATION:
+                # Mark the slot settled so a later population drop does not restart alerts that night.
+                await record_seeding_notice(guild.id,now_et.date(),slot,channel_id,population)
+                log.info('[SEEDING] no message slot=%s guild=%s population=%s threshold=%s',slot,guild.id,population,SEEDING_STOP_POPULATION)
+                continue
+            channel=guild.get_channel(channel_id)
+            if channel is None:
+                try: channel=await guild.fetch_channel(channel_id)
+                except Exception: channel=None
+            if not isinstance(channel,discord.TextChannel):
+                log.warning('[SEEDING] configured channel unavailable guild=%s channel=%s',guild.id,channel_id)
+                continue
+            await channel.send(SEEDING_MESSAGE,allowed_mentions=discord.AllowedMentions.none())
+            await record_seeding_notice(guild.id,now_et.date(),slot,channel.id,population)
+            log.info('[SEEDING] sent slot=%s guild=%s channel=%s population=%s',slot,guild.id,channel.id,population)
+        except Exception:
+            log.exception('[SEEDING] nightly message failed guild=%s slot=%s',guild.id,slot)
+
+@seeding_message_watch.before_loop
+async def before_seeding_message_watch():
+    await bot.wait_until_ready()
+
+@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic nightly HLL server seeding calls.')
+@app_commands.describe(channel='Text channel for the nightly 1/5 Cav server seeding call')
+async def set_seeding_channel_command(interaction:discord.Interaction,channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_seeding_channel(interaction.guild_id,channel.id)
+    await interaction.response.send_message(
+        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **8:00, 8:30, 9:00, and 9:30 PM Eastern**. '
+        f'Messages stop when HLL population reaches **{SEEDING_STOP_POPULATION}+**.',ephemeral=True)
+
+@bot.tree.command(name='seeding-status', description='Show the nightly seeding channel, schedule, and current HLL population.')
+async def seeding_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    channel_id=await get_seeding_channel_id(interaction.guild_id)
+    st=await hllv.status()
+    await interaction.response.send_message(
+        '**1/5 CAV SEEDING AUTOMATION**\n'
+        f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
+        '**Schedule:** 8:00 / 8:30 / 9:00 / 9:30 PM Eastern\n'
+        f'**Stop threshold:** {SEEDING_STOP_POPULATION}+ players\n'
+        f"**Current population:** {int(st.get('player_count') or 0)}\n"
+        f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
+
+@bot.tree.command(name='clear-seeding-channel', description='Disable automatic nightly seeding messages by clearing the configured channel.')
+async def clear_seeding_channel_command(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await clear_seeding_channel(interaction.guild_id)
+    await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic nightly seeding messages are disabled until a channel is assigned.',ephemeral=True)
 
 @bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
 @app_commands.describe(message='Message to display in game (180 characters maximum)')
