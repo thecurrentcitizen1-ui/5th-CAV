@@ -761,6 +761,8 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
     # authoritative Website assignment after Welcome Packet acceptance.
     desired_name='Replacement Depot' if approved else 'Prospective Replacement'
     desired=discord.utils.get(member.guild.roles,name=desired_name)
+    if not desired:
+        desired=await _ensure_dynamic_role(member.guild,desired_name)
     remove=[discord.utils.get(member.guild.roles,name=n) for n in RECRUITING_STATUS_ROLE_BLUEPRINT if n!=desired_name]
     remove += [discord.utils.get(member.guild.roles,name=n) for n in LEGACY_RECRUITING_STATUS_ROLE_NAMES]
     try:
@@ -1032,7 +1034,8 @@ async def reset_discord_routing(guild_id:int):
 
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
-SEEDING_STOP_POPULATION = 40
+SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') or 40))
+SEEDING_MENTION_ROLE_NAME = '5th Cavalry Regiment'
 SEEDING_MESSAGE = (
     "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
     "Server population is low.\n"
@@ -3681,6 +3684,109 @@ async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
 
 
+
+
+async def _retroactive_accession_member(member: discord.Member, *, send_message: bool=True) -> dict:
+    """Safely stage an existing Discord member into the website-authoritative accession flow.
+
+    This never creates personnel, never duplicates a Recruiting Case, and never changes an
+    established Soldier. It only reconciles the recruit-status role and optionally sends the
+    same website-first instructions used for a new Discord arrival.
+    """
+    if member.bot:
+        return {'status':'BOT','messaged':False}
+    await collector.upsert_member(member)
+    existing=await sync_personnel_identity(member,create_if_missing=False,reason='accessions_backfill',deliver_credentials=False)
+    if existing and existing.get('linked'):
+        await clear_recruit_status_roles(member)
+        return {'status':'LINKED SOLDIER','messaged':False}
+
+    recruit=await recruiting_status_for(member)
+    case=recruit.get('case') if recruit and recruit.get('exists') else None
+    status=str((case or {}).get('status') or '').upper()
+    if status in {'DENIED','CLOSED','ENLISTED'}:
+        await clear_recruit_status_roles(member)
+        return {'status':status or 'CLOSED','messaged':False}
+
+    approved=bool(case and status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'})
+    await ensure_recruit_status_role(member,approved=approved)
+    if approved:
+        await process_approved_recruit_case(member.guild,case,member=member)
+        return {'status':'APPROVED REPLACEMENT','messaged':False}
+
+    if not send_message:
+        return {'status':status or 'NO APPLICATION','messaged':False}
+
+    if case:
+        if status=='MORE_INFO_REQUIRED':
+            status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL else 'your Recruiting Case status page'
+            msg=(f"**1/5 CAV — RECRUITING CASE ACTION REQUIRED**\n"
+                 f"Recruiting Case **{case.get('case_number')}** needs additional information.\n"
+                 f"Respond here: {status_url}")
+        else:
+            msg=(f"**1/5 CAV — APPLICATION LOCATED**\n"
+                 f"Recruiting Case **{case.get('case_number')}** is already on file and linked to your Discord account.\n"
+                 f"Status: **{(status or 'COMMAND REVIEW').replace('_',' ')}**\n\n"
+                 "Do **not** submit another application. Battalion Clerk will notify you when Headquarters acts on your case.")
+    else:
+        app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else 'the battalion website — Enlist page'
+        msg=("**1/5 CAV — REPORT TO RECRUITING**\n\n"
+             "You are in the battalion Discord, but no linked Soldier Record or Recruiting Case was found for you.\n\n"
+             f"Complete your enlistment application here: {app_url}\n\n"
+             "Once approved, Battalion Clerk will move you through Replacement Detachment and issue your website access automatically.\n\n"
+             "If you already applied, do **not** apply again. Use **/apply** and choose **I ALREADY APPLIED** to attach your existing case.")
+    try:
+        await member.send(msg)
+        return {'status':status or 'NO APPLICATION','messaged':True}
+    except discord.Forbidden:
+        return {'status':status or 'NO APPLICATION','messaged':False,'dm_blocked':True}
+
+
+@bot.tree.command(name='accessions-backfill', description='Command: sweep existing Discord arrivals into the 1/5 Cav accession pipeline.')
+@app_commands.describe(send_messages='DM website-first recruiting instructions to unlinked arrivals during this sweep.')
+async def accessions_backfill(interaction: discord.Interaction, send_messages: bool=True):
+    if not await require_manage_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    guild=interaction.guild
+    if not guild:
+        await interaction.followup.send('This command must be run inside the battalion Discord.',ephemeral=True)
+        return
+    counts={'linked':0,'prospective':0,'case':0,'approved':0,'messaged':0,'blocked':0,'closed':0,'errors':0}
+    errors=[]
+    for member in list(guild.members):
+        if member.bot:
+            continue
+        try:
+            result=await _retroactive_accession_member(member,send_message=send_messages)
+            state=str(result.get('status') or '')
+            if state=='LINKED SOLDIER': counts['linked']+=1
+            elif state=='APPROVED REPLACEMENT': counts['approved']+=1
+            elif state in {'DENIED','CLOSED','ENLISTED'}: counts['closed']+=1
+            elif state=='NO APPLICATION': counts['prospective']+=1
+            else: counts['case']+=1
+            if result.get('messaged'): counts['messaged']+=1
+            if result.get('dm_blocked'): counts['blocked']+=1
+        except Exception as exc:
+            counts['errors']+=1
+            if len(errors)<5:
+                errors.append(f'{member.display_name}: {str(exc)[:120]}')
+            log.warning('[ACCESSIONS BACKFILL FAILED] member=%s error=%s',member.id,exc)
+        await asyncio.sleep(0.15)
+    summary=("**ACCESSIONS BACKFILL COMPLETE**\n"
+             f"Established Soldiers untouched: **{counts['linked']}**\n"
+             f"Prospective Replacements staged: **{counts['prospective']}**\n"
+             f"Existing recruiting cases reconciled: **{counts['case']}**\n"
+             f"Approved Replacements reconciled: **{counts['approved']}**\n"
+             f"Recruiting DMs sent: **{counts['messaged']}**\n"
+             f"DMs blocked: **{counts['blocked']}**\n"
+             f"Closed/enlisted cases skipped: **{counts['closed']}**\n"
+             f"Errors: **{counts['errors']}**")
+    if errors:
+        summary += "\n\nFirst errors:\n" + "\n".join(f"• {e}" for e in errors)
+    summary += "\n\nNo personnel records or duplicate applications were created by this sweep."
+    await interaction.followup.send(summary[:1900],ephemeral=True)
+
 @bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
 async def application_status(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -3986,15 +4092,13 @@ async def on_member_join(member: discord.Member):
                              "You now hold **Applicant — Awaiting Review** while Battalion Headquarters reviews your application. No verification code is required. You do not need to keep checking the website; Battalion Clerk will DM you when Command acts on your case.")
                 else:
                     app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
-                    msg=("**WELCOME TO THE 1/5 CAVALRY RECRUITING OFFICE**\n"
-                         "If you're here to enlist, Battalion Clerk can process the application privately in Discord.\n\n"
-                         "Choose **BEGIN APPLICATION** below, or choose **I ALREADY APPLIED** to attach this Discord account to an application you already filed on the website.\n\n"
-                         f"Website option: {app_url}")
+                    msg=("**WELCOME TO THE 1/5 CAVALRY — REPORT TO RECRUITING**\n\n"
+                         "You have arrived in the battalion Discord, but you are **not on the rolls yet**.\n\n"
+                         f"**NEXT STEP:** Complete your enlistment application here: {app_url}\n\n"
+                         "Once Battalion Headquarters approves your application, Battalion Clerk will move you into the Replacement Detachment, issue your website access, synchronize your Discord status, and begin your Soldier record.\n\n"
+                         "**Already applied?** Do not submit another application. Use **/apply** and choose **I ALREADY APPLIED** to attach this Discord account to the case already on file.")
                 if msg:
-                    if not case:
-                        await member.send(msg,view=RecruitApplicationStartView())
-                    else:
-                        await member.send(msg)
+                    await member.send(msg)
                 if msg and case and status not in {'ENLISTED'}:
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':status,'guild_id':member.guild.id})
             except discord.Forbidden:
@@ -4004,8 +4108,9 @@ async def on_member_join(member: discord.Member):
                 try:
                     welcome=await get_welcome_channel(member.guild)
                     if welcome:
+                        app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
                         await welcome.send(
-                            f"{member.mention} Battalion Clerk could not open a private DM. Use **/apply** in this server to begin the private enlistment application, or enable server-member DMs and run **/apply**.",
+                            f"{member.mention} Battalion Clerk could not open a private DM. Report to Recruiting here: {app_url}. If you already applied, use **/apply** and choose **I ALREADY APPLIED** to attach your existing case.",
                             allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False),
                         )
                 except Exception as fallback_exc:
@@ -4913,7 +5018,17 @@ async def seeding_message_watch():
             if not isinstance(channel,discord.TextChannel):
                 log.warning('[SEEDING] configured channel unavailable guild=%s channel=%s',guild.id,channel_id)
                 continue
-            await channel.send(SEEDING_MESSAGE,allowed_mentions=discord.AllowedMentions.none())
+            # Seeding calls are only sent while the server is below the configured
+            # populated/ready threshold. Tag the battalion membership role so the
+            # call reaches 1/5 Cav personnel without pinging @everyone.
+            regiment_role=discord.utils.get(guild.roles,name=SEEDING_MENTION_ROLE_NAME)
+            role_prefix=f'{regiment_role.mention}\n' if regiment_role else ''
+            if regiment_role is None:
+                log.warning('[SEEDING] role %r not found guild=%s; sending without role mention',SEEDING_MENTION_ROLE_NAME,guild.id)
+            await channel.send(
+                role_prefix + SEEDING_MESSAGE,
+                allowed_mentions=discord.AllowedMentions(everyone=False,users=False,roles=True,replied_user=False),
+            )
             await record_seeding_notice(guild.id,now_et.date(),slot,channel.id,population)
             log.info('[SEEDING] sent slot=%s guild=%s channel=%s population=%s',slot,guild.id,channel.id,population)
         except Exception:
@@ -4930,7 +5045,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
     await set_seeding_channel(interaction.guild_id,channel.id)
     await interaction.response.send_message(
         f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **8:00, 8:30, 9:00, and 9:30 PM Eastern**. '
-        f'Messages stop when HLL population reaches **{SEEDING_STOP_POPULATION}+**.',ephemeral=True)
+        f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{SEEDING_MENTION_ROLE_NAME}**.',ephemeral=True)
 
 @bot.tree.command(name='seeding-status', description='Show the nightly seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
@@ -4941,7 +5056,8 @@ async def seeding_status(interaction:discord.Interaction):
         '**1/5 CAV SEEDING AUTOMATION**\n'
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
         '**Schedule:** 8:00 / 8:30 / 9:00 / 9:30 PM Eastern\n'
-        f'**Stop threshold:** {SEEDING_STOP_POPULATION}+ players\n'
+        f'**Populated threshold:** {SEEDING_STOP_POPULATION}+ players — seeding calls suppressed\n'
+        f'**Mention role:** {SEEDING_MENTION_ROLE_NAME}\n'
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
