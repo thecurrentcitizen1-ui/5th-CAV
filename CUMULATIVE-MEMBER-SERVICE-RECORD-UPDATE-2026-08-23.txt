@@ -1,0 +1,11 @@
+CUMULATIVE MEMBER / SERVICE RECORD UPDATE — 23 AUG 2026
+
+- Member page reordered: Wall Locker -> Current Field Situation -> Everything Else.
+- Duty Desk hides completed known requirements immediately from authoritative state.
+- Member-facing Discord/guild/bot language removed or translated to period-neutral personnel language.
+- HLL role display now uses verified named roles; unverified IDs display clearly as UNVERIFIED ROLE #.
+- Role and map ledgers now aggregate lifetime service, not only recent matches.
+- Area of Operations display consolidated to one lifetime record per map.
+- Airmobile Service Record replaces raw altitude-gain presentation.
+- Pilot and passenger/aircrew time are separated only when verified role mappings exist; otherwise shown as pending verification.
+- Vehicle Kills and Vehicles Destroyed remain direct server-derived fields.

@@ -1,0 +1,35 @@
+1/5 CAV — BATTALION INTEGRITY & WORKFLOW TIGHTENING — FINAL PASS
+22 AUG 2026 • authoritative period: 1965
+
+This build is cumulative over the existing Battalion Integrity Engine / System Health release.
+
+VERIFIED EXISTING SYSTEMS
+- Read-only Battalion Integrity Engine and System Health Board.
+- One Command Duty Desk with role-aware staff focus and automation status.
+- Member Duty Desk and Next Milestones.
+- Command "What Changed" feed from permanent Staff Duty Log records.
+- Contextual Soldier actions from the 201 File / staff drawer.
+- Structured system-owned rank, MOS, assignment, billet, duty-status, award, qualification and training catalogs.
+- Personnel action preview showing downstream Website / 201 File / history / orders / Discord effects.
+- Historical correction/amendment workflow instead of silent record erasure.
+- One-click S-3 Operation closeout with attendance and M16 round reconciliation.
+
+FINAL GUARDRAILS ADDED
+1. Duplicate pending award recommendations are blocked.
+   - A Soldier cannot receive a second open recommendation for the same award while one is already pending.
+2. Leadership appointment compatibility validation.
+   - PSG requires a structured Platoon.
+   - SL / Assistant SL / Team Leader require a structured Squad.
+   - Team Leader requires Alpha or Bravo fire-team context.
+   - Suggested-rank mismatches are blocked unless Battalion HQ / Commander / Admin deliberately selects Command Override.
+3. Operation closeout integrity protection.
+   - Completed/closed/archived Operations cannot be closed a second time.
+   - Final closeout is written to the Staff Duty Log with credited count, participant count, reconciled rounds, result and Operation ID.
+4. Existing authoritative systems remain the source of truth.
+   - Integrity/health layers report contradictions; they do not silently rewrite Personnel, S-3, S-4, Training, Awards, Recruiting, Welcome Packet or Discord state.
+
+VALIDATION
+- Python syntax compile: PASS.
+- Jinja template parse: PASS.
+- No new database schema or migration required for this final guardrail pass.
+- Existing 1965 visual/UX layer preserved.

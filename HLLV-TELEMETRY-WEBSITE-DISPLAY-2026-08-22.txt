@@ -1,0 +1,16 @@
+HLL: VIETNAM TELEMETRY — WEBSITE DISPLAY LAYER
+22 AUG 2026
+
+Website reads Battalion Clerk's authoritative HLL telemetry tables. It does not collect RCON itself.
+
+Added:
+- Wall Locker Field Service Statistics card with live/last server state.
+- 201 File Combat Record with career totals, score strip, and recent HLL round ledger.
+- Member Operations live field-service feed.
+- Staff S-3 Operations live RCON health/map/player board.
+- Operation Detail HLL telemetry correlation using scheduled operation time overlap.
+- Fault isolation: missing/unavailable RCON tables never block member pages.
+- CSS cache-bust token for the new telemetry display styles.
+
+No RCON credential is stored in the Website package.
+The Battalion Clerk RCON telemetry build must be deployed against the same PostgreSQL DATABASE_URL for live data to populate.

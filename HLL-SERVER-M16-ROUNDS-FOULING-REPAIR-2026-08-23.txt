@@ -1,5 +1,11 @@
-1/5 CAV — BATTALION CLERK HLL M16 RECONCILIATION — 2026-08-23
+1/5 CAV — HLL SERVER M16 ROUNDS / FOULING REPAIR — 2026-08-23
 
-- Battalion Clerk now asks the website weapon engine to reconcile verified HLL M16 field-use blocks every 60 seconds.
-- The website remains authoritative for weapon issue history, cleaning boundaries, round ledger, and fouling state.
-- Existing RCON polling, server broadcast, manual server message, Air Cav/Slick Rides, role research, and other Clerk automation remain intact.
+- HLL: Vietnam server M16/XM16 field-use time now feeds the issued-rifle ledger.
+- 300 estimated rounds/hour; completed 5-minute block = 25 estimated rounds.
+- Estimates are explicitly filed as HLL SERVER M16 ESTIMATE because HLLV does not expose exact shots fired.
+- Reconciliation is idempotent by match + Soldier + completed five-minute block.
+- Historical sessions are backfilled from hll_research_samples and hll_player_match_stats.
+- Historical weapon issue dates are respected.
+- Cleaning timestamps remain authoritative: pre-cleaning field use increases lifetime rounds but does not re-foul the rifle.
+- Member Soldier Record triggers immediate reconciliation before rendering the issued M16.
+- Internal Clerk endpoint: POST /internal/clerk/weapons/reconcile-hll-rounds.

@@ -1,0 +1,6 @@
+HLLV M16 SERVICE RECORD EXPANSION
+
+- M16 service history now shows verified M16 field time, verified M16 kills and Blue on Blue incidents.
+- Estimated rounds are explicitly labeled estimates; HLLV does not expose shots fired.
+- Cleaning-only history replaces Cleaning / Repair on member-facing records.
+- Malfunction/repair concepts are not shown in the member M16 service record.

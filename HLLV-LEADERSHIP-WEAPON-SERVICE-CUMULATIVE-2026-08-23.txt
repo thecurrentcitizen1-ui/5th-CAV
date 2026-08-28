@@ -1,9 +1,24 @@
-1/5 CAV BATTALION CLERK — LEADERSHIP + WEAPON SERVICE CUMULATIVE UPDATE
+1/5 CAV HLL: VIETNAM — LEADERSHIP + WEAPON SERVICE CUMULATIVE UPDATE
 
-- /hll-stats now reports verified leadership role time from HLL roles 9, 12, and 17.
-- /hll-stats now reports M16/XM16 verified carry time, carry distance, weapon-attributed kills, and Blue on Blue.
-- Existing role ledger remains the source of truth; no second leadership timer was created.
-- Existing M16/XM16 loadout collector and admin-log weapon event ingestion remain the source of truth.
-- No player telemetry is reset.
-- Role 16 Pilot + Role 17 Logistics Officer aviation handling remains intact.
-- Armor, console identity linking, server broadcasts, and existing RCON collection remain intact.
+Leadership Experience
+- Role 9 Squad Leader counts toward verified leadership experience.
+- Role 12 Tank Commander counts toward verified leadership experience.
+- Role 17 Logistics Officer counts toward verified leadership experience.
+- Observer intentionally excluded until its HLL role ID is confirmed.
+- Role time is experience/evidence only and never triggers promotion, appointment, or award automatically.
+
+M16 / XM16 Weapon Service
+- Verified field time carrying M16/XM16.
+- Verified distance carried.
+- Map service ledger with rounds, carry time, and distance.
+- Weapon-attributed kills from HLL admin logs.
+- Weapon-attributed Blue on Blue from HLL admin logs.
+- Last verified use uses loadout contact and weapon events.
+- Operations carried retained.
+- Estimated ammunition expenditure remains clearly labeled as an estimate; HLL does not expose shots fired.
+
+Cumulative preservation
+- Confirmed HLL role mappings retained.
+- Role 16 Pilot and Role 17 Logistics Officer Air Cav flight credit retained.
+- Role 11 Crewman / Role 12 Tank Commander armored service retained.
+- Application readability, console linking, M16 fouling reconciliation, organization board and homepage server-panel fixes retained from prior cumulative build.

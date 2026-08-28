@@ -1,0 +1,13 @@
+FORMATION BILLET CONTROL — 2026-08-22
+
+- Added Formation Assignment Control for S-1/Command.
+- Command fills Squad Leader, Assistant Squad Leader, Alpha/Bravo Team Leader and team Soldier billets by dropdown.
+- Leadership scope derives from authoritative billet + formation, not rank alone.
+- Team Leaders see the full squad but can take Quick Actions only on their own fire team.
+- Squad Leader/Assistant Squad Leader can act across the assigned squad.
+- Platoon Sergeant receives platoon-wide leadership scope.
+- PVT/PFC retain view-only My Squad access.
+- Added one-time-safe migration of legacy duty-position assignments into structured appointments.
+- Legacy textual Company/Platoon/Squad records are resolved to structured unit nodes when possible.
+- Ambiguous migration records appear in Formation Migration Exceptions for Command review.
+- Existing Discord role synchronization remains authoritative and is queued after formation changes.

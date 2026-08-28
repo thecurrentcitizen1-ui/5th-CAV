@@ -1,0 +1,6 @@
+5TH CAVALRY — ACTION CENTER FIX REVIEW
+Root cause: missing staff_suspense_summary() helper.
+Python compile: PASS
+Jinja parse: PASS
+Endpoint audit: PASS
+Missing global helper audit: PASS

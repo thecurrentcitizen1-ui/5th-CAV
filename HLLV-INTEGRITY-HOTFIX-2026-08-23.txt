@@ -1,5 +1,5 @@
 HLLV INTEGRITY HOTFIX — 23 AUG 2026
 
-- Suppresses known upstream Pydantic serialization warning spam for HLLV ISO-8601 remaining_match_time values; _seconds() remains authoritative normalization.
-- Adds PyNaCl so discord.py voice support is available to Battalion Clerk.
-- Preserves RCON telemetry, research lab, role/MOS observation, operations, and all existing automations.
+- Formation billet reconciliation now handles personnel without a fire_team value safely.
+- Welcome Packet Clerk notification join explicitly compares website_member_links.personnel_id text to notification UUID text, eliminating PostgreSQL text=uuid failures.
+- No personnel, award, operation, M16, or telemetry features removed.
