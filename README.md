@@ -39,7 +39,8 @@ Recommended defaults:
 - `HLL_RCON_RECONNECT_SECONDS=15`
 
 Discord commands:
-- `/hll-link` — Soldier self-links a 17-digit SteamID64
+- `/link-game` — primary Soldier self-link command for Steam, Xbox, or PlayStation
+- `/hll-link` — legacy Steam-only compatibility alias
 - `/hll-unlink` — removes own link
 - `/hll-link-member` — staff link/repair
 - `/hll-link-console` — members link their own Xbox or PlayStation account by exact in-game gamertag after they have appeared on the server

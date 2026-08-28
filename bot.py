@@ -3215,9 +3215,16 @@ async def welcome_packet_watch():
                 member=guild.get_member(int(item.get('discord_user_id') or 0))
                 ok=False; error=None
                 if member:
-                    message=(f"**1/5 CAV — {item.get('title') or 'WELCOME PACKET'}**\n"
+                    event_type=str(item.get('event_type') or '').upper()
+                    destination=f"{WEBSITE_BASE_URL}/welcome-packet"
+                    destination_label='Open your packet'
+                    if event_type=='ASSIGNMENT':
+                        destination=f"{WEBSITE_BASE_URL}/my-201-file"; destination_label='Open your 201 File'
+                    elif event_type=='ONBOARDING_COMPLETE':
+                        destination=f"{WEBSITE_BASE_URL}/my-201-file"; destination_label='Open your Soldier Record'
+                    message=(f"**1/5 CAV — {item.get('title') or 'ONBOARDING'}**\n"
                              f"{item.get('message') or 'Your onboarding record has been updated.'}\n\n"
-                             f"Open your packet: {WEBSITE_BASE_URL}/welcome-packet")
+                             f"{destination_label}: {destination}")
                     try:
                         await member.send(message[:1900]); ok=True
                     except discord.Forbidden:
@@ -4880,6 +4887,31 @@ async def operation_rounds_for_guild(guild_id:int):
 # ---------------------------------------------------------------------------
 # HELL LET LOOSE: VIETNAM — RCON / TELEMETRY
 # ---------------------------------------------------------------------------
+@bot.tree.command(name='link-game', description='Link your HLL: Vietnam Steam, Xbox, or PlayStation identity to your Soldier Record.')
+@app_commands.describe(platform='Platform you play HLL: Vietnam on', game_id='SteamID64, Xbox Gamertag, or PSN Online ID')
+@app_commands.choices(platform=[
+    app_commands.Choice(name='Steam / PC', value='STEAM'),
+    app_commands.Choice(name='Xbox', value='XBOX'),
+    app_commands.Choice(name='PlayStation 5', value='PS5'),
+])
+async def link_game(interaction:discord.Interaction, platform:app_commands.Choice[str], game_id:str):
+    """Single onboarding-friendly self-link command for every supported platform."""
+    await interaction.response.defer(ephemeral=True)
+    identity=(game_id or '').strip()
+    if not identity:
+        await interaction.followup.send('Enter the game identity exactly as it appears for your platform.',ephemeral=True); return
+    result=await hllv.staff_link_identity(interaction.guild.id,interaction.user.id,platform.value,identity,f'DISCORD LINK-GAME:{interaction.user.id}')
+    if not result.get('ok'):
+        await interaction.followup.send(f"Game link not filed: **{result.get('error','unknown error')}**\n\nIf this identity is already attached to another Soldier, contact S-1; Battalion Clerk will not move server statistics between records automatically.",ephemeral=True); return
+    verified=str(result.get('status') or '').upper()=='VERIFIED'
+    state='VERIFIED' if verified else 'PENDING SERVER VERIFICATION'
+    await interaction.followup.send(
+        f"**HLL: VIETNAM GAME IDENTITY — {state}**\n"
+        f"Platform: **{platform.name}**\nIdentity: `{identity}`\n\n"
+        "This identity is now attached to your 1/5 Cavalry Soldier Record. Verified server time, role service, seeding credit, readiness, ribbon progress, and other supported telemetry will use this link. "
+        + ("Battalion Clerk will finish verification when this exact console identity is observed on the unit server." if not verified else "No additional self-link step is required."),
+        ephemeral=True)
+
 @bot.tree.command(name='hll-link', description='Link your SteamID64 to your 1/5 CAV Soldier Record for automatic server statistics.')
 @app_commands.describe(steam_id='Your 17-digit SteamID64')
 async def hll_link(interaction:discord.Interaction, steam_id:str):
@@ -5170,7 +5202,7 @@ async def hll_stats(interaction:discord.Interaction):
     if not data:
         await interaction.followup.send('No Soldier Record is linked to your Discord account.',ephemeral=True); return
     if not data.get('link'):
-        await interaction.followup.send('Your Soldier Record exists, but no SteamID64 is linked. Use `/hll-link` first.',ephemeral=True); return
+        await interaction.followup.send('Your Soldier Record exists, but no SteamID64 is linked. Use `/link-game` first.',ephemeral=True); return
     a=data.get('aggregate') or {}; latest=data.get('latest') or {}
     sec=int(a.get('seconds') or 0); h=sec//3600; m=(sec%3600)//60
     km=float(a.get('distance') or 0)/1000.0

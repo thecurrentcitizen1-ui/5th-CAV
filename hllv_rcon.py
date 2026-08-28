@@ -1297,6 +1297,12 @@ class HLLVTelemetryCollector:
                 ON CONFLICT(steam_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,discord_user_id=EXCLUDED.discord_user_id,
                     linked_by=EXCLUDED.linked_by,verified=TRUE,updated_at=NOW()
             """, steam_id, person["personnel_id"], str(discord_user_id), linked_by)
+            # Backfill any telemetry collected before the Soldier linked their account.
+            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", person["personnel_id"], steam_id)
+            try:
+                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", person["personnel_id"], steam_id)
+            except Exception:
+                pass
         except Exception as exc:
             # Unique personnel mapping means one Soldier cannot silently own two Steam IDs.
             return {"ok": False, "error": f"Link conflict: {exc}"}
@@ -1351,7 +1357,7 @@ class HLLVTelemetryCollector:
         except Exception as exc:
             return {"ok": False, "error": f"Link conflict: {exc}"}
         name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
-        return {"ok": True, "personnel_id": person["personnel_id"], "soldier": name, "player_name": row.get("player_name"), "platform": platform, "player_key": player_key}
+        return {"ok": True, "status":"VERIFIED", "verified":True, "personnel_id": person["personnel_id"], "soldier": name, "player_name": row.get("player_name"), "platform": platform, "player_key": player_key}
 
     async def staff_link_identity(self, guild_id: int, discord_user_id: int, platform: str, identity: str, linked_by: str) -> dict:
         """Command-staff repair path for HLL identity links.
