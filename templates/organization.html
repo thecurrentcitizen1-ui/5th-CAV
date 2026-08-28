@@ -1,0 +1,73 @@
+{% extends 'base.html' %}
+{% block title %}Units • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page battalion-redesign public-units-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--units">
+  <img src="{{url_for('static',filename='art/public-overhaul/squad-field.webp')}}" alt="1/5 Cavalry Soldiers operating together in Vietnam">
+  <div class="public-section-hero__shade"></div>
+  <div><small>HEADQUARTERS • TABLE OF ORGANIZATION</small><h1>UNITS</h1><p>1st Battalion, 5th Cavalry Regiment from Battalion Headquarters through company, platoon and squad.</p></div>
+</section>
+
+<section class="public-office-board battalion-public-board">
+  <header class="public-board-heading"><small>1ST BATTALION, 5TH CAVALRY REGIMENT</small><h2>BATTALION ORGANIZATION BOARD</h2><p>Leadership and personnel below are drawn from current appointment and assignment records. Vacant positions remain marked vacant rather than filled with fictional names.</p></header>
+
+  {% set bnco=(appointments|selectattr('appointment_code','equalto','BN_CO')|list|first) %}
+  {% set bnxo=(appointments|selectattr('appointment_code','equalto','BN_XO')|list|first) %}
+  {% set bnsgm=(appointments|selectattr('appointment_code','equalto','BN_SGM')|list|first) %}
+  <section class="public-command-group">
+    {% for title,person in [('BATTALION COMMANDER',bnco),('BATTALION EXECUTIVE OFFICER',bnxo),('BATTALION SERGEANT MAJOR',bnsgm)] %}
+    <article class="{% if not person %}is-vacant{% endif %}">
+      {% if person and person.rank_code %}<img src="{{url_for('static',filename='art/ranks/' ~ person.rank_code ~ '.webp')}}" alt="{{person.rank_code}} insignia">{% endif %}
+      <small>{{title}}</small>
+      <h3>{% if person %}{{person.rank_code}} {{person.last_name|soldier_name(person.first_name, true)}}{% else %}VACANT{% endif %}</h3>
+      <span>{% if person %}{{person.appointment_name}}{% else %}NO CURRENT APPOINTMENT FILED{% endif %}</span>
+    </article>
+    {% endfor %}
+  </section>
+
+  <div class="public-company-board">
+  {% for company in nodes if company.unit_type == 'Company' %}
+    {% set co=(appointments|selectattr('unit_node_id','equalto',company.id)|selectattr('appointment_code','equalto','CO_CO')|list|first) %}
+    {% set xo=(appointments|selectattr('unit_node_id','equalto',company.id)|selectattr('appointment_code','equalto','CO_XO')|list|first) %}
+    {% set one=(appointments|selectattr('unit_node_id','equalto',company.id)|selectattr('appointment_code','equalto','CO_1SG')|list|first) %}
+    <section class="public-company-file">
+      <header><div><small>1/5 CAV</small><h2>{{company.display_name}}</h2><span>{{company.unit_code}}</span></div><nav><a href="{{url_for('company',unit_code=company.unit_code)}}">OPEN COMPANY FILE</a><a href="{{url_for('unit_history_page',unit_node_id=company.id)}}">HISTORY</a></nav></header>
+      <div class="public-company-leadership">
+        {% for title,person in [('COMMANDING OFFICER',co),('EXECUTIVE OFFICER',xo),('FIRST SERGEANT',one)] %}
+        <div><small>{{title}}</small><b>{% if person %}{{person.rank_code}} {{person.last_name|soldier_name(person.first_name, true)}}{% else %}VACANT{% endif %}</b></div>
+        {% endfor %}
+      </div>
+
+      <div class="public-platoon-grid">
+      {% for platoon in nodes if platoon.parent_id == company.id and platoon.unit_type == 'Platoon' %}
+        {% set pl=(appointments|selectattr('unit_node_id','equalto',platoon.id)|selectattr('appointment_code','equalto','PL')|list|first) %}
+        {% set psg=(appointments|selectattr('unit_node_id','equalto',platoon.id)|selectattr('appointment_code','equalto','PSG')|list|first) %}
+        <article class="public-platoon-file">
+          <header><div><h3>{{platoon.display_name|formation_label}}</h3><span>{{platoon.unit_code}}</span></div><a href="{{url_for('platoon',unit_code=platoon.unit_code)}}">OPEN</a></header>
+          <div class="public-platoon-leaders"><span>PL: <b>{% if pl %}{{pl.rank_code}} {{pl.last_name|upper}}{% else %}VACANT{% endif %}</b></span><span>PSG: <b>{% if psg %}{{psg.rank_code}} {{psg.last_name|upper}}{% else %}VACANT{% endif %}</b></span></div>
+          {% for squad in nodes if squad.parent_id == platoon.id and squad.unit_type == 'Squad' %}
+            {% set sl=(appointments|selectattr('unit_node_id','equalto',squad.id)|selectattr('appointment_code','equalto','SL')|list|first) %}
+            {% set squad_people=roster|selectattr('unit_node_id','equalto',squad.id)|list %}
+            <section class="public-squad-file">
+              <div><strong>{{squad.display_name|formation_label}}</strong><small>{% if sl %}SL: {{sl.rank_code}} {{sl.last_name|upper}}{% else %}SL: VACANT{% endif %}</small></div>
+              <b>{{squad_people|length}} ASSIGNED</b>
+            </section>
+          {% endfor %}
+        </article>
+      {% endfor %}
+      </div>
+    </section>
+  {% else %}
+    <div class="public-empty-order"><b>UNIT STRUCTURE NOT YET AVAILABLE.</b><span>Headquarters organization data will appear when the unit catalog is available.</span></div>
+  {% endfor %}
+  </div>
+
+  <article class="public-roster-paper">
+    <header><small>S-1 PERSONNEL</small><h2>BATTALION PERSONNEL ROSTER</h2></header>
+    <div class="public-roster-row public-roster-head"><span>RANK</span><span>NAME</span><span>ASSIGNMENT</span><span>DUTY</span><span>STATUS</span></div>
+    {% for row in roster %}
+    <div class="public-roster-row"><span>{{row.rank_code or '—'}}</span><span><b>{{row.last_name|soldier_name(row.first_name, true)}}</b></span><span>{{row.unit_code or 'UNASSIGNED'}}{% if row.platoon %}<small>{{row.platoon|formation_label}}{% if row.squad %} / {{row.squad|formation_label}}{% endif %}</small>{% endif %}</span><span>{{row.duty_position or '—'}}</span><span>{{row.field_status or 'ACTIVE'}}</span></div>
+    {% else %}<p>NO PERSONNEL ARE CURRENTLY ENTERED ON THE PUBLIC BATTALION ROSTER.</p>{% endfor %}
+  </article>
+</section>
+{% endblock %}

@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block title %}HLL Telemetry Lab • {{site_name}}{% endblock %}
+{% block body_class %}page-staff page-s3 page-hll-lab{% endblock %}
+{% block content %}
+<section class="document-sheet hll-lab-header"><header class="army-letterhead"><small>S-3 / BATTALION CLERK</small><strong>HLL: VIETNAM TELEMETRY LAB</strong><span>ROLE • MOS • VEHICLE • AVIATION • WEAPON RESEARCH</span></header>
+<p>This board is observational. No role mapping, movement signature, or progression recommendation changes rank, awards, qualifications, attendance, or MOS certification until an authorized staff action is filed.</p></section>
+
+<section class="hll-lab-status-grid">
+<article class="document-sheet"><small>AVIATION</small><h3>FLIGHT DETECTION</h3><p>{{lab.aviation_status}}</p></article>
+<article class="document-sheet"><small>VEHICLES</small><h3>OCCUPANCY CLASSIFICATION</h3><p>{{lab.vehicle_status}}</p></article>
+<article class="document-sheet"><small>WEAPONS</small><h3>AMMUNITION EXPENDITURE</h3><p>{{lab.ammo_status}}</p></article>
+</section>
+
+<section class="document-sheet"><header class="army-letterhead compact"><small>OBSERVED ROLE REGISTRY</small><strong>ROLE ID MAPPING BOARD</strong><span>VERIFY ONLY AFTER AN IN-GAME CONTROLLED TEST</span></header>
+{% if not lab.available %}<p class="typed-empty">{{lab.error or 'RESEARCH DATA UNAVAILABLE.'}}</p>{% endif %}
+<div class="hll-role-table">
+{% for r in lab.roles %}<div class="hll-role-row {{'verified' if r.verified else 'observe'}}">
+<div><small>ROLE ID</small><b>{{r.role_id}}</b><span>{{r.verified_role_name or r.observed_label or 'UNMAPPED'}}</span></div>
+<div><small>SAMPLES / LOADOUTS</small><b>{{r.sample_count or 0}} / {{r.loadout_count or 0}}</b><span>{{r.role_category or 'OBSERVATION'}}</span></div>
+<div><small>MOVEMENT EVIDENCE</small><b>{{'%.0f'|format((r.max_speed_mps or 0)*3.6)}} KM/H</b><span>VERT {{'%.1f'|format(r.max_vertical_speed_mps or 0)}} M/S • ALT +{{'%.0f'|format(r.altitude_gain_meters or 0)}} M</span></div>
+<div><small>COMBAT SIGNAL</small><b>{{r.infantry_kills_delta or 0}} INF / {{r.vehicle_kills_delta or 0}} VEH</b><span>{{'VERIFIED' if r.verified else 'OBSERVE'}}</span></div>
+<form method="post" action="{{url_for('hll_role_mapping_action')}}" class="hll-role-map-form"><input type="hidden" name="role_id" value="{{r.role_id}}"><input name="verified_role_name" value="{{r.verified_role_name or ''}}" placeholder="Verified role name" required><select name="role_category"><option>{{r.role_category or 'INFANTRY'}}</option><option>INFANTRY</option><option>LEADERSHIP</option><option>AVIATION</option><option>VEHICLE</option><option>MEDICAL</option><option>SUPPORT</option><option>OTHER</option></select><input name="mos_code" value="{{r.mos_code or ''}}" placeholder="MOS code"><input name="notes" value="{{r.notes or ''}}" placeholder="Test notes"><button>VERIFY MAPPING</button></form>
+{% if r.verified %}<form method="post" action="{{url_for('hll_role_mapping_unverify',role_id=r.role_id)}}"><button class="secondary">RETURN TO OBSERVATION</button></form>{% endif %}
+</div>{% else %}<p class="typed-empty">NO ROLE OBSERVATIONS YET. JOIN THE HLLV SERVER WITH A LINKED SOLDIER.</p>{% endfor %}
+</div></section>
+
+<section class="document-sheet"><header><small>CONTROLLED TEST SUPPORT</small><b>RECENT LINKED-SOLDIER SAMPLES</b></header>
+<div class="hll-sample-grid">{% for x in lab.samples[:30] %}<div><b>{{x.rank_code or ''}} {{x.last_name or x.personnel_id or x.steam_id}}</b><span>ROLE {{x.role_id}} • {{x.loadout or 'NO LOADOUT'}}</span><small>{{x.map_name or '—'}} • {{x.game_mode or '—'}} • {{'%.1f'|format((x.speed_mps or 0)*3.6)}} KM/H • VERT {{'%.1f'|format(x.vertical_speed_mps or 0)}} M/S</small><small>{{x.observed_at}}</small></div>{% else %}<p class="typed-empty">NO LINKED-SOLDIER RESEARCH SAMPLES YET.</p>{% endfor %}</div></section>
+
+<section class="document-sheet"><header><small>MOS EXPERIENCE</small><b>AUTOMATIC PROGRESSION RECOMMENDATIONS</b></header><p class="fine-print">Server-role progression thresholds: III at 1 verified hour, II at 5 hours, I at 15 hours, SENIOR at 30 hours. Instructor remains a separate qualification and is never earned from playtime alone.</p>
+{% for r in lab.recommendations[:40] %}<div class="entry-row"><span>{{r.rank_code}} {{r.last_name|soldier_name(r.first_name)}}</span><b>{{r.mos_code}} — {{r.suggested_level}}</b><small>{{'%.1f'|format(r.hours)}} VERIFIED HOURS AS {{r.role_name}} (ROLE {{r.role_id}})</small></div>{% else %}<p class="typed-empty">NO MOS RECOMMENDATIONS UNTIL ROLE MAPPINGS ARE VERIFIED AND THRESHOLDS ARE MET.</p>{% endfor %}</section>
+{% endblock %}

@@ -1,0 +1,158 @@
+{% extends 'base.html' %}
+{% block title %}Command Desk • {{site_name}}{% endblock %}
+{% block body_class %}page-staff-action-center staff-ux-v2{% endblock %}
+{% block content %}
+<section class="staff-center-hero">
+  <div><small>HEADQUARTERS • BATTALION STAFF</small><h1>COMMAND DESK</h1><p><b>{{role_focus}}</b> • Your work starts here. Handle the red items first, search any Soldier from one place, then move directly to the responsible work center.</p></div>
+  <span class="staff-role-stamp">{{section or 'BATTALION HQ'}}<b>{{session.get('display_name') or session.get('username') or 'STAFF'}}</b></span>
+</section>
+
+<section class="staff-center-shell">
+  <section class="command-triage" aria-label="Command priority">
+    <div class="command-triage__lead">
+      <small>DO THIS NEXT</small>
+      {% if do_next %}
+      <h2>{{do_next.title}}</h2>
+      <p>{{do_next.detail}}</p>
+      <a href="{{url_for(do_next.endpoint)}}">WORK {{do_next.count}} ITEM{{'' if do_next.count == 1 else 'S'}} NOW →</a>
+      {% else %}
+      <h2>NO IMMEDIATE COMMAND ACTION</h2>
+      <p>The live priority queue is clear. Use Soldier Search or review the workflow lanes below.</p>
+      <a href="#soldier-search">SEARCH A SOLDIER →</a>
+      {% endif %}
+    </div>
+    <div class="command-triage__health" aria-label="System health">
+      <header><small>SYSTEM HEALTH</small><b>ONE-GLANCE STATUS</b></header>
+      {% for h in command_service_health %}
+      <a href="{{url_for(h.endpoint)}}" class="command-health-chip state-{{h.state|lower}}"><span>{{h.label}}</span><b>{{h.state}}</b><small>{{h.detail}}</small></a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="command-workflow-lanes" aria-label="Workflow queues">
+    <header><div><small>WORKFLOW QUEUES</small><h2>PEOPLE WAITING ON SOMETHING</h2></div><span>CLICK A QUEUE — GO STRAIGHT TO THE WORK</span></header>
+    <div>
+      {% for lane in workflow_lanes %}
+      <a href="{{url_for(lane.endpoint)}}" class="workflow-lane state-{{lane.state}}"><small>{{lane.label}}</small><strong>{{lane.count}}</strong><span>{{lane.detail}}</span><b>{{'OPEN QUEUE →' if lane.count else 'REVIEW →'}}</b></a>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% if role in ['s1','battalion_hq','commander','admin'] %}
+  <section class="command-assignment-queue" aria-label="Unassigned Soldiers">
+    <header><div><small>ASSIGNMENT DESK</small><h2>NEEDS ASSIGNMENT</h2></div><a class="staff-hi-button" href="{{url_for('staff_assign_soldier')}}">OPEN ASSIGN SOLDIER →</a></header>
+    <div class="command-assignment-list">
+      {% for item in assignment_queue[:6] %}<a class="command-assignment-row" href="{{url_for('staff_assign_soldier',personnel_id=item.person.id)}}"><div><small>{{item.stage}}</small><b>{{item.person.rank_code}} {{item.person.last_name|soldier_name(item.person.first_name)}}</b><span>{{item.next_action}}</span></div><strong>ASSIGN →</strong></a>{% else %}<div class="staff-clear-state"><b>NO SOLDIERS WAITING FOR ASSIGNMENT</b><span>When a replacement reaches assignment-ready status, they will appear here automatically.</span></div>{% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <nav class="staff-task-launcher" aria-label="Common staff tasks">
+    <a href="#soldier-search"><small>PERSONNEL</small><b>FIND SOLDIER</b><span>Open the canonical 201 File</span></a>
+    {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_assign_soldier')}}"><small>S-1 • FAST ACTION</small><b>ASSIGN SOLDIER</b><span>Company → Platoon → Squad → Team</span></a>{% endif %}
+    {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('personnel_actions')}}"><small>S-1</small><b>ACTION SOLDIER</b><span>Transfer • promote • personnel action</span></a>{% endif %}
+    {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_onboarding')}}"><small>ONBOARDING</small><b>WELCOME PACKETS</b><span>Progress • review • archive</span></a>{% endif %}
+    {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('personnel_sync_control')}}"><small>SYSTEM</small><b>SYNC ISSUES</b><span>Website authority • Discord repair</span></a>{% endif %}
+    {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('awards_decorations')}}"><small>HONORS</small><b>AWARDS</b><span>Citations • recommendations • records</span></a>{% endif %}
+  </nav>
+  <section class="command-action-now" aria-label="Command action now">
+    <a class="command-action-card server {{server_seed.seed_state|lower|replace(' ','-')}}" href="{{url_for('hll_telemetry_lab_page')}}"><small>SERVER</small><b>{{server_seed.seed_state}}</b><strong>{{server_seed.player_count}} / {{server_seed.max_players}}</strong><span>{{server_seed.map_name}} • {{server_seed.game_mode}}</span></a>
+    {% set rel_bad = reliability|rejectattr('state','equalto','CURRENT')|list %}
+    <a class="command-action-card {{'attention' if rel_bad else 'clear'}}" href="{{url_for('staff_reliability')}}"><small>AUTOMATION RELIABILITY</small><b>{{rel_bad|length}} SYSTEM{{'' if rel_bad|length == 1 else 'S'}} NEED REVIEW</b><span>{{'Open exception board and work only the failing links.' if rel_bad else 'All audited automation lanes are current.'}}</span></a>
+  </section>
+
+  <section class="staff-automation-strip" aria-label="Automation health">
+    <div class="staff-automation-title"><small>AUTOMATION STATUS</small><b>BACKGROUND SYSTEMS</b><span>Healthy systems stay quiet. Exceptions surface here.</span></div>
+    {% for h in automation_health %}<a class="staff-automation-state state-{{h.state|lower}}" href="{{url_for(h.endpoint)}}"><small>{{h.label}}</small><b>{{h.state}}</b>{% if h.count %}<span>{{h.count}} ITEM{{'' if h.count == 1 else 'S'}}</span>{% else %}<span>NO ACTION REQUIRED</span>{% endif %}</a>{% endfor %}
+  </section>
+
+  <section class="integrity-command-strip" aria-label="Battalion integrity engine">
+    <div class="integrity-command-title"><small>BATTALION INTEGRITY ENGINE</small><b>{{'ALL SYSTEMS CONSISTENT' if integrity.all_clear else (integrity.total|string ~ ' EXCEPTION' ~ ('' if integrity.total == 1 else 'S') ~ ' DETECTED')}}</b><span>Read-only cross-checks compare personnel, Discord, onboarding, M16, awards, training, and Operations without becoming another source of truth.</span></div>
+    <div class="integrity-command-counts"><span class="integrity-red"><b>{{integrity.red}}</b> CRITICAL</span><span class="integrity-amber"><b>{{integrity.amber}}</b> REVIEW</span>{% if role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('battalion_control')}}">OPEN SYSTEM HEALTH →</a>{% endif %}</div>
+  </section>
+
+  <section class="staff-brief-strip staff-brief-links" aria-label="Command quick counts">
+    <a href="{{url_for('smart_personnel_search_page')}}"><small>ASSIGNED</small><strong>{{brief.personnel}}</strong><span>active personnel</span><em>OPEN ROSTER →</em></a>
+    {% if role in ['s1','s3','training','battalion_hq','commander','admin'] %}<a class="status-good" href="{{url_for('morning_report')}}"><small>READY</small>{% else %}<a class="status-good" href="{{url_for('smart_personnel_search_page')}}"><small>READY</small>{% endif %}<strong>{{brief.readiness_pct}}%</strong><span>{{brief.ready}} at 80%+</span><em>OPEN READINESS →</em></a>
+    {% if role in ['battalion_hq','commander','admin'] %}<a class="{{'status-attn' if brief.recruit_review else ''}}" href="{{url_for('accession_pipeline')}}"><small>ACCESSIONS</small><strong>{{brief.replacements}}</strong><span>{{brief.recruit_review}} need review</span><em>OPEN PIPELINE →</em></a>{% endif %}
+    {% if role != 's2' %}<a class="{{'status-attn' if brief.open_actions else ''}}" href="{{url_for('personnel_actions')}}"><small>ACTIONS</small><strong>{{brief.open_actions}}</strong><span>{{brief.overdue}} overdue</span><em>OPEN QUEUE →</em></a>{% else %}<a class="{{'status-attn' if brief.open_actions else ''}}" href="#advanced-staff-tools"><small>SUSPENSE</small><strong>{{brief.open_actions}}</strong><span>{{brief.overdue}} overdue</span><em>OPEN SUSPENSE →</em></a>{% endif %}
+    {% if role in ['s4','battalion_hq','commander','admin'] %}<a class="{{'status-warn' if brief.weapons_due else ''}}" href="{{url_for('arms_room')}}"><small>S-4</small><strong>{{brief.weapons_due}}</strong><span>M16 inspections due</span><em>OPEN ARMS ROOM →</em></a>{% endif %}
+    {% if role in ['s3','training','battalion_hq','commander','admin'] %}<a class="{{'status-warn' if brief.qual_expiring else ''}}" href="{{url_for('training')}}"><small>TRAINING</small><strong>{{brief.qual_expiring}}</strong><span>quals expiring</span><em>OPEN TRAINING →</em></a>{% endif %}
+  </section>
+
+  <section class="staff-center-grid staff-center-top-grid">
+    <article class="document-sheet staff-morning-brief">
+      <header><small>1/5 CAV • MORNING STAFF BRIEF</small><h2>{{today.strftime('%d %b %Y')|upper}}</h2></header>
+      <div class="staff-brief-lines">
+        <p><b>PERSONNEL</b><span>{{brief.personnel}} assigned • {{brief.ready}} ready • {{brief.inactivity7}} on 7-day activity watch</span></p>
+        <p><b>REPLACEMENTS</b><span>{{brief.replacements}} in pipeline • {{brief.recruit_review}} awaiting review</span></p>
+        <p><b>TRAINING</b><span>{{brief.qual_expiring}} qualifications expire within 30 days</span></p>
+        <p><b>S-4</b><span>{{brief.weapons_due}} M16 inspections due</span></p>
+        <p><b>OPERATIONS</b><span>{% if brief.next_op %}{{brief.next_op.operation_code}} — {{brief.next_op.title}} • {{brief.next_op.operation_date}}{% else %}No upcoming operation filed{% endif %}</span></p>
+        <p><b>COMMAND ACTION</b><span>{{attention|sum(attribute='count')}} individual action item{{'' if attention|sum(attribute='count') == 1 else 's'}} across {{attention|length}} category/categories</span></p>
+      </div>
+    </article>
+
+    <article class="document-sheet staff-attention-board">
+      <header><small>BATTALION ACTION QUEUE</small><h2>WHAT NEEDS ACTION NOW</h2><p>{{attention|sum(attribute='count')}} open item{{'' if attention|sum(attribute='count') == 1 else 's'}} across this staff lane. Resolved conditions disappear automatically.</p></header>
+      {% for item in attention %}<a class="staff-attention-row {{item.level}}" href="{{url_for(item.endpoint)}}"><strong>{{item.count}}</strong><div><b>{{item.title}}</b><span>{{item.detail}}</span></div><em>OPEN →</em></a>
+      {% else %}<div class="staff-clear-state"><b>DESK CLEAR</b><span>No immediate staff exceptions are currently flagged.</span></div>{% endfor %}
+    </article>
+  </section>
+
+  <article id="soldier-search" class="document-sheet staff-search-desk">
+    <header><div><small>UNIVERSAL PERSONNEL SEARCH</small><h2>FIND A SOLDIER</h2></div><span>NAME • BR / SERVICE # • DISCORD • STEAM / GAMERTAG • UNIT • ORDER #</span></header>
+    <form method="get" action="{{url_for('staff_action_center')}}" class="staff-search-form"><input name="q" value="{{search_query}}" placeholder="Name, BR #, Discord, Steam ID, Gamertag, assignment or order #…" autocomplete="off"><button type="submit">SEARCH</button>{% if search_query %}<a href="{{url_for('staff_action_center')}}">CLEAR</a>{% endif %}</form>
+    {% if search_query %}<div class="staff-search-results">
+      {% for p in search_rows %}<article class="staff-search-result">
+        <div><small>{{p.rank_code}} • {{p.unit_code}}</small><b>{{p.last_name|soldier_name(p.first_name)}}</b><span>{{p.duty_position or p.mos_code}}{% if p.discord_username %} • @{{p.discord_username}}{% endif %}{% if p.game_identity %} • {{p.game_identity}}{% elif p.steam_id %} • STEAM {{p.steam_id}}{% endif %}</span></div>
+        <div class="staff-search-status"><strong>{{p.readiness_percent or 0}}%</strong><span>{{p.readiness_status}}</span></div>
+        <div class="staff-search-result-actions"><a href="{{url_for('personnel_service_record',personnel_id=p.id)}}">OPEN 201 FILE</a>{% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_assign_soldier',personnel_id=p.id)}}">ASSIGN</a>{% endif %}<button type="button" data-soldier-action-url="{{url_for('staff_personnel_drawer',personnel_id=p.id)}}">QUICK ACTIONS</button></div>
+      </article>{% else %}<p class="staff-empty">NO PERSONNEL MATCHED “{{search_query}}”.</p>{% endfor %}
+    </div>{% endif %}
+  </article>
+
+  <section class="staff-work-center-block">
+    <header><small>STAFF DIRECTORY</small><h2>WORK CENTERS</h2><p>Choose the job you need to perform. Each work center opens the existing authoritative system for that function.</p></header>
+    <nav class="staff-office-grid staff-office-grid--primary" aria-label="Staff work centers">
+      {% if role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('recruiting_control')}}"><b>RECRUITING</b><span>Applications • approvals • replacement intake</span></a>{% endif %}
+      {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('personnel_office')}}"><b>S-1 PERSONNEL</b><span>Roster • 201 Files • assignments • onboarding</span></a>{% endif %}
+      {% if role in ['s3','training','battalion_hq','commander','admin'] %}<a href="{{url_for('operations')}}"><b>S-3 OPERATIONS</b><span>Operations • attendance • training • AARs</span></a>{% endif %}
+      {% if role in ['s4','battalion_hq','commander','admin'] %}<a href="{{url_for('arms_room')}}"><b>S-4 SUPPLY</b><span>M16s • inspections • equipment • property</span></a>{% endif %}
+      {% if role in ['s3','battalion_hq','commander','admin'] %}<a href="{{url_for('hll_telemetry_lab_page')}}"><b>SERVER OPERATIONS</b><span>Live HLL • identity links • roles • telemetry</span></a>{% endif %}
+      {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('awards_decorations')}}"><b>HONORS</b><span>Awards • citations • recommendations</span></a>{% endif %}
+      {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_formation_control')}}"><b>ORGANIZATION</b><span>Companies • platoons • squads • billets</span></a>{% endif %}
+      {% if role in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('personnel_sync_control')}}"><b>SYNC CONTROL</b><span>Website authority • Discord reconciliation • automation ledger</span></a>{% endif %}
+      {% if role in ['s1','s3','s4','training','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_reliability')}}"><b>SYSTEM HEALTH</b><span>Automation reliability • exceptions • telemetry</span></a>{% endif %}
+      {% if role in ['s1','s3','training','battalion_hq','commander','admin'] %}<a href="{{url_for('morning_report')}}"><b>REPORTS</b><span>Morning report • readiness • activity • suspense</span></a>{% endif %}
+    </nav>
+  </section>
+
+  {% if role in ['s1','battalion_hq','commander','admin'] %}<section class="staff-center-grid s1-command-work-grid"><article class="document-sheet"><header><small>S-1 PRIORITY WORK</small><h2>REPLACEMENTS NEEDING ACTION</h2><a href="{{url_for('replacement_detachment')}}">OPEN DETACHMENT →</a></header>{% for item in priority_work[:6] %}<button type="button" class="staff-action-row staff-action-button" data-soldier-action-url="{{url_for('staff_personnel_drawer',personnel_id=item.person.id)}}"><div><small>{{item.stage}}</small><b>{{item.person.rank_code}} {{item.person.last_name|soldier_name(item.person.first_name)}}</b><span>{{item.next_action}}</span></div><strong>ACTION</strong></button>{% else %}<p class="staff-empty">NO REPLACEMENTS REQUIRE S-1 ACTION.</p>{% endfor %}</article><article class="document-sheet"><header><small>PERSONNEL EXCEPTIONS</small><h2>AUTOMATIC INTEGRITY CHECK</h2></header>{% for e in personnel_exceptions[:6] %}<button type="button" class="staff-action-row staff-action-button priority-{{e.severity}}" data-soldier-action-url="{{url_for('staff_personnel_drawer',personnel_id=e.person.id)}}"><div><small>{{e.type}}</small><b>{{e.person.rank_code}} {{e.person.last_name|upper}}</b><span>{{e.detail}}</span></div><strong>FIX</strong></button>{% else %}<p class="staff-empty">NO PERSONNEL EXCEPTIONS DETECTED.</p>{% endfor %}</article></section>{% endif %}
+  <section class="staff-center-grid staff-integrity-change-grid">
+    <article class="document-sheet staff-integrity-preview"><header><small>INTEGRITY EXCEPTIONS</small><h2>CROSS-SYSTEM CONFLICTS</h2>{% if role in ['battalion_hq','commander','admin'] %}<a href="{{url_for('battalion_control')}}">FULL HEALTH BOARD →</a>{% endif %}</header>
+      {% for e in integrity.issues[:6] %}<a class="staff-action-row priority-{{e.severity}}" href="{{url_for(e.endpoint)}}"><div><small>{{e.code|replace('_',' ')}}</small><b>{{e.title}}</b><span>{{e.detail}}</span></div><strong>{{'FIX' if e.severity == 'red' else 'REVIEW'}}</strong></a>{% else %}<div class="staff-clear-state"><b>NO CONFLICTS DETECTED</b><span>Personnel, automation, and record relationships currently agree.</span></div>{% endfor %}
+    </article>
+    <article class="document-sheet staff-change-feed"><header><small>SINCE LAST CHECK</small><h2>WHAT CHANGED</h2></header>
+      {% for a in change_feed[:8] %}<div class="staff-recent-row"><time>{{a.created_at.strftime('%d %b • %H:%M') if a.created_at else ''}}</time><div><b>{{a.category}}</b><span>{{a.title}}</span></div><small>{{a.actor or a.section}}</small></div>{% else %}<p class="staff-empty">NO RECENT CHANGES FILED.</p>{% endfor %}
+    </article>
+  </section>
+
+  <section class="staff-center-grid">
+    <article class="document-sheet staff-open-actions"><header><small>STAFF SUSPENSE</small><h2>ACTIVE ACTIONS</h2><a href="{{url_for('personnel_actions')}}">OPEN ACTION CONTROL →</a></header>
+      {% for a in open_actions %}<a class="staff-action-row priority-{{(a.priority or 'ROUTINE')|lower}}" href="{{url_for('personnel_actions', action_id=a.id)}}#action-{{a.id}}"><div><small>{{a.owning_section}} • {{a.priority}}</small><b>{{a.subject}}</b><span>{% if a.last_name %}{{a.rank_code}} {{a.last_name|soldier_name(a.first_name)}}{% else %}BATTALION ACTION{% endif %}</span></div><strong>{{a.status}}</strong><time>{{a.due_date or 'NO DUE DATE'}}</time></a>{% else %}<p class="staff-empty">NO OPEN ACTIONS AT THIS DESK.</p>{% endfor %}
+    </article>
+    <article class="document-sheet staff-recent-actions"><header><small>AUDIT LEDGER</small><h2>RECENT STAFF ACTIONS</h2></header>
+      {% for a in recent_actions %}<div class="staff-recent-row"><time>{{a.created_at.strftime('%d %b • %H:%M') if a.created_at else ''}}</time><div><b>{{a.action_type}}</b><span>{{a.summary}}</span></div><small>{{a.actor or a.section}}</small></div>{% else %}<p class="staff-empty">NO RECENT STAFF ACTIONS FILED.</p>{% endfor %}
+    </article>
+  </section>
+
+  {% if role != 's2' %}<details class="staff-advanced-tools"><summary><span><small>ADVANCED STAFF TOOL</small><b>BATCH ACTION DESK</b></span><em>OPEN ONLY WHEN NEEDED →</em></summary><article class="document-sheet staff-batch-desk"><header><small>BATCH ACTION DESK</small><h2>ROUTE THE SAME ACTION TO MULTIPLE SOLDIERS</h2><p>This opens individual auditable staff actions; it does not silently alter personnel records.</p></header>
+    <form method="post" action="{{url_for('staff_batch_action')}}" class="staff-batch-form"><label>ACTION TYPE<select name="action_type"><option>TRAINING</option><option>QUALIFICATION</option><option>PERSONNEL</option><option>ASSIGNMENT</option><option>WEAPON</option><option>EQUIPMENT</option><option>COMMAND REVIEW</option></select></label>
+    {% if role in ['battalion_hq','commander','admin'] %}<label>ROUTE TO<select name="owning_section"><option>S-1</option><option>S-3</option><option>S-4</option><option>HQ</option></select></label>{% endif %}
+    <label class="wide">SUBJECT<input name="subject" required placeholder="Example: Annual rifle qualification due"></label><label class="wide">REMARKS<input name="remarks" placeholder="Instructions / background"></label>
+    <fieldset class="staff-batch-people"><legend>SELECT SOLDIERS</legend>{% for p in personnel_choices %}<label><input type="checkbox" name="personnel_ids" value="{{p.id}}"><span>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}} <small>{{p.unit_code}}</small></span></label>{% endfor %}</fieldset><button type="submit">FILE BATCH ACTION</button></form>
+  </article></details>{% endif %}
+<details id="advanced-staff-tools" class="staff-advanced-tools"><summary><span><small>ADVANCED STAFF TOOLS</small><b>SUSPENSE / WATCHLIST / COMPARE</b></span><em>OPEN ONLY WHEN NEEDED →</em></summary><section class="staff-deep-control"><article class="document-sheet suspense-board"><header><small>STAFF SUSPENSE</small><h2>DUE DATES</h2></header><div><span><b>{{suspense_summary.due_today or 0}}</b>DUE TODAY</span><span><b>{{suspense_summary.due_7 or 0}}</b>NEXT 7 DAYS</span><span><b>{{suspense_summary.overdue or 0}}</b>OVERDUE</span></div></article>{% if role in ['battalion_hq','commander','admin'] %}<article class="document-sheet"><header><small>COMMAND</small><h2>WATCHLIST</h2></header>{% for w in command_watchlist[:5] %}<p><b>{{w.watch_type}}</b> — {{w.rank_code}} {{w.last_name|upper}}</p>{% else %}<p class="typed-empty">NO OPEN ITEMS.</p>{% endfor %}<a class="staff-hi-button" href="{{url_for('command_watchlist_page')}}">OPEN COMMAND WATCHLIST</a></article>{% endif %}<article class="document-sheet"><header><small>PERSONNEL INDEX</small><h2>ADVANCED SEARCH & COMPARE</h2></header><p>Search by readiness, inactivity, MOS, billet, rank, unit, or weapon state.</p><a class="staff-hi-button" href="{{url_for('smart_personnel_search_page')}}">SMART PERSONNEL SEARCH</a><a class="staff-hi-button secondary" href="{{url_for('personnel_compare_page')}}">COMPARE SOLDIERS</a></article></section></details></section>
+
+{% endblock %}

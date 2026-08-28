@@ -1,0 +1,341 @@
+{% extends 'base.html' %}
+{% block title %}201 File • {{site_name}}{% endblock %}
+{% block body_class %}page-201{% endblock %}
+{% block content %}
+<section class="file-cabinet-room phase3-201">
+  {% if member_preview_mode %}<aside class="staff-member-preview-banner"><div><small>STAFF PREVIEW MODE • READ ONLY</small><b>MEMBER 201 FILE VIEW</b><span>This is the Soldier-facing 201 File. No record can be changed from preview mode.</span></div><button type="button" onclick="history.back()">← RETURN TO STAFF</button></aside>{% endif %}
+  <header class="room-label"><span>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY</span><h1>S-1 PERSONNEL TENT • INDIVIDUAL 201 FILE</h1><p class="room-subcopy">Inside this battalion personnel tent, the Soldier's 201 jacket records assignment, issued government property, operations, qualifications, awards, and the progress of his tour in-country.</p></header>
+  <div class="manila-file">
+    <div class="manila-tab">{% if personnel %}{{personnel.last_name|soldier_name(personnel.first_name, true)}}{% else %}UNASSIGNED{% endif %}</div>
+    {% if personnel %}
+    {% if session.get('access_role') in ['s1','s2','s3','s4','training','battalion_hq','commander','admin'] and not member_preview_mode|default(false) %}
+    <section id="staff-actions" class="staff-201-jacket-cover" aria-label="Staff Soldier action cover">
+      <div class="staff-201-jacket-identity">
+        <small>DEPARTMENT OF THE ARMY • S-1 PERSONNEL JACKET</small>
+        <h2>{{personnel.rank_code or ''}} {{personnel.last_name|soldier_name(personnel.first_name)}}</h2>
+        <p class="staff-201-jacket-subline">{{personnel.unit_code or '1/5 CAV'}}{% if personnel.platoon %} • {{personnel.platoon|formation_label}}{% endif %}{% if personnel.squad %} • {{personnel.squad|formation_label}}{% endif %}{% if personnel.fire_team %} • {{personnel.fire_team|formation_label}}{% endif %}</p>
+        <div class="staff-201-jacket-facts">
+          <span><small>BATTLE ROSTER</small><b>{{roster_card.roster_number if roster_card else 'NOT ISSUED'}}</b></span>
+          <span><small>BILLET</small><b>{{current_situation.duty or 'UNASSIGNED'}}</b></span>
+          <span><small>MOS</small><b>{{current_situation.mos_code or '—'}}{% if current_situation.mos_title %} • {{current_situation.mos_title}}{% endif %}</b></span>
+          <span><small>DUTY STATUS</small><b>{{personnel.personnel_status_label or 'ACTIVE'}}</b></span>
+          <span class="sync-state {{'is-error' if discord_sync and discord_sync.status=='FAILED' else 'is-pending' if discord_sync and discord_sync.status=='PENDING' else 'is-current'}}"><small>RECORD SYNC</small><b>{% if discord_sync %}{{discord_sync.status}}{% else %}CURRENT{% endif %}</b></span>
+        </div>
+      </div>
+      <div class="staff-201-jacket-actions">
+        <a class="staff-201-action-main" href="{{url_for('staff_personnel_manage',personnel_id=personnel.id)}}"><b>ACTION SOLDIER</b><span>MAKE A PERSONNEL, AWARD, TRAINING, NOTE, OR S-4 ACTION</span></a>
+        {% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_formation_control')}}"><b>FORMATION CONTROL</b><span>FILL / CHANGE SQUAD, TEAM, AND LEADERSHIP BILLETS</span></a>{% endif %}
+        <a href="#active-service"><b>VIEW FULL RECORD</b><span>GO TO PERMANENT ACTIVE-SERVICE HISTORY</span></a><a href="{{url_for('staff_personnel_member_preview',personnel_id=personnel.id)}}"><b>PREVIEW AS MEMBER</b><span>READ-ONLY SOLDIER-FACING 201 FILE</span></a>
+      </div>
+      <nav class="staff-201-jacket-shortcuts" aria-label="Quick Soldier actions">
+        {% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_personnel_manage',personnel_id=personnel.id,action='PERSONNEL_CONTROL')}}">PERSONNEL</a><a href="{{url_for('staff_personnel_manage',personnel_id=personnel.id,action='AWARD')}}">AWARD</a>{% endif %}
+        {% if session.get('access_role') in ['s3','training','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_personnel_manage',personnel_id=personnel.id,action='TRAINING')}}">TRAINING</a>{% endif %}
+        {% if session.get('access_role') in ['s4','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_personnel_manage',personnel_id=personnel.id,action='WEAPON')}}">M16 / S-4</a>{% endif %}
+        {% if session.get('access_role') in ['s1','s3','s4','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_personnel_manage',personnel_id=personnel.id,action='COMMAND_REMARK')}}">FILE NOTE</a>{% endif %}
+      </nav>
+      {% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] %}
+      <section class="staff-login-delivery-card" aria-label="Member login credential delivery">
+        <header><small>BATTALION CLERK • MEMBER ACCESS</small><b>LOGIN CREDENTIAL DELIVERY</b></header>
+        {% if recruit_login_case %}
+        <div class="staff-login-delivery-status">
+          <span><small>CASE</small><b>{{recruit_login_case.case_number}}</b></span>
+          <span><small>DISCORD</small><b>{{recruit_login_case.discord_verified_username or recruit_login_case.discord_user_id or 'NOT LINKED'}}</b></span>
+          <span><small>STATUS</small><b class="{{'is-sent' if recruit_login_case.credentials_sent_at else ('is-error' if recruit_login_case.credentials_delivery_error else 'is-queued')}}">{{'SENT' if recruit_login_case.credentials_sent_at else ('ERROR' if recruit_login_case.credentials_delivery_error else 'QUEUED')}}</b></span>
+          <span><small>LAST ATTEMPT</small><b>{{recruit_login_case.credentials_last_attempt_at or 'NONE'}}</b></span>
+        </div>
+        {% if recruit_login_case.credentials_delivery_error %}<p class="staff-login-delivery-error"><b>LAST ERROR:</b> {{recruit_login_case.credentials_delivery_error}}</p>{% endif %}
+        {% if recruit_login_case.credentials_resend_requested_at %}<p class="staff-login-delivery-pending"><b>DELIVERY REQUEST QUEUED:</b> {{recruit_login_case.credentials_resend_requested_at}}</p>{% endif %}
+        {% if recruit_login_case.discord_user_id %}
+        <form method="post" action="{{url_for('staff_personnel_send_login_info',personnel_id=personnel.id)}}" class="staff-login-delivery-form" onsubmit="return confirm('Send this Soldier's website login information by Battalion Clerk DM?');">
+          {% if recruit_login_case.credentials_sent_at and not recruit_login_case.credentials_pending_field_code_enc %}
+          <label><input type="checkbox" name="rotate_field_code" value="YES" required><span><b>ROTATE FIELD CODE &amp; SEND AGAIN</b><small>The previous plaintext Field Code was discarded after successful delivery. This creates a new Field Code and invalidates the old one.</small></span></label>
+          {% else %}<input type="hidden" name="rotate_field_code" value="NO">{% endif %}
+          <button type="submit" class="paper-action button-reset"><span>SEND LOGIN INFO NOW</span><small>BATTALION CLERK DIRECT MESSAGE</small></button>
+          <a class="staff-login-delivery-history-link" href="{{url_for('recruiting_case_archive',case_id=recruit_login_case.id)}}">OPEN DELIVERY HISTORY →</a>
+        </form>
+        {% else %}<p class="staff-login-delivery-error">A Discord account must be linked before Battalion Clerk can send login credentials.</p>{% endif %}
+        {% else %}<p class="staff-login-delivery-error">No Recruiting Case is linked to this 201 File. Use S-1 credential controls for legacy members.</p>{% endif %}
+      </section>
+      {% endif %}
+    </section>
+    {% endif %}
+    {% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] and welcome_packet and welcome_packet.packet %}
+    <section class="staff-201-onboarding-card"><div><small>NEW SOLDIER ONBOARDING</small><b>WELCOME PACKET</b><span>{{welcome_packet.percent}}% COMPLETE • {{welcome_packet.packet.status|replace('_',' ')}}</span></div><a href="{{url_for('staff_welcome_packet',personnel_id=personnel.id)}}">VIEW / MANAGE PACKET →</a></section>
+    {% endif %}
+    {% if record_return_url %}
+    <nav class="canonical-201-context-nav" aria-label="Soldier record navigation">
+      {% if previous_id %}<a href="{{url_for('squad_soldier_combat_record',personnel_id=previous_id)}}">← PREVIOUS SOLDIER</a>{% endif %}
+      <a href="{{record_return_url}}">{{record_return_label or 'BACK TO FORMATION'}}</a>
+      {% if next_id %}<a href="{{url_for('squad_soldier_combat_record',personnel_id=next_id)}}">NEXT SOLDIER →</a>{% endif %}
+    </nav>
+    {% endif %}
+
+    <section class="canonical-201-header document-sheet">
+      <header class="army-letterhead compact">
+        <small>PERSONNEL SERVICE DISPLAY • INDIVIDUAL 201 FILE</small>
+        <strong>{{personnel.rank_code or '—'}} {{personnel.last_name|soldier_name(personnel.first_name)}}</strong>
+        <span>{{current_situation.duty or personnel.duty_position or personnel.mos_code or 'SOLDIER'}} • {{personnel.unit_code or '1/5 CAV'}}{% if personnel.platoon %} • {{personnel.platoon|formation_label}}{% endif %}{% if personnel.squad %} • {{personnel.squad|formation_label}}{% endif %}{% if personnel.fire_team %} • {{personnel.fire_team|formation_label}}{% endif %}</span>
+      </header>
+    </section>
+
+    <nav class="canonical-201-tabs" aria-label="201 file tabs" data-201-tabs>
+      <button type="button" data-201-tab="overview" class="is-active">OVERVIEW</button>
+      <button type="button" data-201-tab="m16">M16</button>
+      <button type="button" data-201-tab="career">CAREER</button>
+      <button type="button" data-201-tab="qualifications">QUALIFICATIONS</button>
+      <button type="button" data-201-tab="awards">AWARDS</button>
+      <button type="button" data-201-tab="orders">ORDERS</button>
+      <button type="button" data-201-tab="readiness">READINESS</button>
+      <button type="button" data-201-tab="service">SERVICE RECORD</button>
+      {% if welcome_packet and welcome_packet.packet %}<button type="button" data-201-tab="onboarding">ONBOARDING</button>{% endif %}
+      {% if session.get('access_role') in ['s1','s2','s3','s4','training','battalion_hq','commander','admin'] %}<button type="button" data-201-tab="admin">ADMIN</button>{% endif %}
+    </nav>
+
+    <section class="canonical-201-overview" data-201-panel="overview">
+      <article class="document-sheet canonical-201-overview-sheet">
+        <div class="canonical-201-top-grid">
+          <section class="canonical-201-uniform canonical-201-field-uniform">
+            <h3>{{personnel.rank_code or ''}} {{personnel.last_name|soldier_name(personnel.first_name)}}</h3>
+            <div class="squad-uniform-stage squad-combat-uniform-stage canonical-201-field-uniform-stage">
+              <img class="uniform-base-image canonical-201-field-uniform-image" src="{{url_for('static',filename='art/member/201-overview-field-uniform.webp')}}" alt="{{personnel.rank_code or ''}} {{personnel.last_name|soldier_name(personnel.first_name)}} field uniform">
+            </div>
+            <div class="canonical-201-facts">
+              <span><small>RANK</small><b>{{personnel.rank_code or '—'}}</b></span>
+              <span><small>ASSIGNMENT</small><b>{{personnel.unit_code or '—'}}{% if personnel.platoon %} • {{personnel.platoon|formation_label}}{% endif %}{% if personnel.squad %} • {{personnel.squad|formation_label}}{% endif %}{% if personnel.fire_team %} • {{personnel.fire_team|formation_label}}{% endif %}</b></span>
+              <span><small>DUTY</small><b>{{current_situation.duty or personnel.duty_position or personnel.mos_code or 'SOLDIER'}}</b></span>
+              <span><small>COMBAT EXPERIENCE</small><b>{{current_situation.combat_experience or 'NEW ARRIVAL'}}</b></span>
+              <span><small>AWARDS</small><b>{{earned_ribbons|length}}</b></span>
+              <span><small>READINESS</small><b>{{current_situation.readiness_percent or personnel.readiness_percent or 0}}%</b></span>
+            </div>
+          </section>
+
+          <section class="canonical-201-service">
+            <header><small>COMBAT RECORD</small><h2>VERIFIED FIELD SERVICE</h2></header>
+            <div class="squad-combat-stat-grid">
+              <article><small>IN THE SHIT</small><b>{{(hll_stats.totals.connected_seconds or 0)//3600}}h {{((hll_stats.totals.connected_seconds or 0)%3600)//60}}m</b><span>Verified server service</span></article>
+              <article><small>OPERATIONS</small><b>{{current_situation.operations or 0}}</b><span>Credited battalion operations</span></article>
+              <article><small>KILLS</small><b>{{hll_stats.totals.infantry_kills or 0}}</b><span>Verified combat record</span></article>
+              <article><small>DEATHS</small><b>{{hll_stats.totals.deaths or 0}}</b><span>Verified combat record</span></article>
+              <article><small>BLUE ON BLUE</small><b>{{hll_stats.totals.team_kills or 0}}</b><span>Recorded team kills</span></article>
+              <article><small>DISTANCE</small><b>{{'%.1f'|format((hll_stats.totals.distance_meters or 0)/1000)}} KM</b><span>Verified movement</span></article>
+            </div>
+            {% if hll_stats.role_ledger %}<section class="squad-combat-section"><small>ROLE EXPERIENCE</small><h3>VERIFIED ROLE SERVICE</h3><div class="squad-combat-ledger">{% for x in hll_stats.role_ledger[:10] %}<span><b>{{x.display_name}}</b><em>{{x.seconds//3600}}h {{(x.seconds%3600)//60}}m</em></span>{% endfor %}</div></section>{% endif %}
+            {% if hll_stats.leadership_experience and hll_stats.leadership_experience.total_seconds %}<section class="squad-combat-section"><small>LEADERSHIP EXPERIENCE</small><h3>{{hll_stats.leadership_experience.total_seconds//3600}}h {{(hll_stats.leadership_experience.total_seconds%3600)//60}}m VERIFIED</h3><p>{% for x in hll_stats.leadership_experience.roles %}{{x.display_name}} — {{x.seconds//3600}}h {{(x.seconds%3600)//60}}m{% if not loop.last %} • {% endif %}{% endfor %}</p></section>{% endif %}
+            {% if hll_stats.armor_service and hll_stats.armor_service.active %}<section class="squad-combat-section"><small>ARMORED SERVICE</small><h3>{{hll_stats.armor_service.total_seconds//3600}}h {{(hll_stats.armor_service.total_seconds%3600)//60}}m</h3><p>CREWMAN {{hll_stats.armor_service.crewman_seconds//3600}}h {{(hll_stats.armor_service.crewman_seconds%3600)//60}}m • TANK COMMANDER {{hll_stats.armor_service.tank_commander_seconds//3600}}h {{(hll_stats.armor_service.tank_commander_seconds%3600)//60}}m</p></section>{% endif %}
+            {% if hll_stats.aviation_service and (hll_stats.aviation_service.pilot_seconds or hll_stats.aviation_service.slick_seconds) %}<section class="squad-combat-section"><small>AIR CAV SERVICE</small><h3>{{hll_stats.aviation_service.pilot_seconds//3600}}h {{(hll_stats.aviation_service.pilot_seconds%3600)//60}}m FLIGHT TIME</h3><p>{{'%.1f'|format((hll_stats.aviation_service.pilot_distance_meters or 0)/1000)}} KM FLIGHT DISTANCE • {{hll_stats.aviation_service.slick_seconds//3600}}h {{(hll_stats.aviation_service.slick_seconds%3600)//60}}m SLICK RIDES</p></section>{% endif %}
+            {% if m16_service and m16_service.available %}<section class="squad-combat-section"><small>M16 WEAPON SERVICE</small><h3>{{m16_service.verified_field_seconds//3600}}h {{(m16_service.verified_field_seconds%3600)//60}}m VERIFIED SERVER SERVICE</h3><p>{{'%.1f'|format((m16_service.verified_distance_meters or 0)/1000)}} KM • {{m16_service.operations_carried or 0}} OPERATIONS • {{m16_service.map_count or 0}} AREAS OF OPERATIONS</p><button type="button" class="canonical-inline-tab-jump" data-open-201-tab="m16">OPEN COMPLETE M16 RECORD →</button></section>{% endif %}
+            <section class="squad-combat-section"><small>CHAIN OF COMMAND</small><h3>CURRENT LEADERSHIP</h3>{% for c in chain_of_command[:6] %}<p><b>{{c.appointment_name or c.duty_position or c.role_name or 'LEADER'}}</b> — {{c.rank_code or ''}} {{c.last_name|soldier_name(c.first_name)}}</p>{% else %}<p>NO CURRENT LEADERSHIP CHAIN FILED.</p>{% endfor %}</section>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <section id="situation" class="file-document document-sheet current-situation-sheet">
+      <header><small>HEADQUARTERS • CURRENT FILE STATUS</small><b>CURRENT SITUATION</b><span>AT-A-GLANCE SOLDIER STATUS</span></header>
+      <div class="situation-grid"><span>RANK<b>{{current_situation.rank or '—'}}</b></span><span>MOS<b>{{current_situation.mos_code or '—'}} — {{current_situation.mos_title or ''}}</b></span><span>ASSIGNMENT<b>{{current_situation.assignment or '—'}}</b></span><span>DUTY<b>{{current_situation.duty or '—'}}</b></span><span>WEAPON<b>{{current_situation.weapon or 'NONE'}}</b></span><span>READINESS<b>{{current_situation.readiness_percent}}% {{current_situation.readiness_status}}</b></span><span>TOUR<b>DAY {{current_situation.tour_day}} • {{current_situation.tour_phase}}{% if current_situation.days_to_deros is not none %} • {{current_situation.days_to_deros}} DAYS TO DEROS{% endif %}</b></span><span>OPERATIONS<b>{{current_situation.operations}}</b></span><span>EXPERIENCE<b>{{current_situation.combat_experience}}</b></span><span>LAST ACTIVITY<b>{% if current_situation.last_activity_days is not none %}{{current_situation.last_activity_days}} DAYS AGO{% else %}NO ACTIVITY FILED{% endif %}</b></span></div>
+      {% if field_reputation %}<div class="reputation-row">{% for r in field_reputation %}<span title="{{r.detail}}">{{r.label}}</span>{% endfor %}</div>{% endif %}
+      <div class="tour-phase-strip" aria-label="Tour of duty progression">{% for phase in ['NEW IN COUNTRY','ESTABLISHED','MID-TOUR','SHORT TIMER','DEROS PENDING','TOUR COMPLETE'] %}<span class="{% if current_situation.tour_phase==phase %}current{% endif %}">{{phase}}</span>{% endfor %}</div>
+    </section>
+    {% if welcome_packet and welcome_packet.packet %}
+    <section id="orientation-record" class="file-document document-sheet orientation-record-sheet"><header><small>S-1 • PERMANENT ONBOARDING RECORD</small><b>WELCOME PACKET / ORIENTATION</b><span>{{welcome_packet.packet.status|replace('_',' ')}}</span></header><div class="orientation-record-grid"><span>GENERATED<b>{{welcome_packet.packet.generated_at.strftime('%d %b %Y') if welcome_packet.packet.generated_at and welcome_packet.packet.generated_at.strftime else welcome_packet.packet.generated_at}}</b></span><span>PROGRESS<b>{{welcome_packet.done}} / {{welcome_packet.total}} • {{welcome_packet.percent}}%</b></span><span>CURRENT PHASE<b>{{welcome_packet.packet.current_phase|replace('_',' ')}}</b></span><span>COMPLETED<b>{{welcome_packet.packet.completed_at.strftime('%d %b %Y') if welcome_packet.packet.completed_at and welcome_packet.packet.completed_at.strftime else (welcome_packet.packet.completed_at or 'IN PROGRESS')}}</b></span></div><div class="orientation-record-actions">{% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] %}<a href="{{url_for('staff_welcome_packet',personnel_id=personnel.id)}}">OPEN COMMAND PACKET VIEW →</a>{% elif session.get('access_role') in ['member','nco','company_hq'] and not read_only_peer %}<a href="{{url_for('welcome_packet')}}">OPEN MY WELCOME PACKET →</a>{% endif %}</div></section>
+    {% endif %}
+    <section class="file-document document-sheet served-with-sheet"><header><small>S-3 • SERVICE ASSOCIATIONS</small><b>MOST SERVED WITH</b><span>SHARED CREDITED OPERATIONS</span></header><div class="served-grid">{% for x in most_served_with %}<span><b>{{x.rank_code}} {{x.last_name|upper}}</b><small>{{x.shared_operations}} SHARED OPERATIONS</small></span>{% else %}<p class="typed-empty">NOT ENOUGH OPERATION HISTORY YET.</p>{% endfor %}</div></section>
+    {% if journal_entries %}<section class="file-document document-sheet"><header><small>PERSONAL FIELD JOURNAL</small><b>SOLDIER JOURNAL ENTRIES</b><span>UNIT-VISIBLE ENTRIES</span></header>{% for e in journal_entries[:10] %}<div class="journal-file-entry"><time>{{e.entry_date}}</time><b>{{e.title}}</b><p>{{e.body}}</p></div>{% endfor %}</section>{% endif %}
+
+    
+<section id="combat-record" class="file-document document-sheet hll-combat-record">
+  <header><small>S-3 • BATTALION CLERK TELEMETRY</small><b>COMBAT RECORD / FIELD SERVICE STATISTICS</b><span>HLL: VIETNAM SERVER RECORD</span></header>
+  {% if hll_stats.linked %}
+  <div class="hll-record-summary">
+    <span>COMBAT HOURS<b>{{'%.1f'|format(hll_stats.totals.connected_seconds / 3600)}}</b></span>
+    <span>DISTANCE TRAVELED<b>{{'%.1f'|format(hll_stats.totals.distance_meters / 1000)}} KM</b></span>
+    <span>IN THE SHIT<b>{{hll_stats.totals.matches}}</b></span>
+    <span>INFANTRY KILLS<b>{{hll_stats.totals.infantry_kills}}</b></span>
+    <span>DEATHS<b>{{hll_stats.totals.deaths}}</b></span>
+    <span>BLUE ON BLUE<b>{{hll_stats.totals.blue_on_blue or 0}}</b></span>
+    <span>VEHICLE KILLS<b>{{hll_stats.totals.vehicle_kills}}</b></span>
+    <span>VEHICLES DESTROYED<b>{{hll_stats.totals.vehicles_destroyed}}</b></span>
+    <span>ARMOR TIME<b>{{hll_stats.armor_service.total_seconds//3600}}h {{(hll_stats.armor_service.total_seconds%3600)//60}}m</b></span>
+    <span>SLICK RIDES<b>{% if hll_stats.aviation_service %}{{hll_stats.aviation_service.slick_seconds//3600}}h {{(hll_stats.aviation_service.slick_seconds%3600)//60}}m • {{'%.1f'|format(hll_stats.aviation_service.slick_distance_meters/1000)}} KM{% else %}0h 0m • 0.0 KM{% endif %}</b></span>
+    <span>K / D RATIO<b>{{'%.2f'|format(hll_stats.totals.kd_ratio or 0)}}</b></span>
+    <span>TOTAL SCORE<b>{{hll_stats.totals.score_total or 0}}</b></span>
+  </div>
+  <div class="hll-record-verification"><b>FIELD VERIFIED</b><span>Field-service figures are automatically filed from recorded battalion server activity.</span></div>
+  <div class="hll-score-strip"><span>COMBAT <b>{{hll_stats.totals.combat_score}}</b></span><span>OFFENSE <b>{{hll_stats.totals.offense_score}}</b></span><span>DEFENSE <b>{{hll_stats.totals.defense_score}}</b></span><span>SUPPORT <b>{{hll_stats.totals.support_score}}</b></span></div>
+  <div class="hll-service-intelligence"><article><small>PRIMARY OBSERVED ROLE</small><b>{% if hll_stats.primary_role %}{{hll_stats.primary_role.display_name}}{% else %}NOT YET ESTABLISHED{% endif %}</b><span>{% if hll_stats.primary_role %}{{hll_stats.primary_role.seconds//3600}}h {{(hll_stats.primary_role.seconds%3600)//60}}m observed{% else %}Role time begins with linked server play.{% endif %}</span></article><article><small>ARMORED SERVICE</small><b>{{hll_stats.armor_service.total_seconds//3600}}h {{(hll_stats.armor_service.total_seconds%3600)//60}}m ARMOR TIME</b><span>CREWMAN — {{hll_stats.armor_service.crewman_seconds//3600}}h {{(hll_stats.armor_service.crewman_seconds%3600)//60}}m • TANK COMMANDER — {{hll_stats.armor_service.tank_commander_seconds//3600}}h {{(hll_stats.armor_service.tank_commander_seconds%3600)//60}}m.</span></article><article><small>AIR CAV SERVICE</small><b>{% if hll_stats.aviation_service.pilot_verified %}{{hll_stats.aviation_service.pilot_seconds//3600}}h {{(hll_stats.aviation_service.pilot_seconds%3600)//60}}m AIRMOBILE FLIGHT TIME{% else %}FLIGHT ROLE VERIFICATION PENDING{% endif %}</b><span>SLICK RIDES — {{hll_stats.aviation_service.slick_seconds//3600}}h {{(hll_stats.aviation_service.slick_seconds%3600)//60}}m • {{'%.1f'|format(hll_stats.aviation_service.slick_distance_meters/1000)}} KM. Roles other than Pilot and Logistics Officer count here when Air Cav movement is observed.</span></article></div>
+  <div class="hll-service-intelligence"><article><small>LEADERSHIP EXPERIENCE</small><b>{{hll_stats.leadership_experience.total_seconds//3600}}h {{(hll_stats.leadership_experience.total_seconds%3600)//60}}m VERIFIED</b><span>{% for x in hll_stats.leadership_experience.roles %}{{x.display_name}} — {{x.seconds//3600}}h {{(x.seconds%3600)//60}}m{% if not loop.last %} • {% endif %}{% endfor %}</span></article><article><small>LEADERSHIP BASIS</small><b>SQUAD LEADER • TANK COMMANDER • LOGISTICS OFFICER</b><span>Verified role experience only. Official appointments, promotions, and awards remain Command actions.</span></article></div>
+  {% if m16_service and m16_service.available %}<div class="hll-service-intelligence"><article><small>M16 WEAPON SERVICE</small><b>{{m16_service.verified_field_seconds//3600}}h {{(m16_service.verified_field_seconds%3600)//60}}m VERIFIED SERVER SERVICE</b><span>{{'%.1f'|format(m16_service.verified_distance_meters/1000)}} KM • {{m16_service.m16_kills}} KILLS • {{m16_service.blue_on_blue}} BLUE ON BLUE • {{m16_service.operations_carried}} OPERATIONS.</span></article><article><small>LAST VERIFIED USE</small><b>{{m16_service.last_verified_use.strftime('%d %b %Y %H%M')|upper if m16_service.last_verified_use else 'NO ENTRY'}}</b><span>{{m16_service.map_count}} AREAS OF OPERATIONS WITH VERIFIED ISSUED-M16 SERVER SERVICE.</span></article></div>{% endif %}
+  {% if hll_stats.map_ledger %}<div class="hll-map-ledger"><b>AREA OF OPERATIONS EXPERIENCE</b><div>{% for m in hll_stats.map_ledger[:6] %}<span><small>{{m.map_name}}</small><strong>{{m.seconds//3600}}h {{(m.seconds%3600)//60}}m</strong><em>{{m.matches}} RDS • {{'%.1f'|format(m.distance_meters/1000)}} KM</em></span>{% endfor %}</div></div>{% endif %}
+  {% if hll_stats.role_seconds %}<div class="hll-role-ledger"><b>RECORDED ROLE TIME</b><div>{% for role in hll_stats.role_ledger %}<span><small>{{role.display_name}}</small><strong>{{role.seconds//3600}}h {{(role.seconds%3600)//60}}m</strong></span>{% endfor %}</div></div>{% endif %}
+  <div class="hll-round-ledger"><div class="head"><span>AREA OF OPERATIONS</span><span>ROUNDS</span><span>TIME</span><span>DISTANCE</span><span>K / D</span><span>VEHICLES</span></div>
+    {% for r in hll_stats.map_ledger %}<div class="row"><span><b>{{r.map_name or 'HLL: VIETNAM'}}</b><small>LIFETIME AREA SERVICE</small></span><span>{{r.matches or 0}}</span><span>{{'%.1f'|format((r.seconds or 0)/3600)}} H</span><span>{{'%.1f'|format((r.distance_meters or 0)/1000)}} KM</span><span>{{r.kills or 0}} / {{r.deaths or 0}}</span><span>{{r.vehicle_kills or 0}} K • {{r.vehicles_destroyed or 0}} DEST</span></div>{% else %}<p class="typed-empty">FIELD ID IS LINKED, BUT NO HLL: VIETNAM FIELD SERVICE HAS BEEN RECORDED YET.</p>{% endfor %}
+  </div>
+  {% else %}<p class="typed-empty">NO HLL: VIETNAM IDENTITY IS LINKED TO THIS SOLDIER. LINK THROUGH BATTALION CLERK WITH /hll-link BEFORE SERVER TELEMETRY CAN BE FILED.</p>{% endif %}
+</section>
+
+<section id="active-service" class="file-document document-sheet active-service-sheet"><header><small>S-1 • PERMANENT RECORD</small><b>RECORD OF ACTIVE SERVICE</b><span>CHRONOLOGICAL BATTALION HISTORY</span></header><div class="active-service-timeline">{% for e in service_timeline %}<div class="service-event"><time>{{e.effective_date}}</time><div><b>{{e.title}}</b><small>{{e.event_type|replace('_',' ')}}{% if e.reference_number %} • {{e.reference_number}}{% endif %}</small>{% if e.narrative %}<p>{{e.narrative}}</p>{% endif %}</div></div>{% else %}<p class="typed-empty">NO ACTIVE SERVICE EVENTS FILED.</p>{% endfor %}</div></section>
+
+    <section class="file-jacket-summary">
+      <article class="jacket-card"><small>BATTLE ROSTER</small><strong>{{ roster_card.roster_number if roster_card else 'NOT ISSUED' }}</strong><span>INDIVIDUAL ROSTER CARD</span></article>
+      <article class="jacket-card"><small>UNIT ASSIGNMENT</small><strong>{{ personnel.unit_code }}</strong><span>{% if personnel.platoon %}{{ personnel.platoon }}{% endif %}{% if personnel.squad %} • {{ personnel.squad }}{% endif %}</span></article>
+      <article class="jacket-card"><small>{% if personnel.loa_active %}LEAVE STATUS{% else %}TOUR STATUS{% endif %}</small><strong>{% if personnel.loa_active %}ON AUTHORIZED LEAVE{% else %}{{ personnel.tour_phase }}{% endif %}</strong><span>{% if personnel.loa_active %}{% if personnel.loa_days_remaining is not none %}{{ personnel.loa_days_remaining }} DAYS TO RETURN{% else %}RETURN DATE PENDING{% endif %}{% elif personnel.days_in_country is not none %}{{ personnel.days_in_country }} DAYS IN COUNTRY{% else %}ARRIVAL PENDING{% endif %}</span></article>
+      <article class="jacket-card emphasis"><small>ISSUED ARM</small><strong>{% if weapon %}M16 {{ weapon.serial_number }}{% else %}NONE ISSUED{% endif %}</strong><span>{% if weapon %}{{ weapon.display_state }} • {{ weapon.total_rounds }} RDS{% else %}REPORT TO S-4{% endif %}</span></article>
+    </section>
+    <section id="promotion-eligibility" class="promotion-eligibility-file document-sheet">
+      <header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>PROMOTION ELIGIBILITY WORKSHEET</strong><span>CURRENT RANK: {{personnel.rank_code}}</span></header>
+      <div class="promotion-leadership-advisory"><span>COMBAT LEADERSHIP SCORE</span><b>{{leadership_score.score}} / 100 — {{leadership_score.rating}}</b><small>ADVISORY ONLY. COMMAND RETAINS PROMOTION AUTHORITY.</small></div>
+      {% if not promotion_onboarding_open %}<div class="promotion-path-sheet"><div class="promotion-path-heading"><span>ONBOARDING GATE</span><b>PROMOTION ELIGIBILITY NOT YET OPEN</b><em class="promotion-status not-eligible">WELCOME PACKET REQUIRED</em></div><p class="appointment-promotion-note">Complete your Welcome Packet and receive Command acceptance. Your next-rank eligibility worksheet will open automatically after onboarding is archived.</p></div>{% else %}{% for path in promotion_eligibility %}<article class="promotion-path-sheet"><div class="promotion-path-heading"><span>{{personnel.rank_code}} → {{path.target}}</span><b>{{path.title}}</b><em class="promotion-status {{'eligible' if path.eligible else 'not-eligible'}}">{{path.status}}</em></div>{% if path.appointment_based %}<p class="appointment-promotion-note">APPOINTMENT / COMMAND SELECTION REQUIRED.</p>{% endif %}<p class="appointment-promotion-note"><b>VERIFIED HLL SERVER SERVICE:</b> {{'%.1f'|format(path.verified_server_hours or 0)}}H LIFETIME • {{'%.1f'|format(path.verified_server_hours_7d or 0)}}H LAST 7 DAYS. Server time feeds readiness and official service evidence; promotion still requires the listed standards below.</p><div class="promotion-requirement-list">{% for req in path.requirements %}<div class="promotion-requirement {{'complete' if req.complete else 'incomplete'}}"><span>{{'✓' if req.complete else '□'}}</span><b>{{req.label}}</b><small>{{req.detail}}</small></div>{% endfor %}</div></article>{% else %}<p class="typed-empty">NO STANDARD PROMOTION PATH IS FILED FOR THIS CURRENT RANK.</p>{% endfor %}{% endif %}
+    </section>
+
+    <section class="file-documents">
+      <article id="assignment" class="file-document document-sheet"><header><small>S-1 PERSONNEL</small><b>ASSIGNMENT HISTORY</b></header>{% for a in assignments %}<div class="entry-row"><span>{{a.unit_code}}{% if a.platoon %} • {{a.platoon|formation_label}}{% endif %}{% if a.squad %} • {{a.squad|formation_label}}{% endif %}{% if a.fire_team %} • {{a.fire_team|formation_label}}{% endif %}</span><b>{{'CURRENT' if a.is_current else 'CLOSED'}}</b><small>{{a.effective_date}}{% if a.ended_date %} — {{a.ended_date}}{% endif %} • {{a.duty_position or 'NO DUTY ENTERED'}}</small></div>{% else %}<p class="typed-empty">NO ASSIGNMENT HISTORY HAS BEEN FILED.</p>{% endfor %}</article>
+
+      <article id="leave" class="file-document document-sheet"><header><small>S-1 PERSONNEL</small><b>LEAVE / ABSENCE CONTROL</b></header>{% if personnel.loa_start_date %}<div class="entry-row"><span>{% if personnel.loa_active %}ON AUTHORIZED LEAVE{% else %}LAST LEAVE OF ABSENCE{% endif %}</span><b>{% if personnel.loa_active %}EXPECTED RETURN {{personnel.loa_expected_return_date or 'PENDING'}}{% else %}RETURNED TO DUTY{% endif %}</b><small>BEGAN {{personnel.loa_start_date}}{% if personnel.loa_actual_return_date %} • RETURNED {{personnel.loa_actual_return_date}}{% endif %}{% if personnel.loa_remarks %} • {{personnel.loa_remarks}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO LEAVE OR ABSENCE ACTIONS ARE ENTERED ON THIS FILE.</p>{% endif %}</article>
+
+                  <article id="readiness" class="file-document document-sheet"><header><small>INDIVIDUAL READINESS</small><b>CURRENT STATUS — {{readiness.percent}}%</b></header>
+<div class="activity-accountability-strip {{inactivity.state|lower|replace(' ','-')}}"><div><small>LAST SERVER ACTIVITY</small><b>{{inactivity.last_activity or 'NO VERIFIED SERVER ACTIVITY ON FILE'}}</b><span>HLL: VIETNAM SERVER</span></div><div><small>SERVER TIME — LAST 7 DAYS</small><b>{{inactivity.time_7d}}</b><span>{% if inactivity.excused %}CLOCK PAUSED{% else %}{{inactivity.days}} DAY{{'' if inactivity.days == 1 else 'S'}} SINCE SERVER ACTIVITY{% endif %}</span></div><div><small>NEXT THRESHOLD</small><b>{% if inactivity.excused %}AUTHORIZED ABSENCE{% elif inactivity.next_label %}{{inactivity.next_label}}{% else %}ADMIN REVIEW{% endif %}</b><span>{% if inactivity.state == 'READY' %}MAINTAIN 2 HOURS / 7 DAYS{% elif inactivity.days_to_next is not none and not inactivity.excused %}IN {{inactivity.days_to_next}} DAY{{'' if inactivity.days_to_next == 1 else 'S'}}{% elif inactivity.expected_return %}RETURN {{inactivity.expected_return}}{% else %}S-1 / HQ ACTION{% endif %}</span></div></div>
+<div class="readiness-file-summary"><span>OVERALL <b>{{readiness.score_status}}</b><small>{{readiness.overall}}</small></span><span>ACTIVITY <b>{{readiness.activity}}</b><small>{{readiness.breakdown.activity.points}} / {{readiness.breakdown.activity.max}} PTS — {{readiness.breakdown.activity.detail}}</small></span><span>TRAINING / QUALIFICATIONS <b>{{readiness.breakdown.training.points}} / {{readiness.breakdown.training.max}} PTS</b><small>{{readiness.breakdown.training.detail}}</small></span><span>WEAPON / EQUIPMENT <b>{{readiness.breakdown.weapon.points}} / {{readiness.breakdown.weapon.max}} PTS</b><small>{{readiness.breakdown.weapon.detail}}</small></span><span>ADMINISTRATIVE <b>{{readiness.breakdown.admin.points}} / {{readiness.breakdown.admin.max}} PTS</b><small>{{readiness.breakdown.admin.detail}}</small></span><span>OFFICIAL DUTY <b>{{readiness.breakdown.duty.points}} / {{readiness.breakdown.duty.max}} PTS</b><small>{{readiness.breakdown.duty.detail}}</small></span><span>TOUR <b>{{tour_phase_record[0]}}</b>{% if personnel.loa_active and personnel.loa_days_remaining is not none %}<small>{{personnel.loa_days_remaining}} DAYS TO RETURN</small>{% elif tour_phase_record[1] is not none %}<small>{{tour_phase_record[1]}} DAYS TO DEROS</small>{% endif %}</span><span>WEAPON STATUS <b>{% if readiness.weapon %}{{readiness.weapon.condition_state}}{% else %}NO WEAPON ON RECORD{% endif %}</b></span></div></article>
+
+<article id="chain" class="file-document document-sheet"><header><small>PERSONNEL RECORD</small><b>CHAIN OF COMMAND</b></header>{% for c in chain_of_command %}<div class="entry-row"><span>{{c.chain_title}}</span><b>{{c.rank_code}} {{c.last_name|soldier_name(c.first_name, true)}}</b><small>{{c.appointment_status or 'CURRENT'}}</small></div>{% else %}<p class="typed-empty">CHAIN OF COMMAND HAS NOT YET BEEN COMPLETELY ENTERED.</p>{% endfor %}</article>
+
+<article id="rank" class="file-document document-sheet"><header><small>S-1 PERSONNEL</small><b>RANK HISTORY</b></header>{% for r in promotions %}<div class="entry-row rank-history-row"><span class="rank-history-identity">{% if r.new_rank_code in ['PVT','PFC','CPL','SP4','SP5','SGT','SP6','SSG','SP7','SFC','MSG','1SG','SGM','2LT','1LT','CPT','MAJ','LTC'] %}<img class="rank-insignia history-rank" src="{{ url_for('static', filename='art/ranks/' ~ r.new_rank_code ~ '.webp') }}" alt="{{r.new_rank_code}} rank insignia">{% endif %}<span>{{r.new_rank_code}} — {{r.rank_name}}</span></span><b>{{r.effective_date}}</b><small>{{r.pay_grade}}{% if r.order_number %} • {{r.order_number}}{% endif %}{% if r.authority %} • {{r.authority|upper}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO RANK ACTIONS HAVE BEEN FILED.</p>{% endfor %}</article>
+
+      <article id="appointments" class="file-document document-sheet"><header><small>S-1 PERSONNEL</small><b>APPOINTMENT HISTORY</b></header>{% for a in appointments %}<div class="entry-row"><span>{{a.appointment_name}}{% if a.organization %} • {{a.organization}}{% endif %}</span><b>{{'CURRENT' if a.is_current else 'RELIEVED'}}</b><small>{{a.appointment_status}} • {{a.effective_date}}{% if a.ended_date %} — {{a.ended_date}}{% endif %}{% if a.order_number %} • {{a.order_number}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO APPOINTMENTS HAVE BEEN FILED.</p>{% endfor %}</article>
+
+      <article id="leadership-service" class="file-document document-sheet leadership-service-sheet">
+        <header><small>S-1 PERSONNEL</small><b>LEADERSHIP SERVICE</b><span>{{leadership_service.total_days}} TOTAL LEADERSHIP DAYS</span></header>
+        <p class="file-note">Leadership service is tracked by appointment and remains separate from rank. Days continue accumulating while an appointment is current.</p>
+        <div class="leadership-days-grid">{% for item in leadership_service.totals %}<div><small>{{item.appointment_name|upper}}</small><b>{{item.days}} DAYS</b><span>{{item.periods}} PERIOD{{'' if item.periods == 1 else 'S'}}</span></div>{% else %}<p class="typed-empty">NO QUALIFYING LEADERSHIP SERVICE HAS BEEN FILED.</p>{% endfor %}</div>
+      </article>
+
+      <article id="combat-leadership" class="file-document document-sheet combat-leadership-sheet">
+        <header><small>COMMAND / S-1</small><b>COMBAT LEADERSHIP RECORD</b><span>ADVISORY PROMOTION CONSIDERATION • NOT RANK</span></header>
+        <div class="leadership-score-head"><div><small>COMBAT LEADERSHIP SCORE</small><strong>{{leadership_score.score}} / 100</strong><span>{{leadership_score.rating}}</span></div><p>This score reflects filed leadership service, operations led, training conducted, readiness of currently assigned Soldiers, and completed leadership assignments. It never grants rank automatically.</p></div>
+        <div class="leadership-score-grid">{% for label,item in leadership_score.breakdown.items() %}<div><small>{{label|upper}}</small><b>{{item.points}} / {{item.max}}</b></div>{% endfor %}</div>
+        <div class="leadership-facts"><span><b>{{leadership_score.operations_led}}</b> OPERATIONS LED</span><span><b>{{leadership_score.training_conducted}}</b> TRAINING PERIODS CONDUCTED</span><span><b>{{leadership_score.assigned_readiness}}%</b> ASSIGNED SOLDIER READINESS</span><span><b>{{leadership_score.successful_assignments}}</b> COMPLETED LEADERSHIP ASSIGNMENTS</span></div>
+      </article>
+
+      <article id="mos-proficiency" class="file-document document-sheet mos-proficiency-sheet">
+        <header><small>S-3 TRAINING</small><b>MOS PROFICIENCY</b><span>VERIFIED SERVER ROLE TIME — NOT RANK</span></header>
+        {% if mos_proficiency %}<div class="mos-proficiency-card"><small>{{mos_proficiency.mos_code}} • {{mos_proficiency.mos_title|upper}}</small><h3>{{mos_proficiency.level}}</h3><div class="mos-prof-grid"><span><b>{{'%.1f'|format(mos_proficiency.server_hours or 0)}}</b><small>VERIFIED MOS HOURS</small></span><span><b>{{mos_proficiency.role_ids|join(', ') if mos_proficiency.role_ids else '—'}}</b><small>HLL ROLE ID{{'S' if mos_proficiency.role_ids|length != 1 else ''}}</small></span><span><b>{{mos_proficiency.progress_percent or 0}}%</b><small>TO NEXT GRADE</small></span></div><div class="mos-server-progress" aria-label="MOS progression toward next grade"><i style="width:{{mos_proficiency.progress_percent or 0}}%"></i></div><p><b>NEXT:</b> {{mos_proficiency.next_requirement}}</p><small>ONLY VERIFIED TIME PLAYED IN THE HLL SERVER ROLE MAPPED TO THIS MOS ADVANCES PROFICIENCY.</small></div>{% else %}<p class="typed-empty">NO PRIMARY MOS PROFICIENCY RECORD IS AVAILABLE.</p>{% endif %}
+      </article>
+
+                        <article id="duty-qualifications" class="file-document document-sheet"><header><small>TRAINING OFFICE</small><b>DUTY QUALIFICATIONS</b></header><p class="form-note">HLL: VIETNAM PLAYABLE DUTIES — SEPARATE FROM ARMY MOS AND APPOINTMENT.</p>{% for q in duty_quals %}<div class="entry-row"><span>{{q.battlefield_unit}} — {{q.display_name|upper}}</span><b>{{q.status}}</b><small>QUALIFIED {{q.qualified_date or 'DATE NOT FILED'}}{% if q.expiration_date %} • REQUAL {{q.expiration_date}}{% endif %}{% if q.instructor_last %} • INSTRUCTOR {{q.instructor_rank}} {{q.instructor_last|upper}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO DUTY QUALIFICATIONS ENTERED ON THIS FILE.</p>{% endfor %}</article>
+
+<article id="combat-journal" class="file-document document-sheet"><header><small>S-3 OPERATIONS</small><b>COMBAT OPERATIONS JOURNAL</b></header>{% for o in personal_ops %}<div class="entry-row"><span>{{o.operation_number or 'OPERATION'}} — {{o.title}}</span><b>{{o.start_at.date() if o.start_at else o.credited_at.date()}}</b><small>{{o.duty_role or 'ASSIGNED'}} • {{o.attendance_status}} • {{o.rounds_expended}} RDS{% if o.casualty_status %} • {{o.casualty_status}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO COMBAT OPERATIONS HAVE BEEN ENTERED ON THIS FILE.</p>{% endfor %}</article>
+
+<article id="issued-equipment" class="file-document document-sheet"><header><small>S-4 SUPPLY</small><b>INDIVIDUAL EQUIPMENT RECORD</b></header><div class="property-table head"><span>ITEM</span><span>SERIAL / RACK</span><span>ISSUED</span><span>CONDITION</span></div>{% for e in issued_equipment %}<div class="property-table"><span>{{e.item_name}}</span><span>{{e.serial_number or e.rack_number or 'NON-SERIALIZED'}}</span><span>{{e.issued_at.date() if e.issued_at else '—'}}</span><span>{{e.condition_state}}</span></div>{% else %}<p class="typed-empty">NO ADDITIONAL FIELD EQUIPMENT IS CURRENTLY ENTERED.</p>{% endfor %}</article>
+
+<article id="arms" class="file-document document-sheet weapon-file-sheet">
+        <header><small>S-4 SUPPLY</small><b>INDIVIDUAL WEAPON RECORD</b><span>M16 SERVICE HISTORY</span></header>
+        {% if weapon %}<div class="weapon-visual record weapon-state-{{weapon.dirt_stage}} weapon-state-photo"><img src="{{url_for('static', filename=weapon.image_asset)}}" alt="Issued M16 rifle"></div><div class="weapon-state-banner status-stage-{{weapon.dirt_stage}}">{{weapon.display_state}}</div><dl class="weapon-record-grid"><dt>TYPE</dt><dd>{{weapon.weapon_type}}</dd><dt>SERIAL NO.</dt><dd>{{weapon.serial_number}}</dd><dt>RACK NO.</dt><dd>{{weapon.rack_number}}</dd><dt>DATE ISSUED</dt><dd>{{weapon.issued_at}}</dd><dt>ROUNDS FIRED</dt><dd>{{weapon.total_rounds}}</dd><dt>ROUNDS SINCE CLEANING</dt><dd>{{weapon.rounds_since_cleaning}}</dd><dt>LAST CLEANED</dt><dd>{{weapon.last_cleaned_at.date() if weapon.last_cleaned_at else 'NO ENTRY'}}</dd><dt>LAST INSPECTED</dt><dd>{{weapon.last_inspected_at.date() if weapon.last_inspected_at else 'NO ENTRY'}}</dd><dt>CONDITION</dt><dd>{{weapon.display_condition_percent}}% • {{weapon.display_state}}</dd></dl>{% else %}<p class="typed-empty">NO INDIVIDUAL WEAPON IS CURRENTLY ISSUED.</p>{% endif %}
+      {% if weapon_personality and weapon_personality.weapon %}<div class="weapon-personality"><h3>THIS RIFLE HAS HISTORY</h3><div class="weapon-story-stats"><span>LIFETIME ROUNDS <b>{{weapon_personality.weapon.total_rounds or 0}}</b></span><span>OPERATIONS CARRIED <b>{{weapon_personality.operations_carried}}</b></span><span>CLEANINGS <b>{{weapon_personality.cleanings}}</b></span><span>INSPECTIONS <b>{{weapon_personality.inspections}}</b></span></div><h4>PREVIOUS HOLDERS</h4>{% for h in weapon_personality.holders %}<p><b>{{h.rank_code}} {{h.last_name|upper}}</b> — {{h.holder_rounds}} RDS <small>{{h.issued_at}} → {{h.turned_in_at or 'CURRENT'}}</small></p>{% else %}<p class="typed-empty">THIS IS THE FIRST FILED HOLDER.</p>{% endfor %}{% if weapon_personality.rcon_observation %}<div class="weapon-rcon-observation"><small>RCON FIELD-CARRY OBSERVATION</small><b>{{weapon_personality.rcon_observation.verified_field_seconds//3600}}h {{(weapon_personality.rcon_observation.verified_field_seconds%3600)//60}}m VERIFIED SERVER SERVICE</b><span>{{weapon_personality.rcon_observation.verified_matches}} server rounds observed while this Soldier is the current holder. {{weapon_personality.rcon_observation.note}}</span></div>{% endif %}<h4>WEAPON SERVICE HISTORY</h4>{% for r in weapon_personality.round_events[:12] %}<p>{{r.recorded_at.date() if r.recorded_at else ''}} — <b>{{r.rounds_fired}} RDS</b> • {{r.source_type}}{% if r.operation_number %} • {{r.operation_number}}{% endif %}</p>{% endfor %}{% for m in weapon_personality.maintenance[:8] %}<p>{{m.performed_at.date() if m.performed_at else ''}} — <b>{{m.action_type}}</b> • {{m.remarks or 'S-4 SERVICE ENTRY'}}</p>{% endfor %}</div>{% endif %}</article>
+
+
+
+      <article id="uniform" class="file-document document-sheet uniform-file-sheet">
+        <header><small>S-4 SUPPLY / PERSONNEL</small><b>ISSUED SERVICE UNIFORM</b><span>ARMY GREEN SERVICE UNIFORM</span></header>
+        <div class="uniform-record-grid">
+          <div class="uniform-record-visual"><img class="uniform-base-image" src="{{url_for('static',filename='art/army-green-service-uniform.webp')}}" alt="Issued Army Green service uniform">{% if uniform_ribbon_rows %}<div class="uniform-ribbon-rack uniform-ribbon-rack--file">{% for row in uniform_ribbon_rows %}<div class="uniform-ribbon-row row-size-{{row|length}}">{% for r in row %}{% if r.image_filename %}<button type="button" class="ribbon-rack-button" data-member-ribbon="{{r.ribbon_code}}" aria-label="Open {{r.ribbon_name}} record"><img src="{{url_for('static', filename='art/ribbons/' ~ r.image_filename)}}" alt="{{r.ribbon_name}}"></button>{% endif %}{% endfor %}</div>{% endfor %}</div>{% endif %}</div>
+          <div class="uniform-record-copy">
+            <div class="uniform-issued-stamp">ISSUED</div>
+            <dl class="weapon-record-grid"><dt>ITEM</dt><dd>ARMY GREEN SERVICE UNIFORM</dd><dt>ISSUE STATUS</dt><dd>{% if uniform_issue %}ISSUED{% else %}PENDING ISSUE{% endif %}</dd><dt>DATE ISSUED</dt><dd>{{uniform_issue.issued_at if uniform_issue else 'NO ENTRY'}}</dd><dt>CONDITION</dt><dd>{{uniform_issue.condition_state if uniform_issue else 'SERVICEABLE'}}</dd><dt>UNIT</dt><dd>{{personnel.unit_code}}</dd></dl>
+            <section class="uniform-awards"><small>RIBBON DISPLAY</small><h3>SERVICE RECOGNITION</h3><p>Earned ribbons remain authorized on the Soldier's permanent 201 File. Only ribbons marked <b>WORN</b> appear on the service uniform.</p>{% for r in earned_ribbons %}<div class="uniform-award-line uniform-award-line--controlled"><div><b>{{r.ribbon_name}}</b><span class="uniform-wear-status {{'is-worn' if r.is_worn else 'not-worn'}}">{{'WORN' if r.is_worn else 'NOT WORN'}}</span></div>{% if not read_only_peer %}<form method="post" action="{{url_for('member_ribbon_toggle', ribbon_id=r.id)}}" class="uniform-wear-action"><input type="hidden" name="return_to" value="my_201_file"><input type="hidden" name="anchor" value="uniform"><button type="submit" name="action" value="{{'TAKE_OFF' if r.is_worn else 'WEAR'}}">{{'TAKE OFF' if r.is_worn else 'WEAR'}}</button></form>{% endif %}</div>{% else %}<p class="typed-empty">NO RIBBONS HAVE BEEN EARNED YET.</p>{% endfor %}</section>
+          </div>
+        </div>
+      </article>
+
+      <article id="qualifications" class="file-document document-sheet"><header><small>TRAINING OFFICE</small><b>QUALIFICATIONS / SCHOOLS</b></header><p class="file-note">Weapons qualifications, training records, and role certifications remain part of the Soldier's permanent 201 File.</p>{% for q in qualifications %}<div class="entry-row"><span>{{q.qualification_name}}</span><b>{{q.status}}</b><small>{{q.earned_at or 'NO DATE'}}{% if q.expires_at %} • EXPIRES {{q.expires_at}}{% endif %}</small></div>{% else %}<p class="typed-empty">NO QUALIFICATIONS ON FILE.</p>{% endfor %}</article>
+
+      
+      <article id="ribbon-progress" class="file-document document-sheet ribbon-progress-file">
+        <header><small>HEADQUARTERS • PERSONNEL</small><b>RIBBON QUALIFICATION STATUS</b><span>1965 BATTALION AWARDS PROGRAM</span></header>
+        <p class="file-note">Select any ribbon to open its award record. Unearned progression ribbons show live qualification progress from the Soldier's official record. Command decorations show the recommendation requirement instead of an artificial score.</p>{% if ribbon_details and ribbon_details[0].progress %}<p class="file-note"><b>VERIFIED HLL SERVICE:</b> {{'%.1f'|format(ribbon_details[0].progress.verified_server_hours or 0)}}H LIFETIME • {{'%.1f'|format(ribbon_details[0].progress.verified_server_hours_7d or 0)}}H LAST 7 DAYS • {{'%.1f'|format(ribbon_details[0].progress.verified_seeding_hours or 0)}}H VERIFIED NIGHTLY SEEDING CREDIT. Discord voice time does not count toward these totals.</p>{% endif %}
+        <div class="member-ribbon-status-grid">
+        {% for r in ribbon_details %}
+          <button type="button" class="member-ribbon-status {{'is-earned' if r.earned else 'is-progress'}}" data-member-ribbon="{{r.ribbon_code}}">
+            {% if r.image_filename %}<img src="{{url_for('static', filename='art/ribbons/' ~ r.image_filename)}}" alt="">{% endif %}
+            <span><b>{{r.ribbon_name}}</b><small>{{'EARNED • ' ~ (r.earned_at or 'DATE ON FILE') if r.earned else r.progress_detail}}</small></span>
+            <em>{{'AUTHORIZED' if r.earned else (r.progress_percent|string ~ '%')}}</em>
+          </button>
+        {% endfor %}
+        </div>
+      </article>
+
+      <div class="award-detail-modal" data-member-award-modal aria-hidden="true">
+        <button class="award-detail-backdrop" type="button" data-member-award-close aria-label="Close award record"></button>
+        <section class="award-detail-sheet award-detail-sheet--member" role="dialog" aria-modal="true" aria-labelledby="member-award-detail-name">
+          <button class="award-detail-close" type="button" data-member-award-close>×</button>
+          <small>INDIVIDUAL 201 FILE • DECORATIONS RECORD • 1965</small>
+          <img data-member-award-image alt="">
+          <span class="award-detail-type" data-member-award-type></span>
+          <h2 id="member-award-detail-name" data-member-award-name></h2>
+          <div class="member-award-status-line"><span data-member-award-status></span><span data-member-award-device></span></div>
+          <div class="award-detail-progress"><b>QUALIFICATION PROGRESS</b><div><i data-member-award-progress-bar></i></div><span data-member-award-progress></span></div>
+          <div class="award-detail-grid"><div><b>WHAT IT RECOGNIZES</b><p data-member-award-description></p></div><div><b>HOW TO EARN IT</b><p data-member-award-earning></p></div></div>
+          <div class="award-detail-rule"><b>OFFICIAL REQUIREMENT</b><span data-member-award-requirement></span></div>
+          <div class="award-history-register"><b>AWARD HISTORY / GENERAL ORDERS</b><div data-member-award-history></div></div>
+        </section>
+      </div>
+      <script type="application/json" id="member-ribbon-details-json">{{ member_json_payload(ribbon_details)|safe }}</script>
+
+<article id="awards" class="file-document document-sheet"><header><small>HEADQUARTERS</small><b>AWARDS & DECORATIONS</b></header><p class="file-note">Awards are filed as official battalion actions and linked to the Soldier's service history. Ribbon-bearing awards also show their current uniform wear status.</p>{% for a in awards %}<div class="entry-row award-record-row"><span>{{a.award_name}}{% if a.ribbon_id %}<em class="award-wear-badge {{'is-worn' if a.is_worn else 'not-worn'}}">{{'WORN' if a.is_worn else 'NOT WORN'}}</em>{% endif %}</span><b>{{a.award_date}}</b><small>{{a.order_number or 'ORDER NUMBER NOT ENTERED'}}{% if a.citation %} • {{a.citation}}{% endif %}</small>{% if a.ribbon_id and not read_only_peer %}<form method="post" action="{{url_for('member_ribbon_toggle', ribbon_id=a.ribbon_id)}}" class="award-record-action"><input type="hidden" name="return_to" value="my_201_file"><input type="hidden" name="anchor" value="awards"><button type="submit" name="action" value="{{'TAKE_OFF' if a.is_worn else 'WEAR'}}">{{'TAKE OFF' if a.is_worn else 'WEAR'}}</button></form>{% endif %}</div>{% else %}<p class="typed-empty">NO AWARDS ON FILE.</p>{% endfor %}</article>
+
+      <article id="orders-file" class="file-document document-sheet"><header><small>S-1 PERSONNEL</small><b>OFFICIAL ORDERS FILE</b></header><div class="document-thumbnail-grid">{% for d in documents %}<a class="document-thumbnail" href="{{url_for('personnel_document',document_id=d.id)}}"><img src="{{url_for('personnel_document_preview',document_id=d.id)}}" alt="{{d.title}}"><span>{{d.document_number}}</span><b>{{d.title}}</b><small>{{d.effective_date}}</small></a>{% else %}<p class="typed-empty">NO ORDERS HAVE BEEN FILED IN THIS JACKET.</p>{% endfor %}</div></article>
+
+      {% if session.get('access_role') in ['s1','battalion_hq','commander','admin'] %}
+      
+    <section class="file-document document-sheet promotion-board-sheet"><header><small>HEADQUARTERS • REVIEW</small><b>PROMOTION BOARD PACKET</b><span>{{'ELIGIBLE FOR CONSIDERATION' if promotion_packet.eligible_for_consideration else 'REVIEW REQUIREMENTS'}}</span></header><div class="packet-grid"><span>CURRENT RANK<b>{{personnel.rank_code}}</b></span><span>TIME IN RANK<b>{{promotion_packet.time_in_rank_days}} DAYS</b></span><span>OPERATIONS<b>{{promotion_packet.operations}}</b></span><span>ATTENDANCE<b>{{promotion_packet.attendance_percent}}%</b></span><span>READINESS<b>{{personnel.readiness_percent or 0}}%</b></span><span>LEADERSHIP DUTIES<b>{{promotion_packet.leadership_days}} DAYS</b></span><span>QUALIFICATIONS<b>{{promotion_packet.qualifications}}</b></span><span>ADMIN FLAGS<b>{{promotion_packet.admin_adverse_notes}}</b></span></div><p class="typed-note">This packet supports Command review only. Promotion remains a Command decision and is never automatic.</p></section>
+    <section class="file-document document-sheet award-evidence-sheet"><header><small>S-1 • RECOMMENDATION SUPPORT</small><b>AWARD RECOMMENDATION EVIDENCE</b><span>FACTUAL SERVICE RECORD</span></header><div class="packet-grid"><span>OPERATIONS<b>{{award_evidence.operations}}</b></span><span>LEADERSHIP DAYS<b>{{award_evidence.leadership_days}}</b></span><span>TRAINING INSTRUCTED<b>{{award_evidence.training_instructed}}</b></span><span>READINESS<b>{{award_evidence.readiness}}%</b></span><span>PREVIOUS AWARDS<b>{{award_evidence.previous_awards|length}}</b></span><span>FIELD CITATIONS<b>{{award_evidence.field_citations|length}}</b></span></div>{% for c in award_evidence.field_citations[:5] %}<p class="evidence-citation"><b>{{c.citation_date}} — {{c.title}}</b><br>{{c.narrative}}</p>{% endfor %}</section>
+    {% if command_watchlist and session.get('access_role') in ['battalion_hq','commander','admin'] %}<section class="file-document document-sheet command-watch-file"><header><small>HEADQUARTERS • INTERNAL</small><b>COMMAND WATCHLIST</b><span>NOT VISIBLE TO MEMBER</span></header>{% for w in command_watchlist %}<p><b>{{w.watch_type}}</b> — {{w.note or 'NO REMARKS'}} <small>{{w.created_at}}</small></p>{% endfor %}</section>{% endif %}
+<article id="lifecycle-control" class="file-document document-sheet lifecycle-control-sheet"><header><small>S-1 PERSONNEL CONTROL</small><b>SOLDIER LIFECYCLE / TOUR ACTION</b><span>CURRENT STATE — {{personnel.lifecycle_state}}</span></header>
+        <p class="file-note">Historical entries are preserved. Separation closes active property; archive retains the complete 201 File; reopening restores the existing record instead of creating a duplicate.</p>
+        <form method="post" action="{{url_for('personnel_lifecycle_action',personnel_id=personnel.id)}}" class="army-form-grid"><label class="wide">REMARKS / REASON<input name="reason" placeholder="Personnel action remarks"></label><button class="paper-action button-reset" name="action" value="SEPARATE"><span>SEPARATE SOLDIER</span><small>TURN IN ACTIVE M16 / CLOSE ACTIVE STATUS</small></button><button class="paper-action button-reset" name="action" value="ARCHIVE"><span>ARCHIVE 201 FILE</span><small>RETAIN FULL HISTORY</small></button><button class="paper-action button-reset" name="action" value="REOPEN"><span>REOPEN 201 FILE</span><small>RETURNING MEMBER — KEEP PRIOR SERVICE</small></button></form>
+        <form method="post" action="{{url_for('personnel_lifecycle_action',personnel_id=personnel.id)}}" class="army-form-grid"><input type="hidden" name="action" value="EXTEND TOUR"><label>NEW DEROS<input type="date" name="new_deros" required></label><label class="wide">EXTENSION REMARKS<input name="reason" placeholder="Tour extension authority / remarks"></label><button class="paper-action primary button-reset"><span>FILE TOUR EXTENSION</span><small>GENERATES OFFICIAL ORDERS</small></button></form>
+      </article>
+      {% endif %}
+
+      <article id="journal" class="file-document document-sheet service-journal"><header><small>S-1 PERSONNEL</small><b>SERVICE HISTORY</b></header>{% for a in service_history %}<div class="journal-entry"><time>{{a.entry_date}}</time><div><b>{{a.title}}</b><p>{{a.narrative}}</p><small>{{a.entry_type}}{% if a.reference_number %} • REF {{a.reference_number}}{% endif %}</small></div></div>{% else %}<p class="typed-empty">NO SERVICE HISTORY ENTRIES HAVE BEEN FILED.</p>{% endfor %}</article>
+    </section>
+    {% else %}<article class="record-form document-sheet"><h2>201 FILE NOT ISSUED</h2><p>REPORT TO S-1 PERSONNEL FOR IN-PROCESSING.</p><a class="paper-action" href="{{url_for('login')}}"><span>REPORT FOR DUTY</span></a></article>{% endif %}
+  </div>
+</section>
+<script>
+(function(){
+  const root=document.querySelector('.phase3-201');
+  const tabs=root&&root.querySelector('[data-201-tabs]');
+  if(!root||!tabs)return;
+  const map={
+    overview:['situation'],
+    m16:['arms','issued-equipment'],
+    career:['tour','rank','appointments','leadership-service','combat-leadership','mos-proficiency','promotion-eligibility'],
+    qualifications:['qualifications','duty-qualifications','replacement-training'],
+    awards:['uniform','ribbon-progress','awards'],
+    orders:['orders-file'],
+    readiness:['readiness','leave'],
+    service:['active-service','combat-record','combat-journal','assignment','journal','record','chain'],
+    onboarding:['orientation-record'],
+    admin:['staff-actions','lifecycle-control']
+  };
+  const staticPanels=[...root.querySelectorAll('.file-document')];
+  const idToTab={}; Object.entries(map).forEach(([tab,ids])=>ids.forEach(id=>idToTab[id]=tab));
+  staticPanels.forEach(el=>{el.dataset.canonicalTab=idToTab[el.id]||'service';});
+  root.querySelectorAll('.promotion-board-sheet,.award-evidence-sheet,.command-watch-file').forEach(x=>{x.dataset.canonicalTab='admin';});
+  const staffActions=root.querySelector('#staff-actions'); if(staffActions) staffActions.dataset.canonicalTab='admin';
+  const oldSituation=root.querySelector('#situation'); if(oldSituation) oldSituation.dataset.canonicalTab='legacy-hidden';
+  const overview=root.querySelector('[data-201-panel="overview"]');
+  function activate(name,updateHash){
+    if(!tabs.querySelector('[data-201-tab="'+name+'"]')) name='overview';
+    tabs.querySelectorAll('[data-201-tab]').forEach(b=>{const on=b.dataset.tab201===name||b.getAttribute('data-201-tab')===name;b.classList.toggle('is-active',on);b.setAttribute('aria-selected',on?'true':'false');});
+    if(overview) overview.hidden=name!=='overview';
+    [...root.querySelectorAll('[data-canonical-tab]')].forEach(el=>{el.hidden=el.dataset.canonicalTab!==name;});
+    if(updateHash){history.replaceState(null,'','#'+name);}
+  }
+  tabs.addEventListener('click',e=>{const b=e.target.closest('[data-201-tab]');if(!b)return;activate(b.getAttribute('data-201-tab'),true);tabs.scrollIntoView({block:'start',behavior:'smooth'});});
+  root.querySelectorAll('[data-open-201-tab]').forEach(b=>b.addEventListener('click',()=>activate(b.getAttribute('data-open-201-tab'),true)));
+  const raw=(location.hash||'').slice(1);
+  const legacyToTab={}; Object.entries(idToTab).forEach(([id,tab])=>legacyToTab[id]=tab);
+  activate(map[raw]?raw:(legacyToTab[raw]||'overview'),false);
+})();
+</script>
+{% endblock %}

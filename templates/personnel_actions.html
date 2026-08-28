@@ -1,0 +1,75 @@
+{% extends 'base.html' %}
+{% block title %}Personnel Action Control • {{site_name}}{% endblock %}
+{% block body_class %}page-actions{% endblock %}
+{% block content %}
+<section class="staff-section-hero action-control-hero"><div class="staff-photo"></div><div class="staff-shade"></div><div class="staff-sign"><span>HEADQUARTERS WORKFLOW</span><h1>PERSONNEL ACTION CONTROL</h1><p>Route, review, complete, and permanently file battalion staff actions from one command desk.</p></div></section>
+
+<section class="staff-workspace actions-workspace action-control-shell">
+  <nav class="action-view-tabs" aria-label="Action control views">
+    <a class="{{'active' if view != 'archive' and not mine else ''}}" href="{{url_for('personnel_actions')}}"><span>ACTIVE DESK</span><small>{{counts.open or 0}} OPEN ACTIONS</small></a>
+    <a class="{{'active' if mine else ''}}" href="{{url_for('personnel_actions',mine=1)}}"><span>ASSIGNED TO ME</span><small>MY CLAIMED WORK</small></a>
+    <a class="{{'active' if view == 'archive' else ''}}" href="{{url_for('personnel_actions',view='archive')}}"><span>COMPLETED FILES</span><small>{{archive_count}} ARCHIVED</small></a>
+    {% if access_role in ['battalion_hq','commander','admin'] %}<a href="#quick-delete"><span>ROSTER CORRECTION</span><small>DELETE DUPLICATE RECORD</small></a>{% endif %}
+  </nav>
+
+  {% if view != 'archive' %}
+  <article class="document-sheet action-register-sheet">
+    <header class="army-letterhead compact"><small>STAFF CONTROL</small><strong>OPEN A NEW ACTION</strong><span>{{role_section or 'BATTALION-WIDE'}} • {{counts.open or 0}} ACTIVE • {{counts.urgent or 0}} HIGH PRIORITY</span></header>
+    <div class="action-form-steps"><span><b>1</b>SOLDIER</span><span><b>2</b>ACTION</span><span><b>3</b>DETAILS</span><span><b>4</b>REVIEW</span><span><b>5</b>SUBMIT</span></div>
+    <form method="post" class="army-form-grid action-create-grid" data-progressive-action-form><input type="hidden" name="action" value="create">
+      <label>SOLDIER<select name="personnel_id"><option value="">BATTALION / GENERAL</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}} — {{p.unit_code}}</option>{% endfor %}</select></label>
+      <label>ACTION TYPE<select name="action_type" data-action-type><option>PERSONNEL</option><option>PROMOTION</option><option>ASSIGNMENT</option><option>APPOINTMENT</option><option>LEAVE</option><option>TRAINING</option><option>QUALIFICATION</option><option>MOS</option><option>OPERATION</option><option>WEAPON</option><option>EQUIPMENT</option><option>LOGISTICS</option><option>COMMAND REVIEW</option></select></label>
+      {% if not role_section %}<label>ROUTE TO<select name="owning_section"><option>S-1</option><option>S-3</option><option>S-4</option><option>HQ</option></select></label>{% endif %}
+      <label>PRIORITY<select name="priority"><option>ROUTINE</option><option>HIGH</option><option>URGENT</option></select></label>
+      <label>DUE DATE<input type="date" name="due_date"></label>
+      <div class="wide action-route-helper" data-action-route-help>Select an action type to see the recommended staff route.</div><label class="wide">SUBJECT<input name="subject" required placeholder="What needs to be actioned?"></label>
+      <label class="wide">REMARKS<textarea name="remarks" rows="3" placeholder="Background, routing instructions, or staff notes"></textarea></label>
+      <button class="paper-action primary button-reset action-open-button" type="submit"><span>OPEN ACTION</span><small>ROUTE TO STAFF DESK</small></button>
+    </form>
+  </article>
+
+  <article class="document-sheet action-queue-sheet">
+    <header class="action-queue-header"><div><small>ACTIVE CONTROL</small><b>INBOX / OUTBOX ROUTING QUEUE</b></div><span>OPEN → IN REVIEW → PENDING COMMAND → RETURNED → COMPLETE</span></header>
+    <div class="action-queue-legend"><span>ACTION</span><span>STATUS</span><span>NEXT STATUS</span>{% if not role_section %}<span>ROUTE</span>{% endif %}<span>REMARKS</span><span></span></div>
+    {% for a in actions %}
+    <form method="post" id="action-{{a.id}}" class="action-ledger-row action-ledger-card"><input type="hidden" name="action" value="transition"><input type="hidden" name="action_id" value="{{a.id}}">
+      <div class="action-ledger-main">
+        <div class="action-ledger-badges"><small class="section-badge">{{a.owning_section}}</small><small class="priority-badge priority-{{(a.priority or 'ROUTINE')|lower}}">{{a.priority}}</small></div>
+        <b>{{a.subject}}</b>
+        <span>{% if a.last_name %}{{a.rank_code}} {{a.last_name|soldier_name(a.first_name)}} • {{a.unit_code}}{% else %}BATTALION ACTION{% endif %}</span>
+        {% if a.assigned_to %}<small class="action-assigned">ASSIGNED TO {{a.assigned_to}}</small>{% endif %}{% if a.due_date %}<small class="action-due">DUE {{a.due_date}}</small>{% endif %}
+      </div>
+      <div class="action-status status-{{(a.status or 'OPEN')|lower|replace(' ','-')}}">{{a.status}}</div>
+      <select name="new_status" aria-label="Next status"><option>IN REVIEW</option><option>PENDING COMMAND</option><option>RETURNED</option><option>COMPLETE</option><option>CLOSED</option></select>
+      {% if not role_section %}<select name="route_section" aria-label="Route section"><option>{{a.owning_section}}</option><option>S-1</option><option>S-3</option><option>S-4</option><option>HQ</option></select>{% endif %}
+      <input name="remarks" placeholder="Routing / action remarks">
+      <div class="action-row-buttons"><button type="submit" class="action-update-button">UPDATE</button>{% if not a.assigned_to %}<button type="submit" class="action-claim-button" formaction="{{url_for('personnel_action_quick',action_id=a.id)}}" formmethod="post" name="quick_action" value="CLAIM">CLAIM</button>{% endif %}<button type="submit" class="action-complete-button" formaction="{{url_for('personnel_action_quick',action_id=a.id)}}" formmethod="post" name="quick_action" value="COMPLETE">COMPLETE</button></div>
+    </form>
+    {% else %}<div class="action-empty-state"><b>ACTIVE DESK CLEAR</b><p>No open actions are waiting in this queue.</p><a href="{{url_for('personnel_actions',view='archive')}}">OPEN COMPLETED FILES →</a></div>{% endfor %}
+  </article>
+
+  {% if access_role in ['battalion_hq','commander','admin'] %}
+  <article id="quick-delete" class="document-sheet quick-roster-correction">
+    <header><small>COMMAND ONLY • ROSTER CORRECTION</small><b>DELETE AN ACCIDENTAL / DUPLICATE MEMBER</b></header>
+    <p>Use this only when a personnel record was created by mistake. Real former members should be separated and archived so their service history remains intact.</p>
+    <form method="post" action="{{url_for('battalion_control')}}" class="quick-delete-grid" onsubmit="return confirm('PERMANENTLY DELETE THIS DUPLICATE PERSONNEL RECORD? This cannot be undone.');">
+      <label>DUPLICATE RECORD<select name="personnel_id" required><option value="">SELECT SOLDIER</option>{% for p in personnel_list %}<option value="{{p.id}}">{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}} — {{p.unit_code}}</option>{% endfor %}</select></label>
+      <label>TYPE DELETE<input name="delete_confirmation" placeholder="DELETE" required autocomplete="off"></label>
+      <button type="submit" name="action" value="DELETE_PERSONNEL" class="danger-delete-button"><span>DELETE DUPLICATE RECORD</span><small>PERMANENT ROSTER CORRECTION</small></button>
+    </form>
+  </article>
+  {% endif %}
+  {% else %}
+  <article class="document-sheet action-archive-sheet">
+    <header class="action-queue-header"><div><small>S-1 RECORDS / HEADQUARTERS FILE</small><b>COMPLETED ACTION ARCHIVE</b></div><span>COMPLETED, CLOSED, AND DENIED ACTIONS ARE FILED HERE</span></header>
+    <div class="archive-folder-mark">FILED ACTIONS • READ ONLY</div>
+    {% for a in archived_actions %}
+      <div class="archived-action-row">
+        <div><small>{{a.owning_section}} • {{a.priority}}</small><b>{{a.subject}}</b><span>{% if a.last_name %}{{a.rank_code}} {{a.last_name|soldier_name(a.first_name)}} • {{a.unit_code}}{% else %}BATTALION ACTION{% endif %}</span></div>
+        <strong>{{a.status}}</strong><time>{{a.updated_at.strftime('%d %b %Y') if a.updated_at else ''}}</time>
+      </div>
+    {% else %}<div class="action-empty-state"><b>NO FILED ACTIONS</b><p>Completed actions will automatically move into this archive.</p></div>{% endfor %}
+  </article>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block title %}Readiness Report • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-readiness-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--readiness">
+  <img src="{{url_for('static',filename='art/public-overhaul/issued-m16.webp')}}" alt="Soldier carrying an M16 in Vietnam jungle terrain">
+  <div class="public-section-hero__shade"></div>
+  <div><small>S-4 / TRAINING / HEADQUARTERS</small><h1>READINESS</h1><p>Public aggregate readiness drawn from the same personnel, weapon, equipment, qualification and training systems used by Headquarters.</p></div>
+</section>
+<section class="public-office-board">
+  <article class="readiness-report-paper">
+    <header><small>HEADQUARTERS • READINESS SUMMARY</small><h2>BATTALION READINESS REPORT</h2></header>
+    {% for label,value,note in [
+      ('WEAPON READINESS',readiness.weapon,'Current condition of issued weapons'),
+      ('EQUIPMENT READINESS',readiness.equipment,'Recorded issued equipment condition'),
+      ('QUALIFICATION RATE',readiness.qualification,'Soldiers holding current qualification records'),
+      ('TRAINING COMPLETE',readiness.training,'Soldiers with completed training records'),
+      ('BATTALION COMBAT READINESS',readiness.combat,'Average personnel readiness across active records')
+    ] %}
+    <div class="readiness-report-line"><div><b>{{label}}</b><small>{{note}}</small></div><div class="readiness-report-bar"><i style="width:{{value or 0}}%"></i></div><strong>{{value or 0}}%</strong></div>
+    {% endfor %}
+  </article>
+  <section class="public-readiness-explainer">
+    <div><small>ISSUED PROPERTY</small><h2>YOUR RIFLE IS PART OF YOUR RECORD.</h2><p>An issued M16 carries its own serial number, field use, estimated ammunition expenditure, fouling, cleaning, inspections and holder history. Operational use and inactivity both influence the accountability picture.</p></div>
+    <img loading="lazy" src="{{url_for('static',filename='art/public-overhaul/issued-m16.webp')}}" alt="M16 rifle in field use">
+  </section>
+</section>
+{% endblock %}

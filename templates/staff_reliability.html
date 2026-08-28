@@ -1,0 +1,60 @@
+{% extends 'base.html' %}
+{% block title %}Automation Reliability • {{site_name}}{% endblock %}
+{% block body_class %}page-staff-reliability{% endblock %}
+{% block content %}
+<section class="staff-center-hero reliability-hero">
+  <div><small>HEADQUARTERS • SYSTEM ASSURANCE</small><h1>AUTOMATION RELIABILITY</h1><p>One exception board for the systems that move a Soldier from application through active service. Healthy systems stay quiet; anything requiring staff attention links directly to its authoritative work center.</p></div>
+  <span class="staff-role-stamp"><b>{{report|selectattr('state','equalto','CURRENT')|list|length}} / {{report|length}}</b>SYSTEMS CURRENT</span>
+</section>
+<section class="reliability-summary-grid">
+  {% for r in report %}<a class="reliability-card state-{{r.state|lower|replace(' ','-')}}{% if r.name == 'SERVER TELEMETRY' %} reliability-card--telemetry{% endif %}" href="{{url_for(r.endpoint)}}">
+    <small>{{r.name}}</small><b>{{r.state}}</b><span>{{r.detail}}</span>{% if r.count %}<em>{{r.count}} EXCEPTION{{'' if r.count == 1 else 'S'}} →</em>{% else %}<em>NO ACTION REQUIRED</em>{% endif %}
+  </a>{% endfor %}
+</section>
+<section class="document-sheet reliability-repair-center"><header><small>COMMAND REPAIR CENTER</small><h2>FIX EVERYTHING</h2><p>Re-run authoritative reconciliation without changing legitimate personnel history.</p></header><div class="reliability-repair-actions"><form method="post" action="{{url_for('system_health_repair')}}"><input type="hidden" name="repair" value="ALL"><button type="submit">RUN FULL REPAIR</button></form><form method="post" action="{{url_for('system_health_repair')}}"><input type="hidden" name="repair" value="SYNC"><button type="submit">RETRY DISCORD SYNC</button></form><form method="post" action="{{url_for('system_health_repair')}}"><input type="hidden" name="repair" value="PROGRESSION"><button type="submit">RECHECK CAREER / RIBBONS</button></form><form method="post" action="{{url_for('system_health_repair')}}"><input type="hidden" name="repair" value="ACCESSION"><button type="submit">REPAIR ACCESSION</button></form><form method="post" action="{{url_for('system_health_repair')}}"><input type="hidden" name="repair" value="OPERATIONS"><button type="submit">RECONCILE OPERATIONS</button></form></div></section>
+{% if details.identity or details.mos or details.readiness %}
+<section class="staff-center-grid reliability-exception-detail-grid">
+  {% if details.identity %}
+  <article class="document-sheet">
+    <header><small>GAME IDENTITY</small><h2>LINKING REQUIRED</h2></header>
+    <p class="fine-print">Only permanently assigned members appear here. Link them with the Command-only Discord command <b>/hll-link-soldier</b>, or allow the normal application/telemetry link to complete.</p>
+    {% for p in details.identity %}
+    <div class="reliability-exception-row"><div><b>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}}</b><span>{{p.unit_code or '1-5 CAV'}}{% if p.platoon %} • {{p.platoon}}{% endif %}{% if p.squad %} • {{p.squad}}{% endif %}</span></div><a class="staff-hi-button secondary" href="{{url_for('staff_personnel_snapshot',personnel_id=p.id)}}">OPEN 201 FILE</a></div>
+    {% endfor %}
+  </article>
+  {% endif %}
+  {% if details.mos %}
+  <article class="document-sheet">
+    <header><small>MOS PROGRESSION</small><h2>LEGACY CURRENT GRADE</h2></header>
+    <p class="fine-print">These are current MOS grades still marked as manual/legacy. Historical old grades are no longer treated as failures. The server-authoritative MOS reconcile will replace current legacy grades when matching role telemetry is available.</p>
+    {% for p in details.mos %}
+    <div class="reliability-exception-row"><div><b>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}}</b><span>{{p.mos_code}} • {{p.proficiency_level or 'UNRATED'}} • {{p.certified_by or 'LEGACY'}}</span></div><a class="staff-hi-button secondary" href="{{url_for('staff_personnel_snapshot',personnel_id=p.id)}}">OPEN 201 FILE</a></div>
+    {% endfor %}
+  </article>
+  {% endif %}
+  {% if details.readiness %}
+  <article class="document-sheet">
+    <header><small>READINESS</small><h2>NO VERIFIED ACTIVITY YET</h2></header>
+    <p class="fine-print">Only assigned Soldiers who have been on the roster at least 14 days are listed. New recruits and recently assigned Soldiers are intentionally excluded.</p>
+    {% for p in details.readiness %}
+    <div class="reliability-exception-row"><div><b>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name)}}</b><span>{{p.unit_code or '1-5 CAV'}}{% if p.platoon %} • {{p.platoon}}{% endif %}{% if p.squad %} • {{p.squad}}{% endif %}</span></div><a class="staff-hi-button secondary" href="{{url_for('staff_personnel_snapshot',personnel_id=p.id)}}">OPEN 201 FILE</a></div>
+    {% endfor %}
+  </article>
+  {% endif %}
+</section>
+{% endif %}
+<section class="staff-center-grid reliability-lower-grid">
+  <article class="document-sheet">
+    <header><small>HLL SERVER</small><h2>{{server_seed.seed_state}}</h2></header>
+    <div class="reliability-server-line"><strong>{{server_seed.player_count}} / {{server_seed.max_players}}</strong><span>{{server_seed.map_name}} • {{server_seed.game_mode}}</span></div>
+    {% if server_seed.online and server_seed.seed_state == 'SEEDING' %}<p>{{server_seed.players_needed}} more player{{'' if server_seed.players_needed == 1 else 's'}} until the {{server_seed.seed_threshold}}-player launch threshold.</p>{% elif server_seed.seed_state == 'READY TO LAUNCH' %}<p>The server has reached the configured seeding threshold. Mission control remains a separate Command action.</p>{% else %}<p>Live RCON telemetry is not currently available.</p>{% endif %}
+    <a class="staff-hi-button" href="{{url_for('hll_telemetry_lab_page')}}">OPEN SERVER OPERATIONS</a>
+  </article>
+  <article class="document-sheet">
+    <header><small>CROSS-SYSTEM INTEGRITY</small><h2>{{'ALL CLEAR' if integrity.all_clear else (integrity.total|string ~ ' EXCEPTIONS')}}</h2></header>
+    <div class="reliability-integrity-counts"><span><b>{{integrity.red}}</b> CRITICAL</span><span><b>{{integrity.amber}}</b> REVIEW</span></div>
+    {% for e in integrity.issues[:6] %}<a class="reliability-exception" href="{{url_for(e.endpoint)}}"><b>{{e.title}}</b><span>{{e.detail}}</span></a>{% else %}<p class="staff-clear-state">No cross-system conflicts detected.</p>{% endfor %}
+    {% if session.get('access_role') in ['battalion_hq','commander','admin'] %}<a class="staff-hi-button secondary" href="{{url_for('battalion_control')}}">OPEN FULL SYSTEM HEALTH</a>{% endif %}
+  </article>
+</section>
+{% endblock %}

@@ -1,0 +1,142 @@
+{% extends 'base.html' %}
+{% block title %}About Us • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-about-page about-us-story-page{% endblock %}
+{% block content %}
+<section class="about-story-hero">
+  <div class="about-story-hero__shade"></div>
+  <div class="about-story-hero__inner">
+    <small>1ST BATTALION • 5TH CAVALRY REGIMENT</small>
+    <h1>ABOUT US</h1>
+    <p>We built the kind of Hell Let Loose: Vietnam community we kept looking for and could never quite find.</p>
+    <div class="about-story-hero__actions">
+      <a class="paper-action primary" href="#our-story"><span>READ OUR STORY</span></a>
+      <a class="paper-action" href="{{url_for('recruiting')}}"><span>BEGIN MY ENLISTMENT</span></a>
+    </div>
+  </div>
+</section>
+
+<main class="about-story-shell" id="our-story">
+  <section class="about-story-grid">
+    <article class="about-story-letter">
+      <header>
+        <small>FROM BATTALION HEADQUARTERS</small>
+        <h2>WHY WE BUILT THE 1/5 CAV</h2>
+      </header>
+
+      <p>The <strong>1st Battalion, 5th Cavalry Regiment</strong> was built because we were tired of joining gaming communities that all felt the same.</p>
+
+      <p>You know the type.</p>
+
+      <p>A giant Discord. A wall of rules. Ranks that don’t mean anything. People you never actually play with. Mandatory events that start feeling like work. You join, get thrown into a channel, and two weeks later nobody even remembers you’re there.</p>
+
+      <p class="about-story-emphasis"><strong>That is not what we wanted. So we built something different.</strong></p>
+
+      <p>The 1/5 Cav is a Hell Let Loose: Vietnam community built around one simple idea:</p>
+
+      <p class="about-story-quote"><strong>You should actually feel like you belong to something.</strong></p>
+
+      <p>When you join us, you’re not just another number on a roster. You’re assigned to a squad. You learn the names of the guys around you. You start building a reputation. People notice when you show up, when you help fill the server, when you make a great play, when you step up to lead, and when you’re the guy everyone wants next to them when things go sideways.</p>
+
+      <p>And we built an entire system around that.</p>
+
+      <p>Every member has their own <strong>201 File, service record, issued uniform, assignments, qualifications, awards, promotions, and career history</strong>. The things you do in the community actually follow you. Over time, your record starts telling the story of your time in the 1/5 Cav.</p>
+
+      <p>Not somebody else’s story.</p>
+
+      <p class="about-story-quote"><strong>Yours.</strong></p>
+
+      <p>Maybe you stay a rifleman and become one of the most dependable guys in your squad.</p>
+
+      <p>Maybe you become a medic everyone trusts.</p>
+
+      <p>Maybe you end up leading a fireteam, running a squad, flying helicopters, training replacements, or eventually helping run the unit.</p>
+
+      <p>There is no single path you have to follow.</p>
+
+      <p>And there is no requirement to treat this like a second job.</p>
+
+      <p>Most of us have jobs, families, school, military obligations, and real lives outside of gaming. We understand that because we live it too. You will not get yelled at because you missed a Thursday night formation. You will not get kicked because real life came first.</p>
+
+      <p class="about-story-emphasis"><strong>Show up when you can. Be part of the team when you’re here. Contribute.</strong></p>
+
+      <p>That’s what matters.</p>
+
+      <p>We still love the military structure, history, immersion, and camaraderie that make a good milsim community special. The difference is that we use those things to make the game <strong>more fun and more meaningful</strong>, not to make grown adults ask permission to go to bed.</p>
+
+      <p>We’re also deliberately building this unit smaller and tighter.</p>
+
+      <p>We do not care about having 500 people in Discord if only twenty of them know each other.</p>
+
+      <p>We would rather have a platoon full of guys who recognize each other’s voices, joke around between matches, know exactly who they want covering their flank, and actually give a damn when another member gets promoted.</p>
+
+      <p>That is the community we want.</p>
+
+      <p>A place where the website feels like your headquarters.</p>
+      <p>Where your squad actually feels like your squad.</p>
+      <p>Where earning a ribbon feels good because you remember what you did to get it.</p>
+      <p>Where a promotion means somebody noticed the effort you’ve been putting in.</p>
+      <p>Where six months from now you can open your record and actually see everything you’ve done since the day you joined.</p>
+
+      <p>And where logging on for a match feels less like joining a random server and more like <strong>meeting back up with your guys.</strong></p>
+
+      <p>We’re still building. We’re still growing. We’re going to make mistakes along the way.</p>
+
+      <p>But we care deeply about getting this right.</p>
+
+      <p>If you have been looking for a community where you can play seriously without taking yourself too seriously, where effort actually gets recognized, and where you can become part of the story instead of disappearing into a member list</p>
+
+      <p class="about-story-quote"><strong>come give us a shot.</strong></p>
+
+      <p>Your spot in the 1/5 Cav isn’t waiting to be handed to you.</p>
+
+      <p class="about-story-final-line"><strong>It’s waiting to be earned.</strong></p>
+    </article>
+
+    <aside class="about-story-sidebar" aria-label="What makes the 1/5 Cavalry different">
+      <section class="about-story-card about-story-card--identity">
+        <small>WHAT YOU BUILD</small>
+        <h3>A RECORD THAT IS ACTUALLY YOURS.</h3>
+        <p>201 File. Issued equipment. Uniform. Awards. Qualifications. Assignments. Promotions. Your history grows with what you actually do.</p>
+        <a href="{{url_for('public_operations')}}">SEE THE EXPERIENCE →</a>
+      </section>
+
+      <section class="about-rank-board">
+        <header><small>EARN YOUR PLACE</small><h3>EFFORT GETS NOTICED.</h3></header>
+        <div class="about-rank-board__patches">
+          <figure><img src="{{url_for('static',filename='art/about-us/corporal-chevron.webp')}}" alt="Worn corporal rank insignia"><figcaption>STEP UP</figcaption></figure>
+          <figure><img src="{{url_for('static',filename='art/about-us/sergeant-chevron.webp')}}" alt="Worn sergeant rank insignia"><figcaption>LEAD</figcaption></figure>
+          <figure><img src="{{url_for('static',filename='art/about-us/staff-sergeant-chevron.webp')}}" alt="Worn staff sergeant rank insignia"><figcaption>BUILD OTHERS</figcaption></figure>
+        </div>
+        <p>Rank is not decoration. Promotions should mean somebody noticed the work you put into the unit and the people around you.</p>
+      </section>
+
+      <section class="about-story-card about-story-card--squad">
+        <small>SMALLER ON PURPOSE</small>
+        <h3>KNOW THE GUYS NEXT TO YOU.</h3>
+        <p>We would rather build one platoon where people recognize each other than fill a Discord with hundreds of strangers.</p>
+      </section>
+
+      <section class="about-field-break">
+        <img loading="lazy" src="{{url_for('static',filename='art/public-overhaul/squad-field.webp')}}" alt="Squad operating together in Vietnam jungle">
+        <div><small>YOUR SQUAD SHOULD FEEL LIKE YOUR SQUAD.</small></div>
+      </section>
+
+      <section class="about-story-card about-story-card--human">
+        <div class="about-human-copy">
+          <small>THE HUMAN PART</small>
+          <h3>SERIOUS PLAY. NORMAL PEOPLE.</h3>
+          <p>Jobs, families, school, service, and real life come first. When you are here, show up for the team. When you cannot be here, handle life.</p>
+        </div>
+        <img src="{{url_for('static',filename='art/about-us/pbr-field-can.webp')}}" alt="Worn vintage Pabst Blue Ribbon can" class="about-human-can">
+      </section>
+    </aside>
+  </section>
+
+  <section class="about-story-cta">
+    <small>1ST BATTALION • 5TH CAVALRY REGIMENT</small>
+    <h2>PLAY SERIOUSLY.<br>DON’T TAKE YOURSELF TOO SERIOUSLY.</h2>
+    <p>If that sounds like the kind of unit you have been looking for, report to the Recruiting Office and see where you fit.</p>
+    <a class="paper-action primary" href="{{url_for('recruiting')}}"><span>BEGIN MY ENLISTMENT</span><small>YOUR RECORD STARTS HERE</small></a>
+  </section>
+</main>
+{% endblock %}

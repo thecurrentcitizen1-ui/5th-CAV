@@ -1,0 +1,33 @@
+{% extends 'base.html' %}
+{% block title %}Personnel Synchronization Control • {{site_name}}{% endblock %}
+{% block content %}
+<section class="document-sheet">
+  <header class="army-letterhead"><small>HEADQUARTERS / S-1</small><strong>PERSONNEL SYNCHRONIZATION CONTROL</strong><span>WEBSITE PERSONNEL RECORD = AUTHORITY • DISCORD = ACCESS / PRESENTATION</span></header>
+  <div class="staff-workload-strip"><span>LINKED PERSONNEL</span><b>{{counts.total}} TOTAL</b><b>{{counts.current}} CURRENT</b><b>{{counts.pending}} PENDING</b><b>{{counts.error}} NEED ATTENTION</b></div>
+  <p>The website owns Rank, MOS, Company, Platoon, Squad, Team and billet. Discord role edits are treated as drift. A Soldier becomes an active member when a real Platoon assignment is filed.</p>
+  <form method="post"><input type="hidden" name="action" value="RECONCILE_ALL"><button class="paper-action primary button-reset" type="submit"><span>RECONCILE ALL LINKED SOLDIERS</span><small>REAPPLY WEBSITE AUTHORITY TO DISCORD</small></button></form><form method="post" action="{{url_for('personnel_sync_repair_stuck')}}"><button class="paper-action button-reset" type="submit"><span>RETRY STUCK PENDING JOBS</span><small>RELEASE JOBS OLDER THAN 3 MINUTES FOR IMMEDIATE CLERK RETRY</small></button></form>
+</section>
+
+<section class="document-sheet"><header class="army-letterhead compact"><small>SYSTEM STATUS</small><strong>HEARTBEATS</strong><span>EXCEPTIONS SHOULD BE VISIBLE, NEVER SILENT</span></header>
+<div class="award-eligibility-columns">
+{% for h in heartbeats %}<div><h3>{{h.component}}</h3><p><b>{{h.status}}</b></p><p>LAST CHECK-IN: {{h.last_seen_at}}</p><p>VERSION: {{h.version or 'NOT REPORTED'}}</p></div>{% else %}<p class="typed-empty">NO BATTALION CLERK HEARTBEAT HAS BEEN RECEIVED YET.</p>{% endfor %}
+</div></section>
+
+<section class="document-sheet"><header class="army-letterhead compact"><small>PERSONNEL</small><strong>SYNC ROSTER</strong><span>ONE-CLICK REPAIR / EXACT FAILURE VISIBILITY</span></header>
+<div class="roster-control-list">
+{% for r in rows %}<article class="staff-search-result">
+  <div><small>{{r.unit_code}} • {{r.platoon or 'PLATOON PENDING'}} • {{r.squad or 'SQUAD PENDING'}} • {{r.fire_team or 'TEAM PENDING'}}</small><b>{{r.rank_code}} {{r.last_name|soldier_name(r.first_name)}}</b><span>{{r.mos_code or 'MOS PENDING'}} • {{r.field_status}} • {{r.lifecycle_state}}</span></div>
+  <div class="staff-search-status"><strong>{{r.observation_status or r.sync_status or 'UNKNOWN'}}</strong><span>{{r.observed_at or r.processed_at or r.requested_at or 'NO SYNC YET'}}</span></div>
+  <div>{% if r.observation_error or r.error_text %}<p><b>ERROR:</b> {{r.observation_error or r.error_text}}</p>{% elif r.sync_reason %}<p>{{r.sync_reason}}</p>{% endif %}<p><small>ATTEMPTS: {{r.attempt_count or 0}}{% if r.last_attempt_at %} • LAST: {{r.last_attempt_at}}{% endif %}{% if r.next_retry_at %} • NEXT RETRY: {{r.next_retry_at}}{% endif %}</small></p></div>
+  <form method="post"><input type="hidden" name="action" value="RECONCILE_ONE"><input type="hidden" name="personnel_id" value="{{r.id}}"><button type="submit">RECONCILE SOLDIER</button></form>
+</article>{% else %}<p class="typed-empty">NO LINKED ACTIVE PERSONNEL.</p>{% endfor %}
+</div></section>
+
+<section class="document-sheet"><header class="army-letterhead compact"><small>DISCORD</small><strong>MANAGED ROLE REGISTRY</strong><span>ROLE IDS, NOT DISPLAY TEXT, ARE TRACKED AFTER DISCOVERY</span></header>
+{% for g in role_registry %}<p><b>{{g.role_category}}</b> — {{g.role_count}} ROLES / {{g.canonical_count}} CANONICAL KEYS{% if g.blocked_count %} • {{g.blocked_count}} ABOVE CLERK / BLOCKED{% endif %}</p>{% else %}<p class="typed-empty">ROLE REGISTRY WILL POPULATE AFTER BATTALION CLERK CHECKS IN.</p>{% endfor %}
+</section>
+
+<section class="document-sheet"><header class="army-letterhead compact"><small>AUTOMATION</small><strong>RECENT AUTOMATION LEDGER</strong><span>PENDING • PROCESSING • COMPLETE • BLOCKED • FAILED • SUPERSEDED</span></header>
+{% for a in ledger %}<div class="staff-recent-row"><time>{{a.updated_at}}</time><div><b>{{a.system}} / {{a.event_type}} — {{a.status}}</b><span>{{a.summary}}</span></div><small>{% if a.last_name %}{{a.rank_code}} {{a.last_name|soldier_name(a.first_name)}}{% else %}BATTALION{% endif %}</small></div>{% else %}<p class="typed-empty">NO AUTOMATION EVENTS YET.</p>{% endfor %}
+</section>
+{% endblock %}

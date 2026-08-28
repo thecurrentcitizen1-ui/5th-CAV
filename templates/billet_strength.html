@@ -1,0 +1,133 @@
+{% extends 'base.html' %}
+{% block title %}Billet Strength • {{site_name}}{% endblock %}
+{% block body_class %}page-billet-strength{% endblock %}
+{% block content %}
+<section class="staff-section-hero">
+  <div class="staff-shade"></div>
+  <div class="staff-sign">
+    <span>BATTALION PERSONNEL CONTROL</span>
+    <h1>BILLET STRENGTH</h1>
+    <p>Authorized positions, vacancy pressure, and recruiting priorities are tracked here for command use.</p>
+  </div>
+</section>
+
+{% set ns = namespace(total_auth=0,total_filled=0,total_vacant=0,unit_count=0) %}
+{% for r in rows %}
+  {% set ns.total_auth = ns.total_auth + (r.authorized_strength or 0) %}
+  {% set ns.total_filled = ns.total_filled + (r.filled or 0) %}
+  {% set ns.total_vacant = ns.total_vacant + (r.vacant or 0) %}
+{% endfor %}
+{% set grouped = rows|groupby('unit_code') %}
+{% set ns.unit_count = grouped|length %}
+
+<section class="billet-command-shell">
+  <div class="billet-overview-grid">
+    <article class="document-sheet billet-command-panel">
+      <div class="command-panel-header">
+        <small>S-1 / COMMAND REVIEW</small>
+        <h2>Strength Summary</h2>
+        <p>Quick command snapshot of authorized manpower versus current fill across the battalion structure.</p>
+      </div>
+      <div class="billet-stat-strip">
+        <div class="billet-stat">
+          <small>Total Authorized</small>
+          <strong>{{ ns.total_auth }}</strong>
+          <span>positions currently established on the books</span>
+        </div>
+        <div class="billet-stat">
+          <small>Currently Filled</small>
+          <strong>{{ ns.total_filled }}</strong>
+          <span>active billets occupied by assigned Soldiers</span>
+        </div>
+        <div class="billet-stat">
+          <small>Current Vacancies</small>
+          <strong>{{ ns.total_vacant }}</strong>
+          <span>open seats still needing replacement personnel</span>
+        </div>
+        <div class="billet-stat">
+          <small>Units Tracked</small>
+          <strong>{{ ns.unit_count }}</strong>
+          <span>separate company or headquarters elements covered</span>
+        </div>
+      </div>
+      <div class="billet-notice">
+        Use this page as the battalion’s visual manning board. Filled positions reflect current roster assignment, while vacant strength drives MOS recruiting priorities and replacement intake planning.
+      </div>
+    </article>
+
+    <article class="document-sheet billet-command-panel">
+      <div class="command-panel-header">
+        <small>RECRUITING GUIDANCE</small>
+        <h2>Priority MOS Needs</h2>
+        <p>These are the highest-need specialties to push on the public recruiting side.</p>
+      </div>
+      <div class="billet-focus-list">
+        {% for n in needs[:8] %}
+        <div class="billet-focus-card">
+          <div>
+            <div class="billet-focus-badge">{{ n.mos_code }}</div>
+          </div>
+          <div>
+            <em>Priority MOS</em>
+            <strong>{{ n.mos_title }}</strong>
+            <span>{{ n.needed }} replacement{{ '' if n.needed == 1 else 's' }} needed</span>
+          </div>
+          <div class="billet-focus-number">{{ n.needed }}</div>
+        </div>
+        {% else %}
+        <p class="typed-empty">NO PRIORITY MOS SHORTAGES ARE CURRENTLY FILED.</p>
+        {% endfor %}
+      </div>
+    </article>
+  </div>
+
+  <div class="billet-unit-grid">
+    {% for unit_code, unit_rows in grouped %}
+      {% set unit = namespace(auth=0, filled=0, vacant=0) %}
+      {% for r in unit_rows %}
+        {% set unit.auth = unit.auth + (r.authorized_strength or 0) %}
+        {% set unit.filled = unit.filled + (r.filled or 0) %}
+        {% set unit.vacant = unit.vacant + (r.vacant or 0) %}
+      {% endfor %}
+      <article class="document-sheet billet-unit-card">
+        <header>
+          <small>AUTHORIZED UNIT MANNING</small>
+          <b>{{ unit_code }}</b>
+        </header>
+        <div class="billet-unit-summary">
+          <span class="billet-chip">AUTHORIZED <strong>{{ unit.auth }}</strong></span>
+          <span class="billet-chip">FILLED <strong>{{ unit.filled }}</strong></span>
+          <span class="billet-chip">VACANT <strong>{{ unit.vacant }}</strong></span>
+          <span class="billet-chip">ROLE LINES <strong>{{ unit_rows|length }}</strong></span>
+        </div>
+        <div class="billet-role-table">
+          <div class="head">Billet</div>
+          <div class="head">Auth</div>
+          <div class="head">Filled</div>
+          <div class="head">Vacant</div>
+          <div class="head">MOS</div>
+          {% for r in unit_rows %}
+            <div>
+              <span class="billet-role-title">{{ r.billet_title }}</span>
+              <span class="billet-role-sub">{{ r.unit_code }}</span>
+            </div>
+            <div>{{ r.authorized_strength }}</div>
+            <div>{{ r.filled }}</div>
+            <div>{{ r.vacant }}</div>
+            <div>{{ r.preferred_mos_code or '—' }}</div>
+          {% endfor %}
+        </div>
+        <div class="billet-strength-band">
+          <span>Total strength picture for <strong>{{ unit_code }}</strong></span>
+          <span>{{ unit.filled }} filled • {{ unit.vacant }} vacant out of {{ unit.auth }}</span>
+        </div>
+      </article>
+    {% else %}
+      <article class="document-sheet billet-unit-card">
+        <header><small>S-1 / COMMAND</small><b>BILLET FILE EMPTY</b></header>
+        <div class="billet-empty">NO BILLETS HAVE BEEN DEFINED YET.</div>
+      </article>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

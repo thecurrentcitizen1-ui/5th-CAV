@@ -1,0 +1,27 @@
+{% extends 'base.html' %}
+{% block title %}Why Join the 1/5 Cavalry • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-why-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--why">
+  <img src="{{url_for('static',filename='art/public-overhaul/combat-operations.webp')}}" alt="1/5 Cavalry field operation in Vietnam">
+  <div class="public-section-hero__shade"></div>
+  <div><small>WHY JOIN THE 1/5 CAVALRY?</small><h1>YOUR SERVICE IS RECORDED HERE.</h1><p>The difference is persistence: what you do in the battalion changes your Soldier record, equipment history, readiness, formation, and tour.</p></div>
+</section>
+<section class="public-office-board">
+  <section class="why-manifest-grid">
+    {% for title,copy in [
+      ('YOUR OWN PERSONNEL RECORD','Every member receives a persistent personnel and service record.'),
+      ('REAL UNIT ASSIGNMENTS','Members serve in real companies, platoons, squads and billets within the battalion.'),
+      ('STRUCTURED OPERATIONS & TRAINING','Operations, patrols, training events, qualifications and battalion events feed the same record system.'),
+      ('AWARDS & DECORATIONS SYSTEM','Earned ribbons and decorations remain filed to the Soldier and existing uniform rack.'),
+      ('EQUIPMENT & READINESS TRACKING','Issued M16s, rounds, maintenance, qualifications and readiness are tracked through actual backend records.'),
+      ('TOUR OF DUTY','Assignment, operations, awards and career milestones form a continuing tour.'),
+      ('RECRUITING PROCESS','New members move through application, command review, Replacement Detachment and assignment instead of receiving a generic role.')
+    ] %}
+    <article><span>{{'%02d'|format(loop.index)}}</span><h2>{{title}}</h2><p>{{copy}}</p></article>
+    {% endfor %}
+  </section>
+  <blockquote class="why-statement">THE MATCH ENDS. THE RECORD REMAINS.</blockquote>
+  <section class="public-personnel-cta"><div><small>REPLACEMENTS WANTED</small><h2>TAKE YOUR PLACE IN THE FORMATION.</h2><p>Start with an actual Recruiting Case and let the battalion system build the rest from there.</p></div><a href="{{url_for('recruiting')}}">BEGIN ENLISTMENT</a></section>
+</section>
+{% endblock %}

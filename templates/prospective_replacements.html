@@ -1,0 +1,65 @@
+{% extends 'base.html' %}
+{% block title %}Prospective Replacements • {{site_name}}{% endblock %}
+{% block body_class %}page-prospective-replacements{% endblock %}
+{% block content %}
+<section class="command-hq-hero recruiting-control-hero">
+  <div class="command-hq-hero-shade"></div>
+  <div class="command-hq-title">
+    <small>HEADQUARTERS • REPLACEMENT CONTROL</small>
+    <h1>PROSPECTIVE REPLACEMENTS</h1>
+    <p>Live Discord intake. Everyone shown here has joined the server but does not yet have an official 1/5 Cavalry personnel record. Command can adopt a Discord-first joiner directly into Recruiting Control.</p>
+  </div>
+</section>
+
+<section class="prospective-shell">
+  <nav class="prospective-nav">
+    <a href="{{url_for('recruiting_control')}}">← RECRUITING CONTROL</a>
+    <span>DISCORD INTAKE — NOT BATTALION PERSONNEL</span>
+  </nav>
+
+  <div class="prospective-stats">
+    <article><small>IN DISCORD INTAKE</small><strong>{{counts.total}}</strong></article>
+    <article><small>NO APPLICATION</small><strong>{{counts.no_application}}</strong></article>
+    <article><small>COMMAND REVIEW</small><strong>{{counts.review}}</strong></article>
+    <article><small>APPROVED / DEPOT</small><strong>{{counts.approved}}</strong></article>
+  </div>
+
+  <section class="prospective-board">
+    <header>
+      <small>REPLACEMENT DETACHMENT ROSTER</small>
+      <h2>DISCORD ARRIVALS AWAITING PERSONNEL CONVERSION</h2>
+      <p>Appearance on this board does not create a 201 File, grant rank, or count the member toward battalion strength.</p>
+    </header>
+
+    {% for r in rows %}
+    <article class="document-sheet prospective-row">
+      <div class="prospective-identity">
+        <small>DISCORD MEMBER</small>
+        <h3>{{(r.display_name or r.username)|gamertag}}</h3>
+        <span>@{{r.username}}</span>
+      </div>
+      <div><small>JOINED DISCORD</small><b>{{r.joined_at or r.updated_at}}</b></div>
+      <div><small>RECRUITING CASE</small><b>{{r.case_number or 'NONE FILED'}}</b></div>
+      <div><small>INTAKE STATUS</small><b>{{r.intake_status}}</b></div>
+      <div><small>DISCORD ID</small><b>{{r.discord_user_id}}</b></div>
+      <div class="prospective-actions">
+        {% if r.case_id %}
+        <a href="{{url_for('recruiting_case_archive',case_id=r.case_id)}}">VIEW APPLICATION</a>
+        {% else %}
+        <form method="post" action="{{url_for('adopt_prospective_replacement')}}" class="prospective-adopt-form">
+          <input type="hidden" name="guild_id" value="{{r.guild_id}}">
+          <input type="hidden" name="discord_user_id" value="{{r.discord_user_id}}">
+          <input type="hidden" name="username" value="{{r.username}}">
+          <input type="hidden" name="display_name" value="{{r.display_name}}">
+          <button type="submit">ADOPT TO RECRUITING CASE</button>
+        </form>
+        <small class="prospective-adopt-note">Creates a command-side Recruiting Case without generating a 201 File.</small>
+        {% endif %}
+      </div>
+    </article>
+    {% else %}
+    <p class="command-empty">NO ACTIVE DISCORD ARRIVALS ARE WAITING FOR PERSONNEL CONVERSION.</p>
+    {% endfor %}
+  </section>
+</section>
+{% endblock %}

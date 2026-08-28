@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}1/5 Awards and Decorations • {{site_name}}{% endblock %}
+{% block body_class %}public-awards-page{% endblock %}
+{% block content %}
+<section class="public-awards-hero">
+  <div class="public-awards-hero__inner">
+    <span>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY REGIMENT</span>
+    <h1>1/5 AWARDS AND DECORATIONS</h1>
+    <p>The battalion awards program records service, leadership, participation, and distinguished contribution. Every decoration below explains what it recognizes and exactly how a Soldier may qualify for it. Earned decorations remain part of the Soldier's permanent service record.</p>
+  </div>
+</section>
+
+<section class="public-awards-index">
+  <a href="#ribbons"><b>RIBBONS</b><small>Service • Leadership • Operations</small></a>
+  <a href="#medals"><b>MEDALS</b><small>Distinguished achievement and service</small></a>
+</section>
+
+<section id="ribbons" class="public-awards-section">
+  <header class="public-awards-section__head">
+    <span>SECTION I</span>
+    <h2>RIBBONS</h2>
+    <p>Ribbons are displayed in official battalion order of precedence. Progression awards are issued when recorded requirements are met. Command awards require Headquarters approval. Verification awards require private verification, and campaign awards use campaign-specific participation requirements.</p>
+  </header>
+  <div class="public-awards-grid">
+    {% for r in ribbons %}
+    <article class="public-award-card is-clickable" tabindex="0" role="button" data-award-public-card data-ribbon-code="{{r.ribbon_code}}" aria-label="Open {{r.ribbon_name}} details">
+      <div class="public-award-card__image">
+        {% if r.image_filename %}<img src="{{url_for('static',filename='art/ribbons/' ~ r.image_filename)}}" alt="{{r.ribbon_name}}">{% else %}<span>IMAGE PENDING</span>{% endif %}
+      </div>
+      <div class="public-award-card__copy">
+        <div class="public-award-card__meta">
+          <span>{{r.award_type_label or r.automation_mode|replace('_',' ')}}</span>
+          <small>ORDER OF PRECEDENCE {{r.sort_order}}</small>
+        </div>
+        <h3>{{r.ribbon_name}}</h3>
+
+        <div class="public-award-guidance">
+          <h4>WHAT THIS RIBBON RECOGNIZES</h4>
+          <p>{{r.description_text or r.requirement_text}}</p>
+        </div>
+
+        <div class="public-award-guidance public-award-guidance--earn">
+          <h4>HOW TO EARN IT</h4>
+          <p>{{r.earning_text or r.requirement_text}}</p>
+        </div>
+
+        <div class="public-award-rule">
+          <b>OFFICIAL REQUIREMENT</b>
+          <span>{{r.requirement_text}}</span>
+        </div>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<div class="award-detail-modal" data-award-public-modal aria-hidden="true">
+  <button class="award-detail-backdrop" type="button" data-award-public-close aria-label="Close ribbon detail"></button>
+  <section class="award-detail-sheet" role="dialog" aria-modal="true" aria-labelledby="public-award-detail-name">
+    <button class="award-detail-close" type="button" data-award-public-close>×</button>
+    <small>HEADQUARTERS • 1ST BATTALION, 5TH CAVALRY • 1965</small>
+    <img data-award-detail-image alt="">
+    <span class="award-detail-type" data-award-detail-type></span>
+    <h2 id="public-award-detail-name" data-award-detail-name></h2>
+    <div class="award-detail-grid"><div><b>WHAT IT RECOGNIZES</b><p data-award-detail-description></p></div><div><b>HOW TO EARN IT</b><p data-award-detail-earning></p></div></div>
+    <div class="award-detail-rule"><b>OFFICIAL REQUIREMENT</b><span data-award-detail-requirement></span></div>
+  </section>
+</div>
+<script type="application/json" id="public-ribbon-catalog-json">{{ ribbons|tojson }}</script>
+
+
+<section class="public-awards-section recent-decorations-section">
+  <header class="public-awards-section__head"><span>HEADQUARTERS REGISTER</span><h2>RECENTLY DECORATED PERSONNEL</h2><p>Recently filed battalion decorations. The permanent citation and General Orders remain in the Soldier's individual 201 File.</p></header>
+  <div class="recent-decoration-register">{% for a in recent_decorations %}<article><b>{{a.rank_code}} {{a.last_name|soldier_name(a.first_name)}}</b><span>{{a.award_name}}</span><small>{{a.award_date}}{% if a.order_number %} • {{a.order_number}}{% endif %}</small></article>{% else %}<p class="typed-empty">NO RECENT DECORATIONS ARE ON FILE.</p>{% endfor %}</div>
+</section>
+
+<section id="medals" class="public-awards-section public-awards-section--medals">
+  <header class="public-awards-section__head"><span>SECTION II</span><h2>MEDALS</h2><p>Full-size medals will be added as Headquarters establishes higher-level decorations. They will appear here with the same description, eligibility, and earning guidance as ribbons.</p></header>
+  {% if medals %}<div class="public-awards-grid">{% for m in medals %}<article class="public-award-card"><h3>{{m.name}}</h3><p>{{m.requirement}}</p></article>{% endfor %}</div>{% else %}<div class="public-awards-empty"><b>MEDAL PROGRAM NOT YET ISSUED</b><p>No battalion medals are currently active. Future medals will be published here when approved.</p></div>{% endif %}
+</section>
+{% endblock %}

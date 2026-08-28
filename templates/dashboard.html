@@ -1,0 +1,89 @@
+{% extends 'base.html' %}
+{% block title %}Member Home • {{site_name}}{% endblock %}
+{% block body_class %}page-dashboard member-command-home{% endblock %}
+{% block content %}
+{% set sit=situation or {} %}
+<section class="member-command-shell">
+  <header class="member-identity-strip">
+    <div>
+      <small>1/5 CAV • CURRENT FIELD STATUS</small>
+      <h1>{% if personnel %}{{personnel.rank_code or ''}} {{personnel.first_name}} {{personnel.last_name}}{% else %}PERSONNEL RECORD PENDING{% endif %}</h1>
+      <p>{{sit.assignment or personnel.unit_code or 'ASSIGNMENT PENDING'}}{% if sit.duty %} • {{sit.duty}}{% endif %}</p>
+    </div>
+    <dl>
+      <div><dt>STATUS</dt><dd>{{personnel.personnel_status_label or personnel.lifecycle_state or 'PENDING'}}</dd></div>
+      <div><dt>READINESS</dt><dd>{{sit.readiness_percent or 0}}%</dd></div>
+      <div><dt>TOUR DAY</dt><dd>{{sit.tour_day or 0}}</dd></div>
+      <div><dt>SERVER</dt><dd>{{'%.1f'|format(server.hours_7d|default(0)|float)}} HRS / 7D</dd></div>
+    </dl>
+  </header>
+
+  {% if welcome and welcome.packet and (welcome.packet.status|string|upper) not in ['COMPLETE','CLOSED','ARCHIVED'] %}
+  <section class="member-onboarding-callout">
+    <div><small>FIRST ARRIVAL</small><h2>COMPLETE YOUR WELCOME PACKET</h2><p>Your battalion in-processing is {{welcome.percent or 0}}% complete. Finish this before career progression fully opens.</p></div>
+    <div class="progress-track"><span style="width:{{welcome.percent or 0}}%"></span></div>
+    <a class="member-primary-button" href="{{url_for('welcome_packet')}}">CONTINUE IN-PROCESSING →</a>
+  </section>
+  {% endif %}
+
+  <section class="member-next-move {% if next_move.priority in ['HIGH','URGENT'] %}is-urgent{% endif %}">
+    <div class="next-move-copy"><small>{{next_move.section or 'HEADQUARTERS'}} • YOUR NEXT MOVE</small><h2>{{next_move.title or 'MAINTAIN READINESS'}}</h2><p>{{next_move.detail or 'No immediate deficiency is on file.'}}</p></div>
+    {% if next_move.target %}<a class="member-primary-button" href="{{url_for(next_move.target)}}{% if next_move.anchor %}#{{next_move.anchor}}{% endif %}">OPEN →</a>{% else %}<a class="member-primary-button" href="{{url_for('my_career')}}">VIEW CAREER →</a>{% endif %}
+  </section>
+
+  <div class="member-home-grid">
+    <section class="member-panel member-actions-panel">
+      <header><div><small>CURRENT • REQUIREMENTS</small><h2>WHAT NEEDS ATTENTION</h2></div><a href="{{url_for('my_action_center')}}">OPEN ALL</a></header>
+      {% set true_actions=[] %}
+      {% for a in actions %}{% if a.title not in ['UPCOMING OPERATION','DEROS'] %}{% set _=true_actions.append(a) %}{% endif %}{% endfor %}
+      {% for a in true_actions[:4] %}
+      <a class="member-task-row" href="{{url_for(a.target or 'my_201_file')}}{% if a.anchor %}#{{a.anchor}}{% endif %}">
+        <span class="task-state action">ACTION REQUIRED</span><div><b>{{a.title}}</b><small>{{a.detail}}</small></div><strong>→</strong>
+      </a>
+      {% else %}
+      <div class="member-empty-state"><b>NO MEMBER ACTION REQUIRED</b><p>Your record has no clearable deficiencies right now. Passive career requirements continue automatically.</p></div>
+      {% endfor %}
+    </section>
+
+    <section class="member-panel promotion-panel">
+      <header><div><small>S-1 • CAREER</small><h2>NEXT PROMOTION</h2></div><a href="{{url_for('my_career')}}#promotion">DETAILS</a></header>
+      {% if promotion %}
+      <div class="promotion-summary"><div><b>{{promotion.target}}</b><span>{{promotion.status}}</span></div><strong>{{promotion.percent}}%</strong></div>
+      <div class="progress-track"><span style="width:{{promotion.percent}}%"></span></div>
+      <div class="promotion-requirements">
+        {% for r in promotion.requirements %}
+        <div class="promotion-req"><span class="task-state {{'complete' if r.owner_state=='COMPLETE' else ('command' if r.owner_state=='AWAITING COMMAND' else ('progress' if r.owner_state=='IN PROGRESS' else 'action'))}}">{{r.owner_state}}</span><div><b>{{r.label}}</b><small>{{r.detail}}</small></div><em>{{r.percent}}%</em></div>
+        {% endfor %}
+      </div>
+      {% else %}<div class="member-empty-state"><b>PROMOTION TRACKER NOT OPEN</b><p>Complete required onboarding or wait for the next rank path to open.</p></div>{% endif %}
+    </section>
+
+    <section class="member-panel ribbon-panel">
+      <header><div><small>HONORS • PROGRESS</small><h2>CLOSEST RIBBONS</h2></div><a href="{{url_for('my_career')}}#ribbons">VIEW ALL</a></header>
+      {% for r in ribbons %}
+      <div class="ribbon-progress-row"><div><b>{{r.name}}</b><small>{{r.detail}}</small></div><strong>{{r.percent}}%</strong><div class="progress-track"><span style="width:{{r.percent}}%"></span></div></div>
+      {% else %}<div class="member-empty-state"><b>NO AUTOMATIC RIBBON TRACKS OPEN</b><p>Your earned decorations remain in the 201 File.</p></div>{% endfor %}
+    </section>
+
+    <section class="member-panel m16-panel">
+      <header><div><small>S-4 • INDIVIDUAL ARMS</small><h2>ISSUED M16</h2></div><a href="{{url_for('my_weapon_service_history')}}">WEAPON RECORD</a></header>
+      {% if weapon %}
+      <div class="m16-home-status"><div><b>{{weapon.display_state or weapon.condition_state}}</b><span>SERIAL {{weapon.serial_number}}</span></div><strong>{{weapon.rounds_since_cleaning or 0}}<small> RDS SINCE CLEAN</small></strong></div>
+      <dl class="member-mini-dl"><div><dt>INSPECTION</dt><dd>{% if inspection %}{% if inspection.overdue %}OVERDUE{% else %}{{inspection.days}} DAYS{% endif %}{% else %}NO DATE{% endif %}</dd></div><div><dt>TOTAL ROUNDS</dt><dd>{{weapon.total_rounds or 0}}</dd></div></dl>
+      {% else %}<div class="member-empty-state"><b>NO M16 ISSUED</b><p>S-4 has no current individual weapon issue on file.</p></div>{% endif %}
+    </section>
+
+    <section class="member-panel notification-panel">
+      <header><div><small>FIELD ORDERS • INBOX</small><h2>NOTIFICATIONS</h2></div><span class="notification-count">{{notifications|length}}</span></header>
+      {% for n in notifications %}<a class="member-notice-row" href="{{url_for(n.target_endpoint or 'my_201_file')}}{% if n.target_anchor %}#{{n.target_anchor}}{% endif %}"><div><b>{{n.title}}</b><small>{{n.message or n.detail or n.body}}</small></div><strong>→</strong></a>{% else %}<div class="member-empty-state"><b>NO NEW ORDERS</b><p>Headquarters has no unread notices for you.</p></div>{% endfor %}
+    </section>
+
+    <section class="member-panel recent-panel">
+      <header><div><small>PERSONNEL JOURNAL</small><h2>YOUR LAST 7 CHANGES</h2></div><a href="{{url_for('my_201_file')}}#service">201 FILE</a></header>
+      {% for e in recent %}<div class="recent-change-row"><time>{{e.entry_date}}</time><div><b>{{e.title}}</b><small>{{e.entry_type}}</small></div></div>{% else %}<div class="member-empty-state"><b>NO RECENT ENTRIES</b><p>Your service timeline will build as activity is recorded.</p></div>{% endfor %}
+    </section>
+  </div>
+
+  <details class="member-help-panel"><summary>WHAT DO THESE STATUS LABELS MEAN?</summary><div><p><b>ACTION REQUIRED</b> — something you can personally complete.</p><p><b>IN PROGRESS</b> — advances automatically from time, server activity, operations, or readiness.</p><p><b>AWAITING COMMAND</b> — leadership must file or approve the next step.</p><p><b>COMPLETE</b> — requirement is satisfied.</p></div></details>
+</section>
+{% endblock %}

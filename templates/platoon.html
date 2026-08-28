@@ -1,0 +1,27 @@
+{% extends 'base.html' %}
+{% block title %}Platoon Roster • {{site_name}}{% endblock %}
+{% block body_class %}page-platoon{% endblock %}
+{% block content %}
+<section class="records-room-heading"><div><span>COMPANY ORDERLY ROOM</span><h1>{{unit.display_name|formation_label if unit else 'PLATOON NOT FOUND'}}</h1><p>PLATOON PERSONNEL ROSTER</p></div></section>
+{% if unit %}
+<section class="platoon-room">
+  <article class="document-sheet platoon-command">
+    <header><small>PLATOON HEADQUARTERS</small><b>LEADERSHIP</b></header>
+    <dl>
+      <dt>PLATOON LEADER</dt><dd>{% if leadership.leader %}{{leadership.leader.rank_code}} {{leadership.leader.last_name|soldier_name(leadership.leader.first_name, true)}}{% else %}VACANT{% endif %}</dd>
+      <dt>PLATOON SERGEANT</dt><dd>{% if leadership.sergeant %}{{leadership.sergeant.rank_code}} {{leadership.sergeant.last_name|soldier_name(leadership.sergeant.first_name, true)}}{% else %}VACANT{% endif %}</dd>
+      <dt>PLATOON RTO</dt><dd>{% if leadership.rto %}{{leadership.rto.rank_code}} {{leadership.rto.last_name|soldier_name(leadership.rto.first_name, true)}}{% else %}VACANT{% endif %}</dd>
+    </dl>
+  </article>
+  <article class="assignment-board platoon-assignment-board">
+    {% for squad in squads %}
+      <section class="squad-board"><h3>{{squad.display_name|formation_label}}</h3>
+      {% for p in roster if p.unit_node_id == squad.id %}
+        <div class="name-strip"><strong>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name, true)}}</strong><small>{{p.duty_position or p.mos_code}}</small></div>
+      {% else %}<span class="vacant-strip">VACANT / NO PERSONNEL ENTERED</span>{% endfor %}
+      </section>
+    {% endfor %}
+  </article>
+</section>
+{% endif %}
+{% endblock %}

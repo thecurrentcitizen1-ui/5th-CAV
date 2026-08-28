@@ -1,0 +1,18 @@
+{% extends 'base.html' %}
+{% block title %}Armored Service Record • {{site_name}}{% endblock %}
+{% block content %}
+<section class="career-file-shell armored-service-shell">
+  <header class="career-file-hero document-sheet"><small>1/5 CAV • RECORDED FIELD SERVICE</small><h1>{{personnel.rank_code}} {{personnel.last_name|upper}} — ARMORED SERVICE RECORD</h1><p>Verified service time filed while serving as Crewman or Tank Commander.</p></header>
+  {% if hll_stats.linked %}
+  <div class="service-stat-grid armor-service-totals">
+    <article class="service-stat-card"><small>TOTAL ARMOR TIME</small><strong>{{hll_stats.armor_service.total_seconds//3600}}h {{(hll_stats.armor_service.total_seconds%3600)//60}}m</strong></article>
+    <article class="service-stat-card"><small>CREWMAN</small><strong>{{hll_stats.armor_service.crewman_seconds//3600}}h {{(hll_stats.armor_service.crewman_seconds%3600)//60}}m</strong></article>
+    <article class="service-stat-card"><small>TANK COMMANDER</small><strong>{{hll_stats.armor_service.tank_commander_seconds//3600}}h {{(hll_stats.armor_service.tank_commander_seconds%3600)//60}}m</strong></article>
+    <article class="service-stat-card"><small>ARMOR DISTANCE</small><strong>{{'%.1f'|format(hll_stats.armor_service.total_distance_meters/1000)}} KM</strong></article>
+    <article class="service-stat-card"><small>ROUNDS WITH ARMOR SERVICE</small><strong>{{hll_stats.armor_service.rounds}}</strong></article>
+  </div>
+  <section class="document-sheet armor-area-ledger"><header><small>AREA OF OPERATIONS</small><h2>ARMOR FIELD HISTORY</h2></header>{% if hll_stats.armor_service.maps %}<div class="hll-map-ledger"><div>{% for m in hll_stats.armor_service.maps %}<span><small>{{m.map_name}}</small><strong>{{m.seconds//3600}}h {{(m.seconds%3600)//60}}m</strong><em>{{m.rounds}} RDS • {{'%.1f'|format(m.distance_meters/1000)}} KM</em></span>{% endfor %}</div></div>{% else %}<p class="typed-empty">NO ARMORED SERVICE HAS BEEN RECORDED YET.</p>{% endif %}</section>
+  {% else %}<section class="document-sheet"><p class="typed-empty">FIELD SERVICE RECORD PENDING. CONTACT UNIT STAFF IF YOUR GAME ID HAS ALREADY BEEN LINKED.</p></section>{% endif %}
+  <nav class="career-page-actions"><a href="{{url_for('my_service_statistics')}}">SERVICE STATISTICS</a><a href="{{url_for('my_soldier_record')}}">RETURN TO SOLDIER RECORD</a></nav>
+</section>
+{% endblock %}

@@ -1,0 +1,16 @@
+{% extends 'base.html' %}
+{% block title %}Contact • {{site_name}}{% endblock %}
+{% block body_class %}public-section-page public-contact-page{% endblock %}
+{% block content %}
+<section class="public-section-hero public-section-hero--contact">
+  <img src="{{url_for('static',filename='art/public-overhaul/tour-in-country.webp')}}" alt="1/5 Cavalry patrol moving through Vietnam">
+  <div class="public-section-hero__shade"></div>
+  <div><small>BATTALION HEADQUARTERS • COMMUNICATIONS</small><h1>CONTACT</h1><p>Choose the correct channel: Recruiting for prospective members, Member Access for existing Soldiers.</p></div>
+</section>
+<section class="public-office-board contact-desk-grid">
+  <article class="public-office-paper"><small>PROSPECTIVE PERSONNEL</small><h2>RECRUITING OFFICE</h2><p>Begin with the official enlistment application. Discord identity verification and the Recruiting Case keep your processing tied to one record.</p><a class="hq-button hq-button--yellow" href="{{url_for('recruiting')}}">REPORT TO RECRUITING</a></article>
+  <article class="public-office-paper"><small>ACTIVE PERSONNEL</small><h2>MEMBER ACCESS</h2><p>Use your issued roster credentials to enter the member personnel system and open your Soldier Record.</p><a class="hq-button hq-button--paper" href="{{url_for('my_soldier_record')}}">REPORT FOR DUTY</a></article>
+  <article class="public-office-paper public-office-paper--staff"><small>AUTHORIZED HEADQUARTERS PERSONNEL</small><h2>STAFF ACCESS</h2><p>Staff authentication is separate from Battle Roster member credentials. Use your issued Headquarters staff username and password.</p><a class="hq-button hq-button--staff" href="/staff-login" data-auth-lane="staff">OPEN STAFF LOGIN</a></article>
+  {% if discord_invite_url %}<article class="public-office-paper"><small>DISCORD</small><h2>BATTALION COMMUNICATIONS</h2><p>Use the community Discord for voice communications and unit coordination. Recruiting processing remains website-first.</p><a class="hq-button hq-button--paper" href="{{discord_invite_url}}" rel="noopener">OPEN DISCORD</a></article>{% endif %}
+</section>
+{% endblock %}

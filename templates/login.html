@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}Report for Duty • {{site_name}}{% endblock %}
+{% block body_class %}page-login{% endblock %}
+{% block content %}
+<section class="identity-station battle-roster-login">
+  <div class="identity-photo"></div><div class="identity-shade"></div>
+  <article class="identity-form battle-roster-auth">
+    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>1ST BATTALION, 5TH CAVALRY</strong><span>PERSONNEL IDENTIFICATION • BATTLE ROSTER</span></header>
+    <div class="card-number-mark">FORM 1-5CAV / BR</div>
+    <h1>REPORT FOR DUTY</h1>
+    <p>Present the credentials issued on your Battle Roster Card.</p>
+    <form method="post" novalidate>
+      <label>BATTLE ROSTER NUMBER<input name="roster_number" autocomplete="username" placeholder="BR-000000" required></label>
+      <label>FIELD CODE<input name="field_code" type="password" autocomplete="current-password" required></label>
+      <button class="paper-action primary button-reset" type="submit"><span>REPORT</span><small>VERIFY PERSONNEL RECORD</small></button>
+    </form>
+    <footer>AUTHORIZED PERSONNEL ONLY • KEEP YOUR FIELD CODE PRIVATE</footer>
+    <a class="staff-access-link" href="{{url_for('staff_login')}}">BATTALION STAFF ACCESS</a>
+  </article>
+</section>
+{% endblock %}

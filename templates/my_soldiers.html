@@ -1,0 +1,58 @@
+{% extends 'base.html' %}
+{% block title %}My Squad • {{site_name}}{% endblock %}
+{% block body_class %}page-my-soldiers member-soldiers-redesign{% endblock %}
+{% block content %}
+<section class="records-room-heading my-soldiers-heading">
+  <div>
+    <span>NONCOMMISSIONED OFFICER WORKING FILE</span>
+    <h1>MY SQUAD</h1>
+    <p>{{scope.display_name if scope else 'CURRENT LEADERSHIP SCOPE'}}</p>
+  </div>
+</section>
+
+<section class="my-soldiers-room">
+  <article class="document-sheet leader-roster">
+    <header class="army-letterhead compact">
+      <small>PERSONNEL STATUS</small>
+      <strong>ASSIGNED SQUAD</strong>
+      <span>READINESS • TRAINING • PROMOTION • PROPERTY</span>
+    </header>
+
+    <div class="leader-roster-head" aria-hidden="true">
+      <span>SOLDIER</span><span>ASSIGNMENT</span><span>DUTY STATUS</span><span>ISSUED WEAPON</span><span>READINESS</span>
+    </div>
+
+    {% for row in soldiers %}{% set s=row.person %}
+      <section class="leader-soldier-file">
+        <div class="leader-roster-row">
+          <span class="leader-cell leader-cell--soldier"><small class="leader-mobile-label">SOLDIER</small><b>{{s.rank_code}} {{s.last_name|soldier_name(s.first_name, true)}}</b><em>{{s.duty_position or s.mos_code}}</em></span>
+          <span class="leader-cell"><small class="leader-mobile-label">ASSIGNMENT</small><b>{{s.platoon or s.unit_code or '—'}}</b><em>{{s.squad or '—'}}</em></span>
+          <span class="leader-cell"><small class="leader-mobile-label">DUTY STATUS</small><b>{{s.lifecycle_state}}</b><em>{{s.personnel_status_label}}</em></span>
+          <span class="leader-cell"><small class="leader-mobile-label">ISSUED WEAPON</small>{% if row.inspection %}<b>M16 {{row.inspection.weapon.serial_number}}</b><em class="{% if row.inspection.overdue %}status-alert{% endif %}">{% if row.inspection.overdue %}INSPECTION OVERDUE{% else %}INSPECTION DUE {{row.inspection.due}}{% endif %}</em>{% else %}<b>NO INDIVIDUAL WEAPON</b><em>NO PROPERTY RECORD</em>{% endif %}</span>
+          <span class="leader-cell leader-cell--readiness"><small class="leader-mobile-label">READINESS</small><b>{{row.readiness.overall}}</b><em>{{s.readiness_percent}}%</em></span>
+        </div>
+
+        <div class="leader-attention-strip">
+          <div class="leader-attention-item"><small>TRAINING</small><span>{{row.replacement.program_title|upper}}</span><b class="{% if not row.replacement.complete %}status-alert{% endif %}">{{'COMPLETE' if row.replacement.complete else 'INCOMPLETE'}}</b></div>
+          <div class="leader-attention-item"><small>DEFICIENCIES</small><span>OPEN ITEMS</span><b class="{% if row.readiness.deficiencies|length %}status-alert{% endif %}">{{row.readiness.deficiencies|length}}</b></div>
+          {% if row.eligibility %}
+          <div class="leader-attention-item"><small>NEXT RANK</small><span>{{row.eligibility[0].target}}</span><b>{{row.eligibility[0].status}}</b></div>
+          {% endif %}
+          <a class="leader-open-file" href="{{url_for('personnel_service_record',personnel_id=s.id)}}"><span>OPEN 201 FILE</span><small>PERSONNEL RECORD →</small></a>
+        </div>
+
+        {% for e in row.eligibility %}{% if e.eligible %}
+        <form method="post" class="army-form-grid leader-promo-form">
+          <input type="hidden" name="personnel_id" value="{{s.id}}">
+          <input type="hidden" name="target_rank" value="{{e.target}}">
+          <label class="wide">PROMOTION RECOMMENDATION — {{e.target}}<textarea name="justification" rows="2" required placeholder="State why this Soldier should be recommended for promotion."></textarea></label>
+          <button class="paper-action primary button-reset"><span>RECOMMEND {{e.target}}</span><small>FORWARD TO S-1</small></button>
+        </form>
+        {% endif %}{% endfor %}
+      </section>
+    {% else %}
+      <p class="typed-empty">NO SOLDIERS ARE ASSIGNED WITHIN YOUR CURRENT DUTY RESPONSIBILITY.</p>
+    {% endfor %}
+  </article>
+</section>
+{% endblock %}

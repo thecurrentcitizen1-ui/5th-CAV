@@ -1,0 +1,71 @@
+{% extends 'base.html' %}
+{% block title %}My Unit • {{site_name}}{% endblock %}
+{% block body_class %}page-my-unit member-unit-redesign org-member-page{% endblock %}
+{% block content %}
+<section class="org-member-shell">
+  <header class="org-member-hero document-sheet">
+    <small>1ST BATTALION, 5TH CAVALRY REGIMENT • YOUR FORMATION</small>
+    <h1>WHERE YOU FIT IN THE 1/5 CAV</h1>
+    <p>Your assignment is shown from Company down to your fire team. Each level opens into the formation above or below it.</p>
+  </header>
+
+  <nav class="org-breadcrumb" aria-label="Current assignment path">
+    <a href="{{url_for('organization')}}">1/5 CAV</a>
+    {% for crumb in org.breadcrumbs or [] %}<span>›</span><b class="{% if loop.last %}is-current{% endif %}">{{crumb.label}}</b>{% endfor %}
+  </nav>
+
+  <section class="org-assignment-path" aria-label="Your current assignment">
+    <article><small>COMPANY</small><strong>{{org.company_name or personnel.unit_code or 'PENDING'}}</strong><span>Company headquarters</span></article>
+    <i>→</i>
+    <article><small>PLATOON</small><strong>{{org.platoon.display_name if org.platoon else (personnel.platoon|formation_label if personnel.platoon else 'PENDING')}}</strong><span>Platoon command</span></article>
+    <i>→</i>
+    <article><small>SQUAD</small><strong>{{org.squad.display_name if org.squad else (personnel.squad|formation_label if personnel.squad else 'PENDING')}}</strong><span>Your fighting squad</span></article>
+    <i>→</i>
+    <article class="is-you"><small>TEAM</small><strong>{{org.team or (personnel.fire_team|formation_label if personnel.fire_team else 'UNASSIGNED')}}</strong><span>YOUR TEAM</span></article>
+  </section>
+
+  <section class="org-member-grid">
+    <article class="document-sheet org-duty-card">
+      <header><small>CURRENT ASSIGNMENT</small><h2>YOUR PLACE</h2></header>
+      <div class="org-duty-identity"><b>{{personnel.rank_code}} {{personnel.last_name|soldier_name(personnel.first_name)}}</b><span>{{personnel.duty_position or personnel.mos_code or 'SOLDIER'}}</span></div>
+      <dl>
+        <dt>IMMEDIATE LEADER</dt><dd>{% if org.immediate_leader %}{{org.immediate_leader.rank_code}} {{org.immediate_leader.last_name|soldier_name(org.immediate_leader.first_name)}}{% else %}NOT CURRENTLY FILED{% endif %}</dd>
+        <dt>TEAM LEADER</dt><dd>{% if org.leaders.team_leader %}{{org.leaders.team_leader.rank_code}} {{org.leaders.team_leader.last_name|soldier_name(org.leaders.team_leader.first_name)}}{% else %}VACANT / NOT FILED{% endif %}</dd>
+        <dt>SQUAD LEADER</dt><dd>{% if org.leaders.squad_leader %}{{org.leaders.squad_leader.rank_code}} {{org.leaders.squad_leader.last_name|soldier_name(org.leaders.squad_leader.first_name)}}{% else %}VACANT / NOT FILED{% endif %}</dd>
+        <dt>PLATOON SERGEANT</dt><dd>{% if org.leaders.platoon_sergeant %}{{org.leaders.platoon_sergeant.rank_code}} {{org.leaders.platoon_sergeant.last_name|soldier_name(org.leaders.platoon_sergeant.first_name)}}{% else %}VACANT / NOT FILED{% endif %}</dd>
+        <dt>PLATOON LEADER</dt><dd>{% if org.leaders.platoon_leader %}{{org.leaders.platoon_leader.rank_code}} {{org.leaders.platoon_leader.last_name|soldier_name(org.leaders.platoon_leader.first_name)}}{% else %}VACANT / NOT FILED{% endif %}</dd>
+      </dl>
+    </article>
+
+    <article class="document-sheet org-squad-summary">
+      <header><small>YOUR SQUAD</small><h2>{{org.squad.display_name if org.squad else (personnel.squad|formation_label if personnel.squad else 'ASSIGNMENT PENDING')}}</h2></header>
+      <div class="org-stat-strip"><span><small>ASSIGNED</small><b>{{org.squad_strength or 0}}</b></span><span><small>READINESS</small><b>{{org.squad_readiness or 0}}%</b></span><span><small>YOUR TEAM</small><b>{{org.team or '—'}}</b></span></div>
+      <div class="org-team-mini-grid">
+        {% for team_name in ['Alpha Team','Bravo Team'] %}
+        <section class="{% if org.team==team_name %}is-member-team{% endif %}"><h3>{{team_name}}{% if org.team==team_name %}<em>YOUR TEAM</em>{% endif %}</h3>
+          {% for m in org.teams.get(team_name,[]) %}<a class="canonical-soldier-link" href="{{url_for('squad_soldier_combat_record',personnel_id=m.id)}}"><b>{{m.rank_code}} {{m.last_name|soldier_name(m.first_name)}}</b><span>{{m.duty_position or m.mos_code or 'SOLDIER'}}{% if m.id==personnel.id %} • YOU{% endif %}</span></a>{% else %}<p>NO PERSONNEL FILED.</p>{% endfor %}
+        </section>
+        {% endfor %}
+      </div>
+    </article>
+  </section>
+
+  <nav class="org-level-actions">
+    <a class="primary" href="{{url_for('my_squad')}}">OPEN MY SQUAD</a>
+    <a href="{{url_for('my_platoon_identity')}}">VIEW MY PLATOON</a>
+    <a href="{{url_for('my_company_identity')}}">VIEW MY COMPANY</a>
+    <a href="{{url_for('organization')}}">VIEW BATTALION</a>
+  </nav>
+
+  <article class="document-sheet org-company-roster">
+    <header><small>{{org.company_name or personnel.unit_code}}</small><h2>COMPANY PERSONNEL DIRECTORY</h2><p>Your own squad/team is highlighted above. This directory shows how the rest of your company is organized.</p></header>
+    <div class="member-unit-table" role="table" aria-label="Current company roster">
+      <div class="member-unit-table__head" role="row"><span>SOLDIER</span><span>DUTY</span><span>PLATOON</span><span>SQUAD / TEAM</span></div>
+      {% for m in members %}<a class="member-unit-table__row canonical-soldier-link {% if m.id==personnel.id %}is-current-soldier{% endif %}" role="row" href="{{url_for('squad_soldier_combat_record',personnel_id=m.id)}}">
+        <span><b>{{m.rank_code}} {{m.last_name|soldier_name(m.first_name)}}</b>{% if m.id==personnel.id %}<small>YOU</small>{% endif %}</span>
+        <span>{{m.duty_position or m.mos_code or '—'}}</span><span>{{m.platoon|formation_label if m.platoon else 'HQ'}}</span><span>{{m.squad|formation_label if m.squad else '—'}}{% if m.fire_team %} • {{m.fire_team|formation_label}}{% endif %}</span>
+      </a>{% else %}<p class="typed-empty">NO COMPANY PERSONNEL ARE CURRENTLY FILED.</p>{% endfor %}
+    </div>
+  </article>
+</section>
+{% endblock %}

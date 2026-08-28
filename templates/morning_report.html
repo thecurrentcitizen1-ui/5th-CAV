@@ -1,0 +1,38 @@
+{% extends 'base.html' %}
+{% block title %}Morning Report • {{site_name}}{% endblock %}
+{% block body_class %}page-morning-report{% endblock %}
+{% block content %}
+<section class="morning-report-room">
+  <article class="document-sheet morning-report-note"><header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>MORNING REPORT EXPLANATION</strong><span>BATTALION STATUS AT 0600 HOURS</span></header><p>The Morning Report gives a daily snapshot of battalion strength, availability, deficiencies, and leave, personnel availability, and upcoming DEROS actions. It serves as the battalion's daily personnel picture at 0600 hours.</p></article>
+  <div class="mr-desk">
+    <article class="document-sheet morning-report-sheet">
+      <header class="mr-letterhead"><small>HEADQUARTERS</small><strong>1ST BATTALION, 5TH CAVALRY</strong><span>1ST CAVALRY DIVISION (AIRMOBILE)</span><b>MORNING REPORT</b><em>AS OF 0600 HOURS — {{report_date.strftime('%d %B %Y')|upper}}</em></header>
+      <div class="mr-grid mr-head"><span>ORGANIZATION</span><span>ASSIGNED</span><span>PRESENT</span><span>COMBAT EFFECTIVE</span><span>WIA</span><span>HOSPITAL</span><span>LEAVE</span><span>INACTIVE</span></div>
+      {% for row in company_rows %}
+      <div class="mr-grid"><span><b>{{row.unit.display_name|upper}}</b></span><span>{{row.summary.assigned}}</span><span>{{row.summary.present}}</span><span>{{row.summary.combat_effective}}</span><span>{{row.summary.wia}}</span><span>{{row.summary.hospital}}</span><span>{{row.summary.leave}}</span><span>{{row.summary.inactive}}</span></div>
+      {% endfor %}
+      <div class="mr-grid mr-total"><span>BATTALION TOTAL</span><span>{{total.assigned or 0}}</span><span>{{total.present or 0}}</span><span>{{total.combat_effective or 0}}</span><span>{{total.wia or 0}}</span><span>{{total.hospital or 0}}</span><span>{{total.leave or 0}}</span><span>{{total.inactive or 0}}</span></div>
+      {% if session.get("user_id") %}<form method="post" class="mr-file-action"><button class="paper-action primary button-reset"><span>FILE TODAY'S MORNING REPORT</span><small>CREATE / UPDATE ARCHIVE SNAPSHOT</small></button></form>{% endif %}
+    </article>
+
+    <aside class="mr-side-stack">
+      <article class="document-sheet deficiency-sheet"><header><small>BATTALION HEADQUARTERS</small><b>CRITICAL DEFICIENCIES</b></header>
+        <div class="deficiency-line"><span>ARMS</span><b>{{total.weapon_deficiencies or 0}}</b><small>WEAPON DEFICIENCIES</small></div>
+        <div class="deficiency-line"><span>PERSONNEL</span><b>{{total.personnel_deficiencies or 0}}</b><small>PERSONNEL DEFICIENCIES</small></div>
+        <div class="deficiency-line"><span>REPLACEMENTS</span><b>{{total.replacements or 0}}</b><small>AWAITING / UNASSIGNED</small></div>
+        {% for v in vacancies[:8] %}<div class="vacancy-notice"><b>VACANCY</b><span>{{v.position}}</span><small>{{v.organization}}</small></div>{% else %}<p class="typed-empty">NO KEY COMMAND VACANCIES REPORTED.</p>{% endfor %}
+      </article>
+
+      <article class="document-sheet deros-sheet"><header><small>PERSONNEL FORECAST</small><b>DEROS — NEXT 90 DAYS</b></header>
+        {% for p in forecast %}<div class="deros-line"><span>{{p.rank_code}} {{p.last_name|soldier_name(p.first_name, true)}}</span><b>{{p.deros_date}}</b><small>{{p.days_remaining}} DAYS REMAINING</small></div>{% else %}<p class="typed-empty">NO DEROS ACTIONS DUE WITHIN 90 DAYS.</p>{% endfor %}
+      </article>
+    </aside>
+  </div>
+
+  <article class="document-sheet strength-history"><header class="army-letterhead compact"><small>HEADQUARTERS • HISTORICAL ANALYSIS</small><strong>BATTALION STRENGTH — LAST 90 DAYS</strong><span>FILED MORNING REPORT TRENDS</span></header><div class="history-legend"><span>ASSIGNED</span><span>READINESS</span><span>WEAPONS</span><span>TRAINING</span></div><div class="history-bars">{% for r in snapshots|reverse %}<div class="history-day" title="{{r.report_date}} — {{r.battalion_assigned}} assigned / {{r.readiness_percent or 0}}% ready"><i style="height:{{[100,(r.battalion_assigned or 0)*2]|min}}%"></i><em style="height:{{r.readiness_percent or 0}}%"></em><b style="height:{{r.weapon_readiness_percent or 0}}%"></b><u style="height:{{r.training_current_percent or 0}}%"></u></div>{% endfor %}</div>{% if snapshots %}<p class="trend-current">LATEST: {{snapshots[0].report_number or 'MORNING REPORT'}} • {{snapshots[0].battalion_assigned}} ASSIGNED • {{snapshots[0].readiness_percent or 0}}% READY • {{snapshots[0].weapon_readiness_percent or 0}}% WEAPON READY • {{snapshots[0].training_current_percent or 0}}% TRAINING CURRENT</p>{% endif %}</article>
+<article class="document-sheet mr-archive"><header class="army-letterhead compact"><small>S-1 PERSONNEL</small><strong>MORNING REPORT ARCHIVE</strong><span>HISTORICAL BATTALION STRENGTH</span></header>
+    <div class="archive-head"><span>DATE</span><span>ASSIGNED</span><span>PRESENT</span><span>COMBAT EFFECTIVE</span><span>INACTIVE</span><span>DEROS 30</span></div>
+    {% for r in snapshots %}<div class="archive-row"><span>{{r.report_number or r.report_date}}</span><span>{{r.battalion_assigned}}</span><span>{{r.battalion_present}}</span><span>{{r.battalion_combat_effective}}</span><span>{{r.battalion_inactive}}</span><span>{{r.battalion_deros_30}}</span></div>{% else %}<p class="typed-empty">NO HISTORICAL MORNING REPORTS HAVE BEEN FILED.</p>{% endfor %}
+  </article>
+</section>
+{% endblock %}

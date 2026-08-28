@@ -1,0 +1,36 @@
+{% extends 'base.html' %}
+{% block title %}Welcome Packet — {{personnel.last_name}} • {{site_name}}{% endblock %}
+{% block body_class %}page-staff-welcome-packet{% endblock %}
+{% block content %}
+<section class="staff-welcome-file">
+  <header><div><small>S-1 • COMMAND VIEW</small><h1>{{personnel.rank_code}} {{personnel.last_name|soldier_name(personnel.first_name)}}</h1><p>Company onboarding progress, member certifications, and Command acceptance record.</p></div><div><b>{{packet.status|replace('_',' ')}}</b><span>{{percent}}% COMPLETE</span><a href="{{url_for('staff_welcome_packet_member_preview',personnel_id=personnel.id)}}">PREVIEW AS MEMBER</a><a href="{{url_for('staff_preview_center')}}">PREVIEW TEST CENTER</a><a href="{{url_for('personnel_service_record',personnel_id=personnel.id)}}">OPEN 201 FILE</a></div></header>
+  {% if packet.return_note %}<div class="welcome-phase-lock"><b>LAST RETURN NOTE:</b> {{packet.return_note}}</div>{% endif %}
+  {% for phase in phases %}
+  <section class="staff-welcome-phase">
+    <header><div><small>FIRST COMPANY ASSIGNMENT</small><h2>{{phase.label}}</h2></div><strong>{{phase.done}} / {{phase.total}}</strong></header>
+    {% for task in phase.tasks %}
+    <div class="staff-welcome-task">
+      <span>{{'✓' if task.status in ['COMPLETE','WAIVED'] else '○'}}</span>
+      <div class="staff-welcome-task-main">
+        <div class="staff-welcome-task-heading"><b>{{task.title}}</b><span>{{task.status|replace('_',' ')}}</span></div>
+        {% if task.completed_by or task.completed_at %}<small>{% if task.completed_by %}{{task.completed_by}}{% endif %}{% if task.completed_at %}{% if task.completed_by %} • {% endif %}{{task.completed_at.strftime('%d %b %Y %H:%M') if task.completed_at.strftime else task.completed_at}}{% endif %}</small>{% endif %}
+        <p>{{task.description}}</p>
+        {% if task.guidance %}
+        <div class="staff-welcome-guidance"><strong>HOW TO GET THERE:</strong> {{task.guidance.where}}<ol>{% for step in task.guidance.steps %}<li>{{step}}</li>{% endfor %}</ol></div>
+        {% endif %}
+      </div>
+      {% if packet.status not in ['COMPLETE','CLOSED','ARCHIVED'] %}<form method="post"><input type="hidden" name="task_code" value="{{task.task_code}}">{% if task.status not in ['COMPLETE','WAIVED'] %}<button name="action" value="COMPLETE">MARK COMPLETE</button><button name="action" value="WAIVE">WAIVE</button>{% else %}<button name="action" value="RESET">RESET</button>{% endif %}</form>{% else %}<b>ARCHIVED</b>{% endif %}
+    </div>
+    {% endfor %}
+  </section>
+{% endfor %}
+
+  {% if packet.status == 'READY_FOR_REVIEW' %}
+  <section class="welcome-submit-board"><small>COMMAND ACTION REQUIRED</small><h2>MEMBER SUBMITTED FOR ACCEPTANCE</h2><p>Accepting archives this packet, records Company Onboarding Completed in the 201 File, removes the dashboard onboarding task, and opens promotion eligibility.</p><form method="post"><button type="submit" name="action" value="APPROVE">ACCEPT &amp; ARCHIVE ONBOARDING →</button><textarea name="return_note" rows="3" placeholder="Reason for returning the packet"></textarea><button type="submit" name="action" value="RETURN">RETURN FOR CORRECTION</button></form></section>
+  {% elif packet.status in ['COMPLETE','CLOSED','ARCHIVED'] %}
+  <section class="welcome-submit-board"><small>PERMANENT RECORD</small><h2>ONBOARDING ACCEPTED &amp; ARCHIVED</h2><p>Accepted {{packet.approved_at.strftime('%d %b %Y %H:%M') if packet.approved_at and packet.approved_at.strftime else (packet.approved_at or packet.completed_at)}}{% if packet.approved_by %} by {{packet.approved_by}}{% endif %}. Promotion eligibility is open.</p></section>
+  {% else %}
+  <section class="welcome-submit-board"><small>COMMAND MONITORING</small><h2>{{percent}}% COMPLETE</h2><p>The member is still completing the checklist. Command can monitor progress or correct an individual item, but acceptance is unavailable until the member submits the finished packet.</p></section>
+  {% endif %}
+</section>
+{% endblock %}

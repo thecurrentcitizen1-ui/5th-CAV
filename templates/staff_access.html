@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block title %}Battalion Staff Access • {{site_name}}{% endblock %}
+{% block body_class %}page-login{% endblock %}
+{% block content %}
+<section class="identity-station staff-login-station">
+  <div class="identity-photo"></div><div class="identity-shade"></div>
+  <article class="identity-form staff-auth-form">
+    <header class="army-letterhead compact"><small>HEADQUARTERS</small><strong>1ST BATTALION, 5TH CAVALRY</strong><span>STAFF DUTY ACCESS</span></header>
+    <h1>BATTALION STAFF</h1>
+    <p>Staff credentials are issued separately from the Soldier Battle Roster Card.</p>
+    <form method="post" novalidate>
+      <label>STAFF IDENTIFICATION<input name="username" autocomplete="username" required></label>
+      <label>ACCESS CODE<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="paper-action primary button-reset" type="submit"><span>ENTER HEADQUARTERS</span><small>VERIFY STAFF ACCESS</small></button>
+    </form>
+    <a class="staff-access-link" href="{{url_for('login')}}">RETURN TO REPORT FOR DUTY</a>
+  </article>
+</section>
+{% endblock %}
