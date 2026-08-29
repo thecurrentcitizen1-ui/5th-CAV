@@ -1038,8 +1038,10 @@ SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') o
 SEEDING_MENTION_ROLE_NAME = '5th Cavalry Regiment'
 SEEDING_MESSAGE = (
     "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
+    "**CURRENT SERVER POPULATION: {population} PLAYERS**\n\n"
     "Server population is low.\n"
-    "All available 1/5 Cav personnel are requested in-country to help establish the line. "
+    "All available 1/5 Cav personnel are requested to get your ASSES to the FIGHT! "
+    "Help establish the line. Charlie is in the TREES!\n\n"
     "Earn credit time for the Seeding Ribbon and Medal!\n\n"
     "**GET IN THE FIGHT.**"
 )
@@ -5070,7 +5072,7 @@ async def seeding_message_watch():
             if regiment_role is None:
                 log.warning('[SEEDING] role %r not found guild=%s; sending without role mention',SEEDING_MENTION_ROLE_NAME,guild.id)
             await channel.send(
-                role_prefix + SEEDING_MESSAGE,
+                role_prefix + SEEDING_MESSAGE.format(population=population),
                 allowed_mentions=discord.AllowedMentions(everyone=False,users=False,roles=True,replied_user=False),
             )
             await record_seeding_notice(guild.id,now_et.date(),slot,channel.id,population)
