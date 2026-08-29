@@ -38,15 +38,14 @@ Recommended defaults:
 - `HLL_RCON_MAX_SPEED_MPS=130`
 - `HLL_RCON_RECONNECT_SECONDS=15`
 
-Discord commands:
+Current HLL / game-link commands:
 - `/link-game` — primary Soldier self-link command for Steam, Xbox, or PlayStation
-- `/hll-link` — legacy Steam-only compatibility alias
-- `/hll-unlink` — removes own link
-- `/hll-link-member` — staff link/repair
-- `/hll-link-console` — members link their own Xbox or PlayStation account by exact in-game gamertag after they have appeared on the server
-- `/hll-link-console-member` — staff override to link another Soldier to an observed console account
-- `/hll-rcon-status` — Command health check
+- `/hll-unlink` — removes the member's current game identity link
+- `/hll-link-soldier` — Command/staff manual link or repair for Steam, Xbox, or PlayStation
+- `/hll-rcon-status` — Command HLL collector health check
 - `/hll-stats` — member field-service totals
+
+Removed legacy commands (2026-08-29): `/hll-link`, `/hll-link-member`, `/hll-link-console`, `/hll-link-console-member`, `/schedule`, and `/operation-rounds-default`. Discord command sync removes these from the live slash-command list after deployment.
 
 The first release is telemetry-only. It intentionally does not issue server-management RCON commands.
 

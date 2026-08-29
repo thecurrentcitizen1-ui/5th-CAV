@@ -5,4 +5,4 @@
 - Duplicate/conflicting identities remain blocked instead of silently moving service between Soldier records.
 - Linking a Steam identity backfills telemetry collected before the link so eligible existing server history can attach to the Soldier.
 - Welcome Packet delivery now sends assignment and initial-onboarding-complete events to the appropriate Soldier Record destination rather than always pointing at the packet.
-- Existing `/hll-link`, `/hll-link-console`, and staff repair commands remain available for compatibility/repair.
+- Legacy self-link aliases were later retired on 2026-08-29. Use `/link-game`; staff use `/hll-link-soldier`.

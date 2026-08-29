@@ -2906,18 +2906,6 @@ async def duty_channel_status(interaction: discord.Interaction):
     await interaction.response.send_message('\n'.join(lines), ephemeral=True)
 
 
-@bot.tree.command(name='schedule', description='Operations are scheduled from the website S-3 Operations Center.')
-async def schedule_duty(interaction: discord.Interaction):
-    if not await require_manage_guild(interaction):
-        return
-    await interaction.response.send_message(
-        '**WEBSITE-AUTHORITATIVE OPERATIONS**\n'
-        'The Discord `/schedule` workflow has been retired to prevent duplicate or unlinked Operations.\n\n'
-        'Schedule and publish the Operation from the **S-3 Operations Center** on the website. '
-        'Battalion Clerk automatically receives the Operation ID, selected voice channel, start/end time, '
-        'credit threshold, reminders, and ammunition expenditure settings.',
-        ephemeral=True,
-    )
 
 
 @bot.tree.command(name='duty-status', description="Show current scheduled duty and each Soldier's credited voice time.")
@@ -4874,12 +4862,6 @@ async def post_operation_report_channel(interaction:discord.Interaction, channel
     await set_report_channel(interaction.guild_id,'POST_OPERATION',channel.id)
     await interaction.response.send_message(f'Post-operation processing reports will be posted to {channel.mention}.',ephemeral=True)
 
-@bot.tree.command(name='operation-rounds-default', description='Legacy setting; M16 field service now comes from verified HLL server telemetry.')
-async def operation_rounds_default(interaction:discord.Interaction, rounds:app_commands.Range[int,0,1000]):
-    if not await require_manage_guild(interaction): return
-    await ensure_clerk_settings_table(); db=collector.db
-    await db.execute("""INSERT INTO clerk_guild_settings(guild_id,operation_rounds_default,updated_at) VALUES($1,$2,NOW()) ON CONFLICT(guild_id) DO UPDATE SET operation_rounds_default=EXCLUDED.operation_rounds_default,updated_at=NOW()""",str(interaction.guild_id),rounds)
-    await interaction.response.send_message('M16 field service is now automatic from **verified HLL server telemetry**. Discord voice does not advance the rifle record. This legacy setting is retained only for older records.',ephemeral=True)
 
 async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db
@@ -4914,18 +4896,6 @@ async def link_game(interaction:discord.Interaction, platform:app_commands.Choic
         + ("Battalion Clerk will finish verification when this exact console identity is observed on the unit server." if not verified else "No additional self-link step is required."),
         ephemeral=True)
 
-@bot.tree.command(name='hll-link', description='Link your SteamID64 to your 1/5 CAV Soldier Record for automatic server statistics.')
-@app_commands.describe(steam_id='Your 17-digit SteamID64')
-async def hll_link(interaction:discord.Interaction, steam_id:str):
-    if not interaction.guild:
-        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    result=await hllv.link_personnel(interaction.guild.id,interaction.user.id,steam_id,f'DISCORD SELF-LINK:{interaction.user.id}')
-    if not result.get('ok'):
-        await interaction.followup.send(f"HLL link not filed: **{result.get('error','unknown error')}**",ephemeral=True); return
-    await interaction.followup.send(
-        f"**HLL: VIETNAM IDENTITY LINK FILED**\n{result.get('soldier')} is now linked to SteamID64 `{result.get('steam_id')}`. "
-        "Battalion Clerk will automatically file server time, distance, role time and combat statistics while you are on the unit server.",ephemeral=True)
 
 @bot.tree.command(name='hll-unlink', description='Remove your HLL: Vietnam game identity link from automatic server statistics.')
 async def hll_unlink(interaction:discord.Interaction):
@@ -4979,48 +4949,8 @@ async def hll_link_soldier(interaction:discord.Interaction, member:discord.Membe
         ephemeral=True
     )
 
-@bot.tree.command(name='hll-link-member', description='Staff: link a Soldier to a SteamID64 for HLL: Vietnam telemetry.')
-@app_commands.describe(member='Soldier to link',steam_id='17-digit SteamID64')
-async def hll_link_member(interaction:discord.Interaction, member:discord.Member, steam_id:str):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    result=await hllv.link_personnel(interaction.guild.id,member.id,steam_id,f'STAFF:{interaction.user.id}')
-    if not result.get('ok'):
-        await interaction.followup.send(f"Link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
-    await interaction.followup.send(f"Linked **{result.get('soldier')}** to SteamID64 `{result.get('steam_id')}`.",ephemeral=True)
 
-@bot.tree.command(name='hll-link-console', description='Link your Xbox or PS5 account to your 1/5 CAV Soldier Record.')
-@app_commands.describe(platform='Your console platform',gamertag='Your Gamertag / PSN Online ID exactly as it appears in-game')
-@app_commands.choices(platform=[
-    app_commands.Choice(name='Xbox', value='XBOX'),
-    app_commands.Choice(name='PlayStation 5', value='PS5'),
-])
-async def hll_link_console(interaction:discord.Interaction, platform:app_commands.Choice[str], gamertag:str):
-    if not interaction.guild:
-        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    result=await hllv.link_console_personnel(interaction.guild.id,interaction.user.id,platform.value,gamertag,f'DISCORD CONSOLE SELF-LINK:{interaction.user.id}')
-    if not result.get('ok'):
-        await interaction.followup.send(f"Console link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
-    await interaction.followup.send(
-        f"**HLL: VIETNAM CONSOLE LINK FILED**\nLinked **{result.get('soldier')}** to **{platform.name}** player **{result.get('player_name')}**. "
-        "Battalion Clerk will now attach your verified server service record to your Soldier Record.", ephemeral=True)
 
-@bot.tree.command(name='hll-link-console-member', description='Staff: link another Soldier to an Xbox or PS5 player by gamertag.')
-@app_commands.describe(member='Soldier to link',platform='Console platform',gamertag='Gamertag / PSN Online ID exactly as it appears in-game')
-@app_commands.choices(platform=[
-    app_commands.Choice(name='Xbox', value='XBOX'),
-    app_commands.Choice(name='PlayStation 5', value='PS5'),
-])
-async def hll_link_console_member(interaction:discord.Interaction, member:discord.Member, platform:app_commands.Choice[str], gamertag:str):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    result=await hllv.link_console_personnel(interaction.guild.id,member.id,platform.value,gamertag,f'STAFF CONSOLE LINK:{interaction.user.id}')
-    if not result.get('ok'):
-        await interaction.followup.send(f"Console link failed: **{result.get('error','unknown error')}**",ephemeral=True); return
-    await interaction.followup.send(
-        f"Linked **{result.get('soldier')}** to **{platform.name}** player **{result.get('player_name')}**. "
-        "Battalion Clerk will now attach that player's server service record to the Soldier Record.", ephemeral=True)
 
 
 @tasks.loop(minutes=1)
