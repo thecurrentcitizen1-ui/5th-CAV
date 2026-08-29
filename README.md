@@ -61,3 +61,12 @@ The Website now exposes an Accession Pipeline, Promotion Board, Personnel Sync r
 ## Discord channel-routing maintenance
 
 Use `/discord-routing-reset confirmation:RESET DISCORD ROUTING` before reorganizing Discord channels. The reset pauses automatic Website/Battalion Clerk channel delivery and clears route bindings without touching personnel or existing Discord structure. Reassign channels using the normal routing commands, verify with `/discord-routing-status`, then use `/discord-routing-resume confirm:RESUME DISCORD ROUTING`.
+
+## 2026-08-29 — Website Status Check Automation
+- Battalion Clerk automatically DMs linked active Soldiers whose website login is stale.
+- Default thresholds: never logged in after 3 days; last login older than 14 days; repeat check no sooner than 30 days after a response.
+- Status DM uses ✅ STILL ACTIVE / ❌ NO LONGER CONTINUING reactions.
+- Responses are recorded in `clerk_website_status_checks` and a staff-only service-history entry.
+- CPT-and-above Discord rank holders receive a direct Command status response report.
+- ❌ never automatically separates a Soldier; Command review is required.
+- Reserve personnel are excluded from the active-roll website status check.

@@ -37,11 +37,15 @@ VOICE_FLUSH_SECONDS = max(60, int(os.getenv('VOICE_FLUSH_SECONDS', '300') or 300
 DUTY_TYPES = ('TRAINING', 'OPERATION', 'MEETING')
 HLL_VIP_SYNC_ENABLED = str(os.getenv('HLL_VIP_SYNC_ENABLED','true')).strip().lower() in {'1','true','yes','on','enabled'}
 HLL_VIP_RESERVED_SLOTS = max(0,int(os.getenv('HLL_VIP_RESERVED_SLOTS','2') or 2))
+WEBSITE_STATUS_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_STATUS_CHECK_DAYS','14') or 14))
+WEBSITE_NEVER_LOGIN_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_NEVER_LOGIN_CHECK_DAYS','3') or 3))
+WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_REPEAT_DAYS','30') or 30))
 
 intents = discord.Intents.none()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
@@ -966,6 +970,20 @@ async def ensure_clerk_settings_table():
         PRIMARY KEY(guild_id,event_id)
     )""")
     await db.execute("ALTER TABLE clerk_operation_schedule_notices ADD COLUMN IF NOT EXISTS event_fingerprint TEXT")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_website_status_checks (
+        id UUID PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        personnel_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        dm_message_id TEXT,
+        last_website_login_at TIMESTAMPTZ,
+        check_reason TEXT NOT NULL,
+        sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        responded_at TIMESTAMPTZ,
+        response TEXT,
+        command_notified_at TIMESTAMPTZ
+    )""")
+    await db.execute("CREATE INDEX IF NOT EXISTS clerk_website_status_checks_personnel_idx ON clerk_website_status_checks(guild_id,personnel_id,sent_at DESC)")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_report_channels (guild_id TEXT NOT NULL, report_type TEXT NOT NULL, channel_id TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,report_type))""")
     await db.execute("""CREATE TABLE IF NOT EXISTS clerk_automation_notices (guild_id TEXT NOT NULL, personnel_id TEXT NOT NULL, notice_type TEXT NOT NULL, notice_key TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,personnel_id,notice_type,notice_key))""")
     await db.execute("""
@@ -3320,6 +3338,8 @@ async def on_ready():
         approved_recruit_watch.start()
     if not welcome_packet_watch.is_running():
         welcome_packet_watch.start()
+    if not website_status_check_watch.is_running():
+        website_status_check_watch.start()
     global collector_started, commands_synced
 
     # Persistent Help Desk buttons survive bot restarts.
@@ -4624,6 +4644,138 @@ async def _notice_once(guild_id,personnel_id,notice_type,notice_key):
     r=await db.fetchrow("""INSERT INTO clerk_automation_notices(guild_id,personnel_id,notice_type,notice_key) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING personnel_id""",str(guild_id),str(personnel_id),notice_type,notice_key)
     return bool(r)
 
+
+WEBSITE_STATUS_CHECK_MESSAGE = """**1/5 CAV — STATUS CHECK**
+
+SOLDIER! Battalion Clerk checking in.
+
+We haven’t seen you log into the 1/5 Cavalry website in a little while, and we want to make sure your status is still accurate.
+
+Your website is where your service is tracked including your **201 File, assignment, readiness, ribbons and awards, promotion progress, server activity, M16 status, qualifications, and current chain of command.**
+
+If you’re still active with the 5th Cav, react with **✅** and we’ll keep you on the active rolls.
+
+If you’re no longer looking to continue with the unit, react with **❌** and Command will update your status accordingly.
+
+If you’re just busy right now, that’s completely fine, this is only a status check.
+
+**✅ — STILL ACTIVE**
+
+**❌ — NO LONGER CONTINUING**
+
+**1/5 Cavalry — Charlie Won’t Wait. Neither Should You.**"""
+
+COMMAND_STATUS_RANKS = {'CPT','MAJ','LTC','COL','BG','MG','LTG','GEN'}
+
+async def _notify_cpt_and_above(guild: discord.Guild, soldier_name: str, response: str, last_login, check_reason: str):
+    """DM current CPT-and-above role holders with the Soldier's status-check response."""
+    label = 'STILL ACTIVE' if response == 'ACTIVE' else 'NO LONGER CONTINUING'
+    emoji = '✅' if response == 'ACTIVE' else '❌'
+    last_login_text = last_login.strftime('%Y-%m-%d %H:%M UTC') if last_login else 'NEVER LOGGED IN'
+    text = (f'**1/5 CAV — MEMBER STATUS RESPONSE**\n\n'
+            f'**Soldier:** {soldier_name}\n'
+            f'**Response:** {emoji} {label}\n'
+            f'**Last Website Login:** {last_login_text}\n'
+            f'**Check Reason:** {check_reason.replace("_"," ").title()}\n\n'
+            + ('No automatic separation was performed. Command review is required.' if response == 'LEAVING' else 'Status confirmation has been recorded by Battalion Clerk.'))
+    recipients=[]
+    for member in guild.members:
+        if member.bot: continue
+        role_names={r.name.strip().upper() for r in member.roles}
+        if role_names & COMMAND_STATUS_RANKS:
+            recipients.append(member)
+    for member in recipients:
+        try:
+            await member.send(text)
+        except Exception as exc:
+            log.warning('[STATUS CHECK COMMAND DM FAILED] member=%s error=%s',member.id,exc)
+
+@tasks.loop(minutes=60)
+async def website_status_check_watch():
+    """Friendly website-login status checks for linked active Soldiers."""
+    await collector.start(); db=collector.db
+    if not db.pool: return
+    await ensure_clerk_settings_table()
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            rows=await db.fetch("""
+                SELECT p.id::text personnel_id,p.rank_code,p.first_name,p.last_name,p.duty_position,p.field_status,
+                       w.discord_user_id::text discord_user_id,brc.issued_at,brc.last_used_at
+                FROM personnel p
+                JOIN website_member_links w ON w.personnel_id=p.id::text AND w.guild_id::text=$1
+                JOIN battle_roster_cards brc ON brc.personnel_id=p.id AND brc.is_active=TRUE
+                WHERE COALESCE(p.archived,FALSE)=FALSE
+                  AND UPPER(COALESCE(p.duty_position,'')) <> 'RESERVE'
+                  AND (
+                    (brc.last_used_at IS NULL AND brc.issued_at <= NOW() - ($2::int * INTERVAL '1 day'))
+                    OR
+                    (brc.last_used_at IS NOT NULL AND brc.last_used_at <= NOW() - ($3::int * INTERVAL '1 day'))
+                  )
+            """,str(guild.id),WEBSITE_NEVER_LOGIN_CHECK_DAYS,WEBSITE_STATUS_CHECK_DAYS)
+            for r in rows:
+                uid=str(r['discord_user_id'] or '')
+                if not uid.isdigit(): continue
+                member=guild.get_member(int(uid))
+                if not member or member.bot: continue
+                previous=await db.fetchrow("""SELECT sent_at,responded_at,response FROM clerk_website_status_checks
+                    WHERE guild_id=$1 AND personnel_id=$2 ORDER BY sent_at DESC LIMIT 1""",str(guild.id),r['personnel_id'])
+                if previous:
+                    anchor=previous['responded_at'] or previous['sent_at']
+                    cooldown=WEBSITE_STATUS_CHECK_REPEAT_DAYS if previous['responded_at'] else 14
+                    if anchor and anchor > datetime.now(timezone.utc)-timedelta(days=cooldown):
+                        continue
+                    if str(previous['response'] or '').upper()=='LEAVING':
+                        continue
+                reason='NEVER_LOGGED_IN' if r['last_used_at'] is None else 'WEBSITE_LOGIN_STALE'
+                try:
+                    msg=await member.send(WEBSITE_STATUS_CHECK_MESSAGE)
+                    await msg.add_reaction('✅'); await msg.add_reaction('❌')
+                    await db.execute("""INSERT INTO clerk_website_status_checks(id,guild_id,personnel_id,discord_user_id,dm_message_id,last_website_login_at,check_reason)
+                        VALUES($1,$2,$3,$4,$5,$6,$7)""",uuid.uuid4(),str(guild.id),r['personnel_id'],uid,str(msg.id),r['last_used_at'],reason)
+                    log.info('[WEBSITE STATUS CHECK SENT] guild=%s personnel=%s user=%s reason=%s',guild.id,r['personnel_id'],uid,reason)
+                except Exception as exc:
+                    log.warning('[WEBSITE STATUS CHECK DM FAILED] guild=%s user=%s error=%s',guild.id,uid,exc)
+        except Exception as exc:
+            log.warning('[WEBSITE STATUS CHECK WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+@website_status_check_watch.before_loop
+async def before_website_status_check_watch():
+    await bot.wait_until_ready()
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # This handler is intentionally scoped only to Battalion Clerk status-check DMs.
+    if payload.user_id == bot.user.id or str(payload.emoji) not in {'✅','❌'}:
+        return
+    await collector.start(); db=collector.db
+    if not db.pool: return
+    try:
+        row=await db.fetchrow("""SELECT * FROM clerk_website_status_checks
+            WHERE dm_message_id=$1 AND discord_user_id=$2 AND responded_at IS NULL
+            ORDER BY sent_at DESC LIMIT 1""",str(payload.message_id),str(payload.user_id))
+        if not row: return
+        response='ACTIVE' if str(payload.emoji)=='✅' else 'LEAVING'
+        await db.execute("UPDATE clerk_website_status_checks SET response=$1,responded_at=NOW() WHERE id=$2",response,row['id'])
+        soldier=await db.fetchrow("SELECT rank_code,first_name,last_name FROM personnel WHERE id::text=$1",row['personnel_id'])
+        name=f"{soldier['rank_code'] or ''} {soldier['first_name'] or ''} {soldier['last_name'] or ''}".strip() if soldier else row['personnel_id']
+        guild=bot.get_guild(int(row['guild_id'])) if str(row['guild_id']).isdigit() else None
+        user=bot.get_user(payload.user_id) or await bot.fetch_user(payload.user_id)
+        if response=='ACTIVE':
+            await user.send('✅ **STATUS RECEIVED — STILL ACTIVE**\n\nBattalion Clerk recorded your confirmation. When you get a chance, log into the battalion website to review your 201 File, assignment, readiness, awards, and current service progress.')
+        else:
+            await user.send('❌ **STATUS RECEIVED**\n\nBattalion Clerk recorded that you no longer wish to continue with the 1/5 Cavalry. **No automatic separation has been performed.** Command has been notified for review.')
+        if guild:
+            await _notify_cpt_and_above(guild,name,response,row['last_website_login_at'],row['check_reason'])
+            await db.execute("UPDATE clerk_website_status_checks SET command_notified_at=NOW() WHERE id=$1",row['id'])
+        try:
+            await db.execute("""INSERT INTO personnel_service_history(personnel_id,entry_type,title,narrative,authority,visibility)
+                VALUES($1::uuid,'ADMIN','MEMBER STATUS CHECK RESPONSE',$2,'BATTALION CLERK','STAFF')""",
+                row['personnel_id'], f"Discord status check response: {'STILL ACTIVE' if response=='ACTIVE' else 'NO LONGER CONTINUING'}. No automatic separation action taken.")
+        except Exception as exc:
+            log.warning('[STATUS CHECK SERVICE ENTRY FAILED] personnel=%s error=%s',row['personnel_id'],exc)
+    except Exception as exc:
+        log.warning('[WEBSITE STATUS REACTION FAILED] message=%s user=%s error=%s',payload.message_id,payload.user_id,exc)
 
 @tasks.loop(minutes=5)
 async def live_activity_credit_watch():
