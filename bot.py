@@ -1035,7 +1035,7 @@ async def reset_discord_routing(guild_id:int):
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
 SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') or 40))
-SEEDING_MENTION_ROLE_NAME = '5th Cavalry Regiment'
+SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Prospective Replacement')
 SEEDING_MESSAGE = (
     "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
     "**CURRENT SERVER POPULATION: {population} PLAYERS**\n\n"
@@ -5065,12 +5065,19 @@ async def seeding_message_watch():
                 log.warning('[SEEDING] configured channel unavailable guild=%s channel=%s',guild.id,channel_id)
                 continue
             # Seeding calls are only sent while the server is below the configured
-            # populated/ready threshold. Tag the battalion membership role so the
-            # call reaches 1/5 Cav personnel without pinging @everyone.
-            regiment_role=discord.utils.get(guild.roles,name=SEEDING_MENTION_ROLE_NAME)
-            role_prefix=f'{regiment_role.mention}\n' if regiment_role else ''
-            if regiment_role is None:
-                log.warning('[SEEDING] role %r not found guild=%s; sending without role mention',SEEDING_MENTION_ROLE_NAME,guild.id)
+            # populated/ready threshold. Tag both established battalion personnel and
+            # Prospective Replacements without pinging @everyone or individual users.
+            mention_roles=[]
+            missing_roles=[]
+            for role_name in SEEDING_MENTION_ROLE_NAMES:
+                role=discord.utils.get(guild.roles,name=role_name)
+                if role is not None:
+                    mention_roles.append(role)
+                else:
+                    missing_roles.append(role_name)
+            role_prefix=(' '.join(role.mention for role in mention_roles) + '\n') if mention_roles else ''
+            if missing_roles:
+                log.warning('[SEEDING] mention role(s) missing guild=%s roles=%s',guild.id,', '.join(missing_roles))
             await channel.send(
                 role_prefix + SEEDING_MESSAGE.format(population=population),
                 allowed_mentions=discord.AllowedMentions(everyone=False,users=False,roles=True,replied_user=False),
@@ -5091,7 +5098,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
     await set_seeding_channel(interaction.guild_id,channel.id)
     await interaction.response.send_message(
         f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **8:00, 8:30, 9:00, and 9:30 PM Eastern**. '
-        f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{SEEDING_MENTION_ROLE_NAME}**.',ephemeral=True)
+        f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
 @bot.tree.command(name='seeding-status', description='Show the nightly seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
@@ -5103,7 +5110,7 @@ async def seeding_status(interaction:discord.Interaction):
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
         '**Schedule:** 8:00 / 8:30 / 9:00 / 9:30 PM Eastern\n'
         f'**Populated threshold:** {SEEDING_STOP_POPULATION}+ players — seeding calls suppressed\n'
-        f'**Mention role:** {SEEDING_MENTION_ROLE_NAME}\n'
+        f'**Mention roles:** {" / ".join(SEEDING_MENTION_ROLE_NAMES)}\n'
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
