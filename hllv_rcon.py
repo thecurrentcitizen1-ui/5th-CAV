@@ -273,6 +273,9 @@ def _weapon_label(value: Any) -> str:
     return _text(value)
 
 
+HLL_ROUNDS_PER_INFANTRY_KILL = 7
+
+
 HLL_KNOWN_ROLE_MAPPINGS = {
     # Confirmed role IDs are also mapped to the community battlefield MOS so
     # verified role_seconds can drive MOS proficiency without a second timer.
@@ -387,10 +390,14 @@ class HLLVTelemetryCollector:
                 last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 final_allied_score INTEGER,
                 final_axis_score INTEGER,
+                allied_faction_id TEXT,
+                axis_faction_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_match_sessions_time ON hll_match_sessions(started_at DESC)")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS allied_faction_id TEXT")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS axis_faction_id TEXT")
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_player_match_stats (
                 id BIGSERIAL PRIMARY KEY,
@@ -602,6 +609,11 @@ class HLLVTelemetryCollector:
     async def start(self):
         await self.collector.start()
         await self.ensure_schema()
+        try:
+            credit=await self.reconcile_kill_round_credits()
+            log.info("[HLL KILL ROUND BACKFILL] matches=%s players=%s rounds_applied=%s",credit.get("matches"),credit.get("players"),credit.get("rounds"))
+        except Exception:
+            log.exception("[HLL KILL ROUND BACKFILL FAILED]")
         if not self.configured:
             log.warning("[HLLV RCON DISABLED] enabled=%s host=%s password=%s", RCON_ENABLED, bool(RCON_HOST), bool(RCON_PASSWORD))
             return False
@@ -929,6 +941,103 @@ class HLLVTelemetryCollector:
               is_m16=hll_weapon_events.is_m16 OR EXCLUDED.is_m16
         """, event_key, match_id, ts, event_type, attacker_id or None, personnel_id, attacker_name or None, victim_id or None, victim_name or None, weapon_id or None, weapon_name or None, is_m16, raw or None)
 
+    async def _file_kill_round_credit(self, match_id: int, personnel_id: str, kills: int, event_at: datetime) -> dict:
+        """Idempotently convert verified infantry kills into M16 round credit.
+
+        Community rule: 7 rounds are filed for each verified infantry kill.  The
+        credit is attached to the rifle that was issued to the Soldier on the
+        match date.  This is a bookkeeping model; the HLL API itself does not
+        expose trigger-pull telemetry.
+        """
+        kills=max(0,int(kills or 0))
+        if kills <= 0 or not personnel_id or not self.db.pool:
+            return {"applied":0}
+        when=event_at or utcnow()
+        event_date=when.date()
+        source_key=f"HLL_KILL_ROUNDS:{int(match_id)}:{personnel_id}"
+        desired=kills * HLL_ROUNDS_PER_INFANTRY_KILL
+        async with self.db.pool.acquire() as conn:
+            async with conn.transaction():
+                weapon=await conn.fetchrow("""
+                    SELECT wi.id,wi.serial_number,wi.last_cleaned_at
+                    FROM weapon_issue_history wih
+                    JOIN weapon_inventory wi ON wi.id=wih.weapon_id
+                    WHERE wih.personnel_id=$1::uuid
+                      AND wih.issued_at<=$2::date
+                      AND (wih.turned_in_at IS NULL OR wih.turned_in_at>=$2::date)
+                    ORDER BY wih.is_current DESC,wih.issued_at DESC
+                    LIMIT 1
+                """, personnel_id, event_date)
+                if not weapon:
+                    return {"applied":0,"reason":"no rifle issued for match date"}
+                existing=await conn.fetchrow("""
+                    SELECT id,rounds_fired,weapon_id,recorded_at
+                    FROM weapon_round_events WHERE source_key=$1
+                """, source_key)
+                old=int(existing["rounds_fired"] or 0) if existing else 0
+                delta=desired-old
+                if existing:
+                    # If historical data was corrected, keep the single source row
+                    # and reconcile the inventory by only the difference.
+                    old_weapon=str(existing["weapon_id"])
+                    new_weapon=str(weapon["id"])
+                    if old_weapon != new_weapon:
+                        await conn.execute("""UPDATE weapon_inventory
+                            SET total_rounds=GREATEST(0,COALESCE(total_rounds,0)-$1),updated_at=NOW()
+                            WHERE id=$2""", old, existing["weapon_id"])
+                        await conn.execute("""UPDATE weapon_round_events
+                            SET weapon_id=$1,rounds_fired=$2,recorded_at=$3,remarks=$4
+                            WHERE id=$5""", weapon["id"], desired, when,
+                            f"{kills} verified infantry kills × {HLL_ROUNDS_PER_INFANTRY_KILL} rounds per kill.", existing["id"])
+                        delta=desired
+                    elif delta:
+                        await conn.execute("""UPDATE weapon_round_events
+                            SET rounds_fired=$1,recorded_at=$2,remarks=$3 WHERE id=$4""",
+                            desired, when, f"{kills} verified infantry kills × {HLL_ROUNDS_PER_INFANTRY_KILL} rounds per kill.", existing["id"])
+                else:
+                    await conn.execute("""INSERT INTO weapon_round_events
+                        (weapon_id,personnel_id,rounds_fired,source_type,recorded_at,recorded_by,remarks,source_key)
+                        VALUES($1,$2::uuid,$3,'HLL KILL ROUND CREDIT',$4,'BATTALION CLERK',$5,$6)""",
+                        weapon["id"], personnel_id, desired, when,
+                        f"{kills} verified infantry kills × {HLL_ROUNDS_PER_INFANTRY_KILL} rounds per kill.", source_key)
+                if delta:
+                    await conn.execute("""UPDATE weapon_inventory SET
+                        total_rounds=GREATEST(0,COALESCE(total_rounds,0)+$1),
+                        rounds_since_cleaning=GREATEST(0,COALESCE(rounds_since_cleaning,0)+CASE
+                            WHEN last_cleaned_at IS NULL OR $2>last_cleaned_at THEN $1 ELSE 0 END),
+                        last_fired_at=CASE WHEN $1>0 THEN GREATEST(COALESCE(last_fired_at,$2),$2) ELSE last_fired_at END,
+                        updated_at=NOW() WHERE id=$3""", delta, when, weapon["id"])
+                return {"applied":max(0,delta),"desired":desired,"kills":kills,"weapon_id":str(weapon["id"])}
+
+    async def reconcile_kill_round_credits(self, match_id: Optional[int]=None) -> dict:
+        """Backfill/reconcile kill-derived round credit for completed HLL matches."""
+        if not self.db.pool:
+            return {"matches":0,"players":0,"rounds":0}
+        params=[]
+        match_filter=""
+        if match_id is not None:
+            params=[int(match_id)]
+            match_filter=" AND ms.id=$1"
+        rows=await self.db.fetch("""SELECT ms.id AS match_id,COALESCE(ms.ended_at,ms.last_seen_at,ms.started_at) AS ended_at,
+                    ps.personnel_id,COALESCE(ps.infantry_kills,0)::int AS infantry_kills
+             FROM hll_match_sessions ms
+             JOIN hll_player_match_stats ps ON ps.match_id=ms.id
+             WHERE ms.ended_at IS NOT NULL AND ps.personnel_id IS NOT NULL
+               AND COALESCE(ps.infantry_kills,0)>0"""+match_filter, *params)
+        result={"matches":0,"players":0,"rounds":0}
+        seen=set()
+        for row in rows:
+            mid=int(row["match_id"])
+            seen.add(mid)
+            try:
+                applied=await self._file_kill_round_credit(mid,str(row["personnel_id"]),int(row["infantry_kills"] or 0),row["ended_at"] or utcnow())
+                result["players"]+=1
+                result["rounds"]+=int(applied.get("applied") or 0)
+            except Exception:
+                log.exception("[HLL KILL ROUND CREDIT FAILED] match=%s personnel=%s",mid,row["personnel_id"])
+        result["matches"]=len(seen)
+        return result
+
     def _server_payload(self, session: Any) -> dict:
         d = _dump_model(session)
         map_obj = getattr(session, "map", None)
@@ -955,6 +1064,8 @@ class HLLVTelemetryCollector:
             "remaining_match_time": _seconds(_first(d, "remaining_match_time", "remainingMatchTime", default=0)),
             "allied_score": int(_first(d, "allied_score", "alliedScore", default=0) or 0),
             "axis_score": int(_first(d, "axis_score", "axisScore", default=0) or 0),
+            "allied_faction_id": _text(_first(d, "allied_faction_id", "alliedFactionId", "allied_faction", "alliedFaction", default="")),
+            "axis_faction_id": _text(_first(d, "axis_faction_id", "axisFactionId", "axis_faction", "axisFaction", default="")),
         }
 
     async def _ensure_match(self, server: dict) -> int:
@@ -962,17 +1073,29 @@ class HLLVTelemetryCollector:
         # Map/mode changes are authoritative round boundaries. A match timer reset
         # on the same layer is also detected by closing records that have been stale.
         if self._active_match_id and self._active_match_signature == signature:
+            await self.db.execute("""UPDATE hll_match_sessions SET last_seen_at=NOW(),
+                allied_faction_id=COALESCE(NULLIF($1,''),allied_faction_id),
+                axis_faction_id=COALESCE(NULLIF($2,''),axis_faction_id) WHERE id=$3""",
+                str(server.get('allied_faction_id') or ''),str(server.get('axis_faction_id') or ''),self._active_match_id)
             return self._active_match_id
         if self._active_match_id:
+            closed_match_id=self._active_match_id
             await self.db.execute("""
                 UPDATE hll_match_sessions SET ended_at=COALESCE(ended_at,NOW()),
                     final_allied_score=$1,final_axis_score=$2,last_seen_at=NOW()
                 WHERE id=$3
-            """, int(server.get("allied_score") or 0), int(server.get("axis_score") or 0), self._active_match_id)
+            """, int(server.get("allied_score") or 0), int(server.get("axis_score") or 0), closed_match_id)
+            try:
+                credit=await self.reconcile_kill_round_credits(closed_match_id)
+                if credit.get("rounds"):
+                    log.info("[HLL KILL ROUND CREDIT] match=%s players=%s rounds=%s",closed_match_id,credit.get("players"),credit.get("rounds"))
+            except Exception:
+                log.exception("[HLL KILL ROUND RECONCILE FAILED] match=%s",closed_match_id)
         row = await self.db.fetchrow("""
-            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds)
-            VALUES($1,$2,$3,$4,$5) RETURNING id
-        """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0))
+            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id)
+            VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id
+        """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0),
+             str(server.get('allied_faction_id') or '') or None,str(server.get('axis_faction_id') or '') or None)
         self._active_match_id = int(row["id"])
         self._active_match_signature = signature
         log.info("[HLLV MATCH OPEN] id=%s map=%s mode=%s", self._active_match_id, server.get("map_name"), server.get("game_mode"))

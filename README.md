@@ -75,3 +75,10 @@ Use `/discord-routing-reset confirmation:RESET DISCORD ROUTING` before reorganiz
 - Role 20 = Commander
 - Role 10 = Sniper
 - Both are filed into the verified HLL role registry on Battalion Clerk startup. No MOS code is inferred for either mapping.
+
+
+### Kill-driven M16 rounds (V30)
+Battalion Clerk files 7 M16 rounds for each verified infantry kill in a completed HLL match. Historical completed matches are reconciled at startup and each match is idempotent via `HLL_KILL_ROUNDS:<match_id>:<personnel_id>`. Blue-on-Blue is excluded.
+
+### Commander match-side telemetry (V31)
+Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with each HLL match. This lets the Website resolve a Soldier's recorded Team value against the correct final Allied/Axis score for Commander win/loss tracking.
