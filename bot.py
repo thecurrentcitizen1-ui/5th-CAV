@@ -5039,8 +5039,13 @@ COMMENDATION_CHOICES = [
 COMMENDATION_NAMES={c.value:c.name for c in COMMENDATION_CHOICES}
 
 async def ensure_commendations_table():
-    if not db or not getattr(db,'pool',None): return
-    async with db.pool.acquire() as conn:
+    # Commendations use the shared DataCollector database.  Do not reference a
+    # module-level `db` name: Battalion Clerk never defines one.
+    await collector.start()
+    commend_db = getattr(collector, 'db', None)
+    if not commend_db or not getattr(commend_db, 'pool', None):
+        raise RuntimeError('Battalion Clerk personnel database is not connected')
+    async with commend_db.pool.acquire() as conn:
         await conn.execute("""CREATE TABLE IF NOT EXISTS personnel_commendations (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), recipient_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
             giver_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL, guild_id BIGINT, category_code TEXT NOT NULL, message TEXT NOT NULL,
@@ -5081,8 +5086,11 @@ async def _linked_personnel_for_discord(guild_id:int,user_id:int):
     record exists. This prevents peer commendations from landing on stale duplicate
     personnel UUIDs left by repaired accessions cases.
     """
-    if not db or not getattr(db,'pool',None): return None
-    async with db.pool.acquire() as conn:
+    await collector.start()
+    commend_db = getattr(collector, 'db', None)
+    if not commend_db or not getattr(commend_db, 'pool', None):
+        return None
+    async with commend_db.pool.acquire() as conn:
         return await conn.fetchrow("""
             WITH candidates AS (
               SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position,
@@ -5142,7 +5150,9 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
                 log.exception('[COMMENDATION RESPONSE FAILED] guild=%s giver=%s recipient=%s',interaction.guild.id,interaction.user.id,member.id)
 
     try:
-        if not db or not getattr(db,'pool',None):
+        await collector.start()
+        commend_db = getattr(collector, 'db', None)
+        if not commend_db or not getattr(commend_db, 'pool', None):
             await _reply('Battalion Clerk cannot reach the personnel database right now. Nothing was filed. Try again in a moment.'); return
 
         # Schema creation/backfill runs during bot startup via ensure_commendations_table().
@@ -5160,7 +5170,7 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
             await _reply('That Soldier is not currently on the battalion rolls.'); return
 
         async def _file_commendation():
-            async with db.pool.acquire() as conn:
+            async with commend_db.pool.acquire() as conn:
                 async with conn.transaction():
                     # Discord IDs are the stable anti-duplicate identity. Personnel UUIDs
                     # remain the authoritative 201 File relationship.
