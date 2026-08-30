@@ -5114,6 +5114,12 @@ async def _linked_personnel_for_discord(guild_id:int,user_id:int):
 @app_commands.describe(member='Soldier receiving the commendation', category='Type of commendation', message='Short reason for the commendation')
 @app_commands.choices(category=COMMENDATION_CHOICES)
 async def commend(interaction:discord.Interaction, member:discord.Member, category:app_commands.Choice[str], message:str):
+    """File a peer commendation without doing schema maintenance in the interaction path.
+
+    Discord gets deferred immediately, then all database work is bounded. Any database
+    or identity error is converted into a visible ephemeral response instead of leaving
+    the interaction stuck on "Thinking...".
+    """
     if not interaction.guild:
         await interaction.response.send_message('Use this command inside the 1/5 Cavalry Discord server.',ephemeral=True); return
     if member.id==interaction.user.id:
@@ -5121,46 +5127,94 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
     reason=' '.join((message or '').split()).strip()
     if len(reason)<5:
         await interaction.response.send_message('Add a short reason explaining what the Soldier did.',ephemeral=True); return
-    if len(reason)>350: reason=reason[:350]
+    if len(reason)>350:
+        reason=reason[:350]
+
     await interaction.response.defer(ephemeral=True,thinking=True)
-    await ensure_commendations_table()
-    giver=await _linked_personnel_for_discord(interaction.guild.id,interaction.user.id)
-    recipient=await _linked_personnel_for_discord(interaction.guild.id,member.id)
-    if not giver:
-        await interaction.followup.send('Your Discord account is not linked to a 1/5 Cavalry Soldier Record yet.',ephemeral=True); return
-    if not recipient:
-        await interaction.followup.send('That Discord member is not linked to a 1/5 Cavalry Soldier Record.',ephemeral=True); return
-    if str(recipient.get('status') or '').upper() in {'SEPARATED','DISCHARGED','REMOVED'}:
-        await interaction.followup.send('That Soldier is not currently on the battalion rolls.',ephemeral=True); return
-    async with db.pool.acquire() as conn:
-        duplicate=await conn.fetchval("""SELECT 1 FROM personnel_commendations WHERE giver_personnel_id=$1 AND recipient_personnel_id=$2
-            AND category_code=$3 AND removed_at IS NULL AND created_at > NOW()-INTERVAL '24 hours' LIMIT 1""",giver['id'],recipient['id'],category.value)
-        if duplicate:
-            await interaction.followup.send('You already gave this Soldier that commendation category within the last 24 hours.',ephemeral=True); return
-        daily=await conn.fetchval("SELECT COUNT(*) FROM personnel_commendations WHERE giver_personnel_id=$1 AND removed_at IS NULL AND created_at::date=CURRENT_DATE",giver['id'])
-        if int(daily or 0)>=5:
-            await interaction.followup.send('You have reached the 5-commendation daily limit. Save the next one for tomorrow.',ephemeral=True); return
-        filed=await conn.fetchrow("""INSERT INTO personnel_commendations(
-                recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source,
-                recipient_discord_user_id,giver_discord_user_id)
-            VALUES($1,$2,$3,$4,$5,'DISCORD',$6,$7)
-            RETURNING id,recipient_personnel_id,recipient_discord_user_id,created_at""",
-            recipient['id'],giver['id'],interaction.guild.id,category.value,reason,member.id,interaction.user.id)
-        if not filed or str(filed['recipient_personnel_id']) != str(recipient['id']):
-            await interaction.followup.send('Battalion Clerk could not verify the commendation against the Soldier Record. Nothing was filed; notify Command.',ephemeral=True); return
-        # Permanent service-history mirror makes the recognition auditable even if a
-        # personnel-link repair occurs later. Failure here must not undo the commendation.
+
+    async def _reply(text:str):
         try:
-            await conn.execute("""INSERT INTO personnel_service_history(personnel_id,entry_date,entry_type,title,narrative,authority,visibility)
-                VALUES($1,CURRENT_DATE,'COMMENDATION',$2,$3,'BATTALION CLERK','MEMBER')""",
-                recipient['id'],COMMENDATION_NAMES.get(category.value,category.name),f'Peer commendation from {interaction.user.display_name}: {reason}')
+            await interaction.edit_original_response(content=text)
         except Exception:
-            log.exception('[COMMENDATION SERVICE HISTORY MIRROR FAILED] recipient=%s',recipient['id'])
-    name=COMMENDATION_NAMES.get(category.value,category.name)
-    await interaction.followup.send(f'**{name.upper()} FILED**\n{member.mention} has been commended and the entry is now on their 201 File.',ephemeral=True)
+            try:
+                await interaction.followup.send(text,ephemeral=True)
+            except Exception:
+                log.exception('[COMMENDATION RESPONSE FAILED] guild=%s giver=%s recipient=%s',interaction.guild.id,interaction.user.id,member.id)
+
     try:
-        await member.send(f"**1/5 CAV — COMMENDATION RECEIVED**\n\nYou received a **{name}** from **{interaction.user.display_name}**.\n\n> {reason}\n\nThe commendation is now filed under **201 FILE → COMMENDATIONS**.")
-    except discord.Forbidden: pass
+        if not db or not getattr(db,'pool',None):
+            await _reply('Battalion Clerk cannot reach the personnel database right now. Nothing was filed. Try again in a moment.'); return
+
+        # Schema creation/backfill runs during bot startup via ensure_commendations_table().
+        # Never run DDL or historical recovery SQL inside a live slash command.
+        giver,recipient=await asyncio.wait_for(asyncio.gather(
+            _linked_personnel_for_discord(interaction.guild.id,interaction.user.id),
+            _linked_personnel_for_discord(interaction.guild.id,member.id)
+        ),timeout=12.0)
+
+        if not giver:
+            await _reply('Your Discord account is not linked to a 1/5 Cavalry Soldier Record yet.'); return
+        if not recipient:
+            await _reply('That Discord member is not linked to a 1/5 Cavalry Soldier Record.'); return
+        if str(recipient.get('status') or '').upper() in {'SEPARATED','DISCHARGED','REMOVED'}:
+            await _reply('That Soldier is not currently on the battalion rolls.'); return
+
+        async def _file_commendation():
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    # Discord IDs are the stable anti-duplicate identity. Personnel UUIDs
+                    # remain the authoritative 201 File relationship.
+                    duplicate=await conn.fetchval("""SELECT 1 FROM personnel_commendations
+                        WHERE giver_discord_user_id=$1 AND recipient_discord_user_id=$2
+                          AND category_code=$3 AND removed_at IS NULL
+                          AND created_at > NOW()-INTERVAL '24 hours' LIMIT 1""",
+                        interaction.user.id,member.id,category.value)
+                    if duplicate:
+                        return ('duplicate',None)
+
+                    daily=await conn.fetchval("""SELECT COUNT(*) FROM personnel_commendations
+                        WHERE giver_discord_user_id=$1 AND removed_at IS NULL
+                          AND created_at::date=CURRENT_DATE""",interaction.user.id)
+                    if int(daily or 0)>=5:
+                        return ('daily',None)
+
+                    filed=await conn.fetchrow("""INSERT INTO personnel_commendations(
+                            recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source,
+                            recipient_discord_user_id,giver_discord_user_id)
+                        VALUES($1,$2,$3,$4,$5,'DISCORD',$6,$7)
+                        RETURNING id,recipient_personnel_id,recipient_discord_user_id,created_at""",
+                        recipient['id'],giver['id'],interaction.guild.id,category.value,reason,member.id,interaction.user.id)
+                    if not filed or str(filed['recipient_personnel_id']) != str(recipient['id']) or int(filed['recipient_discord_user_id'] or 0) != int(member.id):
+                        raise RuntimeError('Inserted commendation failed identity verification')
+
+                    # Service-history mirror is useful, but it must never block or roll
+                    # back an otherwise valid commendation if an older DB lacks fields.
+                    try:
+                        await conn.execute("""INSERT INTO personnel_service_history(personnel_id,entry_date,entry_type,title,narrative,authority,visibility)
+                            VALUES($1,CURRENT_DATE,'COMMENDATION',$2,$3,'BATTALION CLERK','MEMBER')""",
+                            recipient['id'],COMMENDATION_NAMES.get(category.value,category.name),f'Peer commendation from {interaction.user.display_name}: {reason}')
+                    except Exception:
+                        log.exception('[COMMENDATION SERVICE HISTORY MIRROR FAILED] recipient=%s',recipient['id'])
+                    return ('filed',filed)
+
+        status,filed=await asyncio.wait_for(_file_commendation(),timeout=12.0)
+        if status=='duplicate':
+            await _reply('You already gave this Soldier that commendation category within the last 24 hours.'); return
+        if status=='daily':
+            await _reply('You have reached the 5-commendation daily limit. Save the next one for tomorrow.'); return
+
+        name=COMMENDATION_NAMES.get(category.value,category.name)
+        await _reply(f'**{name.upper()} FILED**\n{member.mention} has been commended and the entry is now on their 201 File.')
+        try:
+            await member.send(f"**1/5 CAV — COMMENDATION RECEIVED**\n\nYou received a **{name}** from **{interaction.user.display_name}**.\n\n> {reason}\n\nThe commendation is now filed under **201 FILE → COMMENDATIONS**.")
+        except (discord.Forbidden,discord.HTTPException):
+            pass
+    except asyncio.TimeoutError:
+        log.exception('[COMMENDATION TIMEOUT] guild=%s giver=%s recipient=%s',interaction.guild.id,interaction.user.id,member.id)
+        await _reply('Battalion Clerk timed out while filing that commendation. **Nothing was confirmed as filed.** Try once more; if it repeats, notify Command.')
+    except Exception as exc:
+        log.exception('[COMMENDATION COMMAND FAILED] guild=%s giver=%s recipient=%s error=%s',interaction.guild.id,interaction.user.id,member.id,exc)
+        await _reply('Battalion Clerk hit a database error while filing that commendation. **Nothing was confirmed as filed.** Command can check the bot log for `COMMENDATION COMMAND FAILED`.')
 
 
 # ---------------------------------------------------------------------------

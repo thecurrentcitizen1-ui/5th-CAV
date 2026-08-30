@@ -88,3 +88,4 @@ Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with 
 - `/commend member category message` files one of eight peer commendations to the recipient's 201 File.
 - No self-commendations; same giver/recipient/category is limited to once per 24 hours; maximum five commendations per giver per day.
 - Commendations are recognition only and do not directly grant promotion points or ribbons.
+- V37 reliability fix: `/commend` no longer runs schema/backfill DDL inside the Discord interaction; database work is timeout-bounded and always resolves the deferred response instead of hanging on Thinking.
