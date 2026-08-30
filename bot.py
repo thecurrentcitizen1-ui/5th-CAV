@@ -5049,11 +5049,41 @@ async def ensure_commendations_table():
         await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_giver_idx ON personnel_commendations(giver_personnel_id,created_at DESC)")
 
 async def _linked_personnel_for_discord(guild_id:int,user_id:int):
+    """Resolve Discord identity to the canonical active Soldier record.
+
+    Prefer the personnel record attached to an active Battle Roster Card / approved
+    recruiting case. Fall back to the bridge table only when no stronger current
+    record exists. This prevents peer commendations from landing on stale duplicate
+    personnel UUIDs left by repaired accessions cases.
+    """
     if not db or not getattr(db,'pool',None): return None
     async with db.pool.acquire() as conn:
-        return await conn.fetchrow("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position
-            FROM website_member_links l JOIN personnel p ON p.id::text=l.personnel_id
-            WHERE l.guild_id=$1 AND l.discord_user_id=$2 LIMIT 1""",guild_id,user_id)
+        return await conn.fetchrow("""
+            WITH candidates AS (
+              SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position,
+                     CASE WHEN brc.id IS NOT NULL AND brc.is_active=TRUE THEN 300 ELSE 0 END +
+                     CASE WHEN COALESCE(p.archived,FALSE)=FALSE THEN 50 ELSE 0 END +
+                     20 AS score,
+                     GREATEST(COALESCE(brc.issued_at,'epoch'::timestamptz),COALESCE(p.updated_at,p.created_at)) touched
+                FROM recruiting_cases rc
+                JOIN personnel p ON p.id=rc.personnel_id
+                LEFT JOIN battle_roster_cards brc ON brc.personnel_id=p.id AND brc.is_active=TRUE
+               WHERE rc.guild_id=$1 AND rc.discord_user_id=$2 AND rc.personnel_id IS NOT NULL
+              UNION ALL
+              SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position,
+                     CASE WHEN brc.id IS NOT NULL AND brc.is_active=TRUE THEN 300 ELSE 0 END +
+                     CASE WHEN COALESCE(p.archived,FALSE)=FALSE THEN 50 ELSE 0 END +
+                     10 AS score,
+                     GREATEST(COALESCE(brc.issued_at,'epoch'::timestamptz),COALESCE(p.updated_at,p.created_at)) touched
+                FROM website_member_links l
+                JOIN personnel p ON p.id::text=l.personnel_id
+                LEFT JOIN battle_roster_cards brc ON brc.personnel_id=p.id AND brc.is_active=TRUE
+               WHERE l.guild_id=$1 AND l.discord_user_id=$2
+            )
+            SELECT id,rank_code,first_name,last_name,status,duty_position
+              FROM candidates
+             ORDER BY score DESC,touched DESC
+             LIMIT 1""",guild_id,user_id)
 
 @bot.tree.command(name='commend', description='Recognize another 1/5 Cavalry Soldier for a positive contribution.')
 @app_commands.describe(member='Soldier receiving the commendation', category='Type of commendation', message='Short reason for the commendation')
@@ -5085,7 +5115,19 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
         daily=await conn.fetchval("SELECT COUNT(*) FROM personnel_commendations WHERE giver_personnel_id=$1 AND removed_at IS NULL AND created_at::date=CURRENT_DATE",giver['id'])
         if int(daily or 0)>=5:
             await interaction.followup.send('You have reached the 5-commendation daily limit. Save the next one for tomorrow.',ephemeral=True); return
-        await conn.execute("""INSERT INTO personnel_commendations(recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source) VALUES($1,$2,$3,$4,$5,'DISCORD')""",recipient['id'],giver['id'],interaction.guild.id,category.value,reason)
+        filed=await conn.fetchrow("""INSERT INTO personnel_commendations(recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source)
+            VALUES($1,$2,$3,$4,$5,'DISCORD')
+            RETURNING id,recipient_personnel_id,created_at""",recipient['id'],giver['id'],interaction.guild.id,category.value,reason)
+        if not filed or str(filed['recipient_personnel_id']) != str(recipient['id']):
+            await interaction.followup.send('Battalion Clerk could not verify the commendation against the Soldier Record. Nothing was filed; notify Command.',ephemeral=True); return
+        # Permanent service-history mirror makes the recognition auditable even if a
+        # personnel-link repair occurs later. Failure here must not undo the commendation.
+        try:
+            await conn.execute("""INSERT INTO personnel_service_history(personnel_id,entry_date,entry_type,title,narrative,authority,visibility)
+                VALUES($1,CURRENT_DATE,'COMMENDATION',$2,$3,'BATTALION CLERK','MEMBER')""",
+                recipient['id'],COMMENDATION_NAMES.get(category.value,category.name),f'Peer commendation from {interaction.user.display_name}: {reason}')
+        except Exception:
+            log.exception('[COMMENDATION SERVICE HISTORY MIRROR FAILED] recipient=%s',recipient['id'])
     name=COMMENDATION_NAMES.get(category.value,category.name)
     await interaction.followup.send(f'**{name.upper()} FILED**\n{member.mention} has been commended and the entry is now on their 201 File.',ephemeral=True)
     try:
