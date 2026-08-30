@@ -5039,11 +5039,11 @@ COMMENDATION_CHOICES = [
 COMMENDATION_NAMES={c.value:c.name for c in COMMENDATION_CHOICES}
 
 async def ensure_commendations_table():
-    """Create the peer-commendation table with the original V33 core schema.
+    """Create or reconcile the peer-commendation schema.
 
-    The live /commend command only depends on these core columns. Optional identity
-    columns are added independently so a legacy/backfill problem can never prevent
-    commendations from being filed.
+    CREATE TABLE IF NOT EXISTS alone is not sufficient when an older release already
+    created the table with fewer columns. Reconcile every field the live command or
+    Website reads so schema drift cannot produce UndefinedColumnError.
     """
     await collector.start()
     commend_db = getattr(collector, 'db', None)
@@ -5052,61 +5052,72 @@ async def ensure_commendations_table():
     async with commend_db.pool.acquire() as conn:
         await conn.execute("""CREATE TABLE IF NOT EXISTS personnel_commendations (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            recipient_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
-            giver_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL,
+            recipient_personnel_id UUID,
+            giver_personnel_id UUID,
             guild_id BIGINT,
-            category_code TEXT NOT NULL,
-            message TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'DISCORD',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            category_code TEXT,
+            message TEXT,
+            source TEXT DEFAULT 'DISCORD',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
             removed_at TIMESTAMPTZ,
             removed_by TEXT,
-            removal_reason TEXT
+            removal_reason TEXT,
+            recipient_discord_user_id BIGINT,
+            giver_discord_user_id BIGINT
         )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_idx ON personnel_commendations(recipient_personnel_id,created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_giver_idx ON personnel_commendations(giver_personnel_id,created_at DESC)")
-        # Optional durable identity columns. Each migration is isolated; failure here
-        # must not make the core commendation table unusable.
-        for stmt in (
+
+        # Reconcile ALL columns expected by both Battalion Clerk and the Website.
+        # Each statement is independently safe on an existing deployment.
+        migrations = (
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS id UUID DEFAULT gen_random_uuid()",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS recipient_personnel_id UUID",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS giver_personnel_id UUID",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS guild_id BIGINT",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS category_code TEXT",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS message TEXT",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'DISCORD'",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS removed_by TEXT",
+            "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS removal_reason TEXT",
             "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS recipient_discord_user_id BIGINT",
             "ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS giver_discord_user_id BIGINT",
+        )
+        for stmt in migrations:
+            await conn.execute(stmt)
+
+        # Backfill safe defaults for legacy rows before indexes/reads use them.
+        await conn.execute("UPDATE personnel_commendations SET id=gen_random_uuid() WHERE id IS NULL")
+        await conn.execute("UPDATE personnel_commendations SET created_at=NOW() WHERE created_at IS NULL")
+        await conn.execute("UPDATE personnel_commendations SET source='DISCORD' WHERE source IS NULL OR BTRIM(source)=''")
+
+        for stmt in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS personnel_commendations_id_uidx ON personnel_commendations(id)",
+            "CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_idx ON personnel_commendations(recipient_personnel_id,created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS personnel_commendations_giver_idx ON personnel_commendations(giver_personnel_id,created_at DESC)",
             "CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_discord_idx ON personnel_commendations(recipient_discord_user_id,created_at DESC)",
             "CREATE INDEX IF NOT EXISTS personnel_commendations_giver_discord_idx ON personnel_commendations(giver_discord_user_id,created_at DESC)",
         ):
-            try:
-                await conn.execute(stmt)
-            except Exception as exc:
-                log.warning('[COMMENDATION OPTIONAL SCHEMA WARNING] %s', exc)
+            await conn.execute(stmt)
 
 async def _linked_personnel_for_discord(guild_id:int,user_id:int):
-    """Resolve a Discord member to the Website's canonical Soldier record.
+    """Resolve Discord identity using Battalion Clerk's proven Website link shape.
 
-    website_member_links is the authoritative current Website bridge. Recruiting
-    history is fallback-only. The query deliberately avoids optional organization
-    tables/columns so a commendation cannot fail because of unrelated schema drift.
+    Do not select optional personnel columns here. The commendation command only
+    requires the canonical personnel UUID, which avoids unrelated schema drift.
     """
     await collector.start()
     commend_db = getattr(collector, 'db', None)
     if not commend_db or not getattr(commend_db, 'pool', None):
         return None
     async with commend_db.pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position
-              FROM website_member_links l
-              JOIN personnel p ON p.id::text=l.personnel_id
-             WHERE l.guild_id=$1 AND l.discord_user_id=$2
-             LIMIT 1
-        """, guild_id, user_id)
-        if row:
-            return row
         return await conn.fetchrow("""
-            SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position
-              FROM recruiting_cases rc
-              JOIN personnel p ON p.id=rc.personnel_id
-             WHERE rc.guild_id=$1 AND rc.discord_user_id=$2 AND rc.personnel_id IS NOT NULL
-             ORDER BY COALESCE(rc.approved_at,rc.updated_at,rc.created_at) DESC
+            SELECT p.id
+              FROM personnel p
+              JOIN website_member_links w ON w.personnel_id=p.id::text
+             WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2
              LIMIT 1
-        """, guild_id, user_id)
+        """, str(guild_id), str(user_id))
 
 @bot.tree.command(name='commend', description='Recognize another 1/5 Cavalry Soldier for a positive contribution.')
 @app_commands.describe(member='Soldier receiving the commendation', category='Type of commendation', message='Short reason for the commendation')
@@ -5153,8 +5164,6 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
             await _reply('Your Discord account is not linked to a 1/5 Cavalry Soldier Record yet.'); return
         if not recipient:
             await _reply('That Discord member is not linked to a 1/5 Cavalry Soldier Record.'); return
-        if str(recipient.get('status') or '').upper() in {'SEPARATED','DISCHARGED','REMOVED'}:
-            await _reply('That Soldier is not currently on the battalion rolls.'); return
 
         async with commend_db.pool.acquire() as conn:
             # Cooldowns use the original personnel UUID columns so they work on every
@@ -5205,7 +5214,8 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
         log.exception('[COMMENDATION COMMAND FAILED] guild=%s giver=%s recipient=%s error=%r',interaction.guild.id,interaction.user.id,member.id,exc)
         # Include the database exception class to make any remaining Railway issue
         # immediately diagnosable without exposing credentials or SQL.
-        await _reply(f'Battalion Clerk could not file that commendation. **Nothing was confirmed as filed.** Error type: `{type(exc).__name__}`. Command can check `COMMENDATION COMMAND FAILED`.')
+        detail=str(exc).replace('\n',' ')[:180]
+        await _reply(f'Battalion Clerk could not file that commendation. **Nothing was confirmed as filed.** Error type: `{type(exc).__name__}`. Database detail: `{detail}`.')
 
 
 # ---------------------------------------------------------------------------
