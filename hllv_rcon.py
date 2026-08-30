@@ -283,10 +283,12 @@ HLL_KNOWN_ROLE_MAPPINGS = {
     "7": {"name": "GRENADIER", "category": "INFANTRY", "mos_code": "11G"},
     "8": {"name": "ENGINEER", "category": "SUPPORT", "mos_code": "12E"},
     "9": {"name": "SQUAD LEADER", "category": "LEADERSHIP", "mos_code": "11L"},
+    "10": {"name": "SNIPER", "category": "INFANTRY", "mos_code": ""},
     "11": {"name": "CREWMAN", "category": "ARMOR", "mos_code": "19K"},
     "12": {"name": "TANK COMMANDER", "category": "ARMOR", "mos_code": "19C"},
     "16": {"name": "PILOT", "category": "AVIATION", "mos_code": "67P"},
     "17": {"name": "LOGISTICS OFFICER", "category": "AVIATION", "mos_code": "67L"},
+    "20": {"name": "COMMANDER", "category": "LEADERSHIP", "mos_code": ""},
 }
 
 

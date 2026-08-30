@@ -70,3 +70,8 @@ Use `/discord-routing-reset confirmation:RESET DISCORD ROUTING` before reorganiz
 - CPT-and-above Discord rank holders receive a direct Command status response report.
 - ❌ never automatically separates a Soldier; Command review is required.
 - Reserve personnel are excluded from the active-roll website status check.
+
+### 2026-08-30 Role mapping update
+- Role 20 = Commander
+- Role 10 = Sniper
+- Both are filed into the verified HLL role registry on Battalion Clerk startup. No MOS code is inferred for either mapping.
