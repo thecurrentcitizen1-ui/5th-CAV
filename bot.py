@@ -5044,9 +5044,34 @@ async def ensure_commendations_table():
         await conn.execute("""CREATE TABLE IF NOT EXISTS personnel_commendations (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), recipient_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
             giver_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL, guild_id BIGINT, category_code TEXT NOT NULL, message TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'DISCORD', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), removed_at TIMESTAMPTZ, removed_by TEXT, removal_reason TEXT)""")
+            source TEXT NOT NULL DEFAULT 'DISCORD', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), removed_at TIMESTAMPTZ, removed_by TEXT, removal_reason TEXT,
+            recipient_discord_user_id BIGINT, giver_discord_user_id BIGINT)""")
+        await conn.execute("ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS recipient_discord_user_id BIGINT")
+        await conn.execute("ALTER TABLE personnel_commendations ADD COLUMN IF NOT EXISTS giver_discord_user_id BIGINT")
         await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_idx ON personnel_commendations(recipient_personnel_id,created_at DESC)")
         await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_giver_idx ON personnel_commendations(giver_personnel_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_discord_idx ON personnel_commendations(recipient_discord_user_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_giver_discord_idx ON personnel_commendations(giver_discord_user_id,created_at DESC)")
+        # Backfill identity columns for historical commendations whenever the old
+        # personnel UUID still has a recruiting/link record. This is idempotent.
+        await conn.execute("""UPDATE personnel_commendations c SET recipient_discord_user_id=x.discord_user_id
+              FROM (SELECT p.id AS personnel_id,MAX(u.discord_user_id) AS discord_user_id
+                      FROM personnel p
+                      JOIN (SELECT NULLIF(personnel_id,'')::uuid personnel_id,discord_user_id FROM website_member_links
+                            UNION ALL
+                            SELECT personnel_id,discord_user_id FROM recruiting_cases WHERE personnel_id IS NOT NULL AND discord_user_id IS NOT NULL) u
+                        ON u.personnel_id=p.id
+                     GROUP BY p.id) x
+             WHERE c.recipient_personnel_id=x.personnel_id AND c.recipient_discord_user_id IS NULL""")
+        await conn.execute("""UPDATE personnel_commendations c SET giver_discord_user_id=x.discord_user_id
+              FROM (SELECT p.id AS personnel_id,MAX(u.discord_user_id) AS discord_user_id
+                      FROM personnel p
+                      JOIN (SELECT NULLIF(personnel_id,'')::uuid personnel_id,discord_user_id FROM website_member_links
+                            UNION ALL
+                            SELECT personnel_id,discord_user_id FROM recruiting_cases WHERE personnel_id IS NOT NULL AND discord_user_id IS NOT NULL) u
+                        ON u.personnel_id=p.id
+                     GROUP BY p.id) x
+             WHERE c.giver_personnel_id=x.personnel_id AND c.giver_discord_user_id IS NULL""")
 
 async def _linked_personnel_for_discord(guild_id:int,user_id:int):
     """Resolve Discord identity to the canonical active Soldier record.
@@ -5115,9 +5140,12 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
         daily=await conn.fetchval("SELECT COUNT(*) FROM personnel_commendations WHERE giver_personnel_id=$1 AND removed_at IS NULL AND created_at::date=CURRENT_DATE",giver['id'])
         if int(daily or 0)>=5:
             await interaction.followup.send('You have reached the 5-commendation daily limit. Save the next one for tomorrow.',ephemeral=True); return
-        filed=await conn.fetchrow("""INSERT INTO personnel_commendations(recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source)
-            VALUES($1,$2,$3,$4,$5,'DISCORD')
-            RETURNING id,recipient_personnel_id,created_at""",recipient['id'],giver['id'],interaction.guild.id,category.value,reason)
+        filed=await conn.fetchrow("""INSERT INTO personnel_commendations(
+                recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source,
+                recipient_discord_user_id,giver_discord_user_id)
+            VALUES($1,$2,$3,$4,$5,'DISCORD',$6,$7)
+            RETURNING id,recipient_personnel_id,recipient_discord_user_id,created_at""",
+            recipient['id'],giver['id'],interaction.guild.id,category.value,reason,member.id,interaction.user.id)
         if not filed or str(filed['recipient_personnel_id']) != str(recipient['id']):
             await interaction.followup.send('Battalion Clerk could not verify the commendation against the Soldier Record. Nothing was filed; notify Command.',ephemeral=True); return
         # Permanent service-history mirror makes the recognition auditable even if a
