@@ -82,3 +82,9 @@ Battalion Clerk files 7 M16 rounds for each verified infantry kill in a complete
 
 ### Commander match-side telemetry (V31)
 Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with each HLL match. This lets the Website resolve a Soldier's recorded Team value against the correct final Allied/Axis score for Commander win/loss tracking.
+
+
+## Peer Commendations
+- `/commend member category message` files one of eight peer commendations to the recipient's 201 File.
+- No self-commendations; same giver/recipient/category is limited to once per 24 hours; maximum five commendations per giver per day.
+- Commendations are recognition only and do not directly grant promotion points or ribbons.

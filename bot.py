@@ -3315,6 +3315,10 @@ async def before_operation_lifecycle_review_watch():
 
 @bot.event
 async def on_ready():
+    try:
+        await ensure_commendations_table()
+    except Exception:
+        log.exception("[COMMENDATIONS TABLE INIT FAILED]")
     # Retire the pre-Welcome-Packet Approved Replacement Discord role. This is
     # idempotent and only touches the explicitly named legacy managed role.
     if not getattr(bot, '_legacy_recruit_role_cleanup_done', False):
@@ -5019,6 +5023,75 @@ async def operation_rounds_for_guild(guild_id:int):
     await ensure_clerk_settings_table(); db=collector.db
     async with db.pool.acquire() as conn: v=await conn.fetchval("SELECT COALESCE(operation_rounds_default,180) FROM clerk_guild_settings WHERE guild_id=$1",str(guild_id))
     return int(v or 180)
+
+
+
+COMMENDATION_CHOICES = [
+    app_commands.Choice(name='Teamwork Commendation', value='TEAMWORK'),
+    app_commands.Choice(name='Leadership Commendation', value='LEADERSHIP'),
+    app_commands.Choice(name='Helpfulness Commendation', value='HELPFULNESS'),
+    app_commands.Choice(name='Server Seeding Commendation', value='SERVER_SEEDING'),
+    app_commands.Choice(name='Training Support Commendation', value='TRAINING_SUPPORT'),
+    app_commands.Choice(name='Good Communication Commendation', value='GOOD_COMMUNICATION'),
+    app_commands.Choice(name='Fun Gameplay Experience Commendation', value='FUN_GAMEPLAY'),
+    app_commands.Choice(name='Community Commendation', value='COMMUNITY'),
+]
+COMMENDATION_NAMES={c.value:c.name for c in COMMENDATION_CHOICES}
+
+async def ensure_commendations_table():
+    if not db or not getattr(db,'pool',None): return
+    async with db.pool.acquire() as conn:
+        await conn.execute("""CREATE TABLE IF NOT EXISTS personnel_commendations (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), recipient_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+            giver_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL, guild_id BIGINT, category_code TEXT NOT NULL, message TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'DISCORD', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), removed_at TIMESTAMPTZ, removed_by TEXT, removal_reason TEXT)""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_recipient_idx ON personnel_commendations(recipient_personnel_id,created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS personnel_commendations_giver_idx ON personnel_commendations(giver_personnel_id,created_at DESC)")
+
+async def _linked_personnel_for_discord(guild_id:int,user_id:int):
+    if not db or not getattr(db,'pool',None): return None
+    async with db.pool.acquire() as conn:
+        return await conn.fetchrow("""SELECT p.id,p.rank_code,p.first_name,p.last_name,p.status,p.duty_position
+            FROM website_member_links l JOIN personnel p ON p.id::text=l.personnel_id
+            WHERE l.guild_id=$1 AND l.discord_user_id=$2 LIMIT 1""",guild_id,user_id)
+
+@bot.tree.command(name='commend', description='Recognize another 1/5 Cavalry Soldier for a positive contribution.')
+@app_commands.describe(member='Soldier receiving the commendation', category='Type of commendation', message='Short reason for the commendation')
+@app_commands.choices(category=COMMENDATION_CHOICES)
+async def commend(interaction:discord.Interaction, member:discord.Member, category:app_commands.Choice[str], message:str):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 Cavalry Discord server.',ephemeral=True); return
+    if member.id==interaction.user.id:
+        await interaction.response.send_message('You cannot commend yourself.',ephemeral=True); return
+    reason=' '.join((message or '').split()).strip()
+    if len(reason)<5:
+        await interaction.response.send_message('Add a short reason explaining what the Soldier did.',ephemeral=True); return
+    if len(reason)>350: reason=reason[:350]
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    await ensure_commendations_table()
+    giver=await _linked_personnel_for_discord(interaction.guild.id,interaction.user.id)
+    recipient=await _linked_personnel_for_discord(interaction.guild.id,member.id)
+    if not giver:
+        await interaction.followup.send('Your Discord account is not linked to a 1/5 Cavalry Soldier Record yet.',ephemeral=True); return
+    if not recipient:
+        await interaction.followup.send('That Discord member is not linked to a 1/5 Cavalry Soldier Record.',ephemeral=True); return
+    if str(recipient.get('status') or '').upper() in {'SEPARATED','DISCHARGED','REMOVED'}:
+        await interaction.followup.send('That Soldier is not currently on the battalion rolls.',ephemeral=True); return
+    async with db.pool.acquire() as conn:
+        duplicate=await conn.fetchval("""SELECT 1 FROM personnel_commendations WHERE giver_personnel_id=$1 AND recipient_personnel_id=$2
+            AND category_code=$3 AND removed_at IS NULL AND created_at > NOW()-INTERVAL '24 hours' LIMIT 1""",giver['id'],recipient['id'],category.value)
+        if duplicate:
+            await interaction.followup.send('You already gave this Soldier that commendation category within the last 24 hours.',ephemeral=True); return
+        daily=await conn.fetchval("SELECT COUNT(*) FROM personnel_commendations WHERE giver_personnel_id=$1 AND removed_at IS NULL AND created_at::date=CURRENT_DATE",giver['id'])
+        if int(daily or 0)>=5:
+            await interaction.followup.send('You have reached the 5-commendation daily limit. Save the next one for tomorrow.',ephemeral=True); return
+        await conn.execute("""INSERT INTO personnel_commendations(recipient_personnel_id,giver_personnel_id,guild_id,category_code,message,source) VALUES($1,$2,$3,$4,$5,'DISCORD')""",recipient['id'],giver['id'],interaction.guild.id,category.value,reason)
+    name=COMMENDATION_NAMES.get(category.value,category.name)
+    await interaction.followup.send(f'**{name.upper()} FILED**\n{member.mention} has been commended and the entry is now on their 201 File.',ephemeral=True)
+    try:
+        await member.send(f"**1/5 CAV — COMMENDATION RECEIVED**\n\nYou received a **{name}** from **{interaction.user.display_name}**.\n\n> {reason}\n\nThe commendation is now filed under **201 FILE → COMMENDATIONS**.")
+    except discord.Forbidden: pass
+
 
 # ---------------------------------------------------------------------------
 # HELL LET LOOSE: VIETNAM — RCON / TELEMETRY
