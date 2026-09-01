@@ -5293,6 +5293,50 @@ async def hll_unlink(interaction:discord.Interaction):
         ephemeral=True
     )
 
+@bot.tree.command(name='unlink-member-game', description='Command: unlink a Soldier’s incorrect SteamID64 or console gamertag.')
+@app_commands.describe(member='Soldier whose current HLL game identity should be cleared')
+async def unlink_member_game(interaction:discord.Interaction, member:discord.Member):
+    """Staff repair command for an incorrectly linked member identity.
+
+    This deliberately removes only the live identity link / pending console claim.
+    It does not delete historical match telemetry, the website Soldier Record,
+    assignments, awards, qualifications, or service-history rows.
+    """
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        ok=await hllv.unlink_personnel(interaction.guild.id, member.id)
+    except Exception as exc:
+        log.exception('[STAFF UNLINK-MEMBER-GAME FAILED] guild=%s staff=%s target=%s error=%r',
+                      interaction.guild.id, interaction.user.id, member.id, exc)
+        await interaction.followup.send(
+            '**GAME IDENTITY UNLINK FAILED**\n'
+            f'Soldier: {member.mention}\n'
+            'Battalion Clerk could not clear the current game identity. **No telemetry was deleted.**',
+            ephemeral=True
+        )
+        return
+
+    if not ok:
+        await interaction.followup.send(
+            '**NO ACTIVE GAME IDENTITY FOUND**\n'
+            f'Soldier: {member.mention}\n\n'
+            'No verified HLL identity or pending console claim is currently filed for that Soldier. '
+            'They can use `/link-game`, or staff can use `/hll-link-soldier`.',
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        '**HLL: VIETNAM GAME IDENTITY — STAFF UNLINK COMPLETE**\n\n'
+        f'Soldier: {member.mention}\n'
+        f'Filed by: {interaction.user.mention}\n\n'
+        'The Soldier’s current verified Steam/console link and any pending console claim were cleared. '
+        '**Their Soldier Record and historical telemetry were preserved.**\n\n'
+        'Next step: have the Soldier run `/link-game`, or use `/hll-link-soldier` to file the correct identity for them.',
+        ephemeral=True
+    )
+
 @bot.tree.command(name='hll-link-soldier', description='Command: manually link a Soldier SteamID64 or console gamer tag.')
 @app_commands.describe(
     member='Soldier whose HLL identity should be linked',
