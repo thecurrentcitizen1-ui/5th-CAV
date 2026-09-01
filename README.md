@@ -40,6 +40,7 @@ Recommended defaults:
 
 Current HLL / game-link commands:
 - `/link-game` — primary Soldier self-link command for Steam, Xbox, or PlayStation
+- `/unlink-game` — clear the current/pending game identity without deleting historical telemetry, then use `/link-game` again
 - `/hll-unlink` — removes the member's current game identity link
 - `/hll-link-soldier` — Command/staff manual link or repair for Steam, Xbox, or PlayStation
 - `/hll-rcon-status` — Command HLL collector health check

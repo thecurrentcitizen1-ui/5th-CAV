@@ -1575,14 +1575,47 @@ class HLLVTelemetryCollector:
                 "claim_id": claim.get("id") if claim else None}
 
     async def unlink_personnel(self, guild_id: int, discord_user_id: int) -> bool:
+        """Remove the Soldier's current HLL identity claim without touching telemetry history.
+
+        This is intentionally an identity-only operation. Historical match rows,
+        research samples, awards, service records, and the Website Soldier Record
+        are preserved so an accidental unlink cannot erase credited service.
+        Pending console claims are superseded so /link-game can immediately file
+        a corrected identity.
+        """
         person = await self.db.fetchrow("""
             SELECT p.id::text AS personnel_id FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text
             WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1
         """, str(guild_id), str(discord_user_id))
         if not person:
             return False
-        result = await self.db.execute("DELETE FROM hll_personnel_links WHERE personnel_id=$1", person["personnel_id"])
-        return bool(result and not str(result).endswith(" 0"))
+
+        personnel_id = str(person["personnel_id"])
+        changed = False
+
+        result = await self.db.execute(
+            "DELETE FROM hll_personnel_links WHERE personnel_id=$1", personnel_id
+        )
+        if result and not str(result).endswith(" 0"):
+            changed = True
+
+        # A console self-link can exist only as a pending claim until the exact
+        # account is observed on the server. Clear that claim too so a corrected
+        # /link-game is not blocked by the old gamertag. Keep this compatibility
+        # safe for deployments that predate hll_identity_claims.
+        try:
+            pending = await self.db.execute("""
+                UPDATE hll_identity_claims
+                SET status='SUPERSEDED', updated_at=NOW(),
+                    error='UNLINKED BY SOLDIER BEFORE RE-LINK'
+                WHERE personnel_id=$1 AND status='PENDING'
+            """, personnel_id)
+            if pending and not str(pending).endswith(" 0"):
+                changed = True
+        except Exception as exc:
+            log.warning('[HLL UNLINK] pending-claim cleanup skipped personnel=%s error=%s', personnel_id, exc)
+
+        return changed
 
     async def research_snapshot(self, guild_id: int, discord_user_id: int) -> Optional[dict]:
         person = await self.db.fetchrow("""

@@ -5247,12 +5247,51 @@ async def link_game(interaction:discord.Interaction, platform:app_commands.Choic
         ephemeral=True)
 
 
-@bot.tree.command(name='hll-unlink', description='Remove your HLL: Vietnam game identity link from automatic server statistics.')
+@bot.tree.command(name='unlink-game', description='Unlink your current HLL: Vietnam identity so you can link the correct account.')
+async def unlink_game(interaction:discord.Interaction):
+    """Member-facing companion to /link-game.
+
+    Identity-only: this does not delete historical server telemetry or the Soldier
+    Record. It also supersedes a pending console claim so the member can immediately
+    file the corrected identity with /link-game.
+    """
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
+    except Exception as exc:
+        log.exception('[UNLINK-GAME FAILED] guild=%s user=%s error=%r', interaction.guild.id, interaction.user.id, exc)
+        await interaction.followup.send(
+            '**GAME IDENTITY UNLINK FAILED**\nBattalion Clerk could not clear the current identity link. No telemetry was deleted. Contact S-1 if the problem continues.',
+            ephemeral=True
+        ); return
+    if not ok:
+        await interaction.followup.send(
+            '**NO ACTIVE GAME IDENTITY FOUND**\nThere is no verified or pending HLL identity on your Soldier Record. You can use `/link-game` now.',
+            ephemeral=True
+        ); return
+    await interaction.followup.send(
+        '**HLL: VIETNAM GAME IDENTITY — UNLINKED**\n\n'
+        'Your current verified link and any pending console claim have been cleared. '
+        '**Your Soldier Record and historical server telemetry were not deleted.**\n\n'
+        'Run `/link-game` and enter the correct SteamID64, Xbox Gamertag, or PSN Online ID.',
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name='hll-unlink', description='Legacy alias: unlink your HLL identity before using /link-game again.')
 async def hll_unlink(interaction:discord.Interaction):
+    # Keep the old command working for members who already know it, but route it
+    # through the same safe identity-only behavior as /unlink-game.
     if not interaction.guild:
         await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
     ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
-    await interaction.response.send_message('Your HLL game identity link was removed.' if ok else 'No HLL telemetry link was on file.',ephemeral=True)
+    await interaction.response.send_message(
+        'Your HLL game identity was unlinked. Your historical telemetry was preserved. Use `/link-game` to file the correct identity.'
+        if ok else 'No HLL identity link was on file. You can use `/link-game` now.',
+        ephemeral=True
+    )
 
 @bot.tree.command(name='hll-link-soldier', description='Command: manually link a Soldier SteamID64 or console gamer tag.')
 @app_commands.describe(
