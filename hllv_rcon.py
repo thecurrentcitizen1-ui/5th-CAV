@@ -550,6 +550,10 @@ class HLLVTelemetryCollector:
                 support_score INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # V48: repair legacy copies of the research table. PostgreSQL's
+        # CREATE TABLE IF NOT EXISTS does not add newer columns to an existing
+        # table, which can break website seeding reconciliation after upgrades.
+        await self.db.execute("ALTER TABLE hll_research_samples ADD COLUMN IF NOT EXISTS connected_delta_seconds INTEGER NOT NULL DEFAULT 0")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_personnel_time ON hll_research_samples(personnel_id,observed_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_role_time ON hll_research_samples(role_id,observed_at DESC)")
         # Exact weapon-attribution events from the HLLV admin log.  These are
@@ -740,7 +744,7 @@ class HLLVTelemetryCollector:
         """Credit only the configured nightly seeding period while population is below 40."""
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         minutes=now_et.hour*60+now_et.minute
-        return 20*60 <= minutes <= 21*60+30 and int(player_count or 0) < SEEDING_STOP_PLAYERS
+        return 19*60 <= minutes < 21*60 and int(player_count or 0) < SEEDING_STOP_PLAYERS
 
     async def _file_seeding_credit(self, credits: list[tuple[str,int]]):
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)

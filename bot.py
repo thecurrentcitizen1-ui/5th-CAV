@@ -1059,7 +1059,7 @@ async def reset_discord_routing(guild_id:int):
     return {'paused':True,'duty_channels_cleared':cleared_duty}
 
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
-SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
+SEEDING_SLOTS = ((19, 0), (19, 30), (20, 0), (20, 30))
 SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') or 40))
 SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Member', 'Replacement')
 SEEDING_MESSAGE = (
@@ -5533,14 +5533,14 @@ async def hll_link_soldier(interaction:discord.Interaction, member:discord.Membe
 
 @tasks.loop(minutes=1)
 async def seeding_message_watch():
-    """Post the controlled nightly seeding call at 20:00, 20:30, 21:00 and 21:30 Eastern.
+    """Post the controlled nightly seeding call at 19:00, 19:30, 20:00 and 20:30 Eastern.
 
     A slot is only sent once, only when RCON has a current population sample, and only
     while the server population is below the live/stop threshold. Starting the bot a few
     minutes after a slot safely catches up that slot without duplicating earlier notices.
     """
     now_et=datetime.now(SEEDING_TIMEZONE)
-    if now_et.hour < 20 or (now_et.hour > 21) or (now_et.hour == 21 and now_et.minute > 30):
+    if now_et.hour < 19 or now_et.hour >= 21:
         return
     elapsed=now_et.hour*60+now_et.minute
     eligible=[(h,m) for h,m in SEEDING_SLOTS if h*60+m <= elapsed]
@@ -5605,7 +5605,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
     if not await require_manage_guild(interaction): return
     await set_seeding_channel(interaction.guild_id,channel.id)
     await interaction.response.send_message(
-        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **8:00, 8:30, 9:00, and 9:30 PM Eastern**. '
+        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **7:00, 7:30, 8:00, and 8:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
 @bot.tree.command(name='seeding-status', description='Show the nightly seeding channel, schedule, and current HLL population.')
@@ -5616,7 +5616,7 @@ async def seeding_status(interaction:discord.Interaction):
     await interaction.response.send_message(
         '**1/5 CAV SEEDING AUTOMATION**\n'
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
-        '**Schedule:** 8:00 / 8:30 / 9:00 / 9:30 PM Eastern\n'
+        '**Schedule:** 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
         f'**Populated threshold:** {SEEDING_STOP_POPULATION}+ players — seeding calls suppressed\n'
         f'**Mention roles:** {" / ".join(SEEDING_MENTION_ROLE_NAMES)}\n'
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
