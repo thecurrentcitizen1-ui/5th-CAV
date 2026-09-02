@@ -203,9 +203,11 @@ ROLE_SECTIONS = [
 # name, type where type is text/voice/forum. Forum creation is supported by
 # discord.py on compatible Discord guilds; this blueprint intentionally uses
 # text and voice only so a fresh server can be built reliably everywhere.
+LEGACY_CATEGORY_RENAMES = {"REPLACEMENT DETACHMENT": "RECRUITING"}
+
 CHANNEL_BLUEPRINT = [
     {
-        "category": "REPLACEMENT DETACHMENT",
+        "category": "RECRUITING",
         "scope": "REPLACEMENT",
         "channels": [
             ("start-here", "text"),
@@ -607,13 +609,24 @@ async def build_battalion_channels(guild: discord.Guild):
     for spec in CHANNEL_BLUEPRINT:
         category=discord.utils.get(guild.categories,name=spec["category"])
         if not category:
-            try:
-                category=await guild.create_category(spec["category"], overwrites=_scope_overwrites(guild,spec["scope"]),
-                                                     reason="Battalion Clerk — 1/5 CAV category structure")
-                created.append(f"CATEGORY:{spec['category']}")
-            except Exception as exc:
-                failed.append(f"CATEGORY {spec['category']}: {exc}")
-                continue
+            legacy_name=next((old for old,new_name in LEGACY_CATEGORY_RENAMES.items() if new_name==spec["category"]),None)
+            legacy=discord.utils.get(guild.categories,name=legacy_name) if legacy_name else None
+            if legacy:
+                try:
+                    await legacy.edit(name=spec["category"],overwrites=_scope_overwrites(guild,spec["scope"]),
+                                      reason="Battalion Clerk — rename legacy recruiting category")
+                    category=legacy
+                    repaired.append(f"CATEGORY RENAME:{legacy_name}->{spec['category']}")
+                except Exception as exc:
+                    failed.append(f"CATEGORY RENAME {legacy_name}: {exc}")
+            if not category:
+                try:
+                    category=await guild.create_category(spec["category"], overwrites=_scope_overwrites(guild,spec["scope"]),
+                                                         reason="Battalion Clerk — 1/5 CAV category structure")
+                    created.append(f"CATEGORY:{spec['category']}")
+                except Exception as exc:
+                    failed.append(f"CATEGORY {spec['category']}: {exc}")
+                    continue
         else:
             existing.append(f"CATEGORY:{spec['category']}")
             try:
@@ -1060,7 +1073,7 @@ async def reset_discord_routing(guild_id:int):
 
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_SLOTS = ((19, 0), (19, 30), (20, 0), (20, 30))
-SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') or 40))
+SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_STOP_PLAYERS', '50') or 50))
 SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Member', 'Replacement')
 SEEDING_MESSAGE = (
     "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
@@ -3281,12 +3294,15 @@ async def game_link_reminder_watch():
                 if 'MEMBER' not in role_names:
                     continue
                 message=(
-                    "**BATTALION CLERK — GAME ACCOUNT NOT LINKED**\n\n"
-                    "Your Steam/Gamertag is not currently linked to your 1/5 Cavalry personnel record.\n\n"
-                    "Until it is linked, Battalion Clerk cannot reliably credit your server activity toward your service record, including server time, seeding, ribbons, campaign progress, and other tracked statistics.\n\n"
-                    "Use **`/link-game`** to connect your game account.\n\n"
-                    "**You can use `/link-game` in any text channel in the 1/5 Cavalry Discord.**\n\n"
-                    "Once your account is successfully linked, these reminders will stop automatically."
+                    "**BATTALION CLERK — LINK YOUR GAME ACCOUNT**\n\n"
+                    "Your HLL: Vietnam game identity is not currently linked to your 1/5 Cavalry Soldier Record. Without that link, Battalion Clerk cannot reliably credit server time, seeding, completed games, leadership-role time, ribbons, campaign progress, or supported server statistics.\n\n"
+                    "**HOW TO LINK IT**\n"
+                    "1. In any 1/5 Cavalry Discord text channel, run **`/link-game`**.\n"
+                    "2. Select **Steam / PC**, **Xbox**, or **PlayStation**.\n"
+                    "3. **Steam:** enter your 17-digit **SteamID64** — not your display name.\n"
+                    "4. **Xbox:** enter your exact **Gamertag** as it appears in HLL: Vietnam.\n"
+                    "5. **PlayStation:** enter your exact **PSN Online ID** as it appears in-game.\n\n"
+                    "Console links may remain pending until Battalion Clerk observes that exact identity on the server. Once you have successfully filed the link, these three-day reminders stop automatically."
                 )
                 try:
                     await member.send(message)
@@ -4224,6 +4240,18 @@ async def on_member_join(member: discord.Member):
         await post_public_welcome(member)
         existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
         if not (existing and existing.get('linked')):
+            # Every brand-new Discord arrival receives the entry-rank PVT role immediately.
+            # This is presentation/intake only: Website approval remains required before a
+            # new personnel record is provisioned, so the role cannot bypass recruiting.
+            pvt_role=_role_by_name(member.guild,'PVT') or await _ensure_dynamic_role(member.guild,'PVT')
+            if pvt_role and pvt_role not in member.roles:
+                try:
+                    role_sync_suppressed_members.add((member.guild.id,member.id))
+                    await member.add_roles(pvt_role,reason='Battalion Clerk — new arrival entry rank')
+                except discord.Forbidden:
+                    log.warning('[PVT ARRIVAL ROLE BLOCKED] member=%s',member.id)
+                finally:
+                    role_sync_suppressed_members.discard((member.guild.id,member.id))
             recruit=await recruiting_status_for(member)
             case=recruit.get('case') if recruit and recruit.get('exists') else None
             if case:

@@ -32,7 +32,7 @@ RCON_PORT = int(os.getenv("HLL_RCON_PORT", "7779") or 7779)
 RCON_PASSWORD = os.getenv("HLL_RCON_PASSWORD", "")
 RCON_POLL_SECONDS = max(3, int(os.getenv("HLL_RCON_POLL_SECONDS", "5") or 5))
 SEEDING_TIMEZONE = ZoneInfo("America/New_York")
-SEEDING_STOP_PLAYERS = max(1, int(os.getenv("HLL_SEED_READY_PLAYERS", "40") or 40))
+SEEDING_STOP_PLAYERS = max(1, int(os.getenv("HLL_SEED_STOP_PLAYERS", "50") or 50))
 RCON_CM_PER_METER = max(1.0, float(os.getenv("HLL_RCON_CM_PER_METER", "100") or 100))
 # Preserve helicopter movement while rejecting respawn/teleport jumps. 130 m/s
 # is 468 km/h, comfortably above Vietnam-era helicopter speeds.
@@ -540,6 +540,7 @@ class HLLVTelemetryCollector:
                 speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
                 vertical_speed_mps DOUBLE PRECISION NOT NULL DEFAULT 0,
                 connected_delta_seconds INTEGER NOT NULL DEFAULT 0,
+                server_player_count INTEGER,
                 infantry_kills INTEGER NOT NULL DEFAULT 0,
                 deaths INTEGER NOT NULL DEFAULT 0,
                 vehicle_kills INTEGER NOT NULL DEFAULT 0,
@@ -554,6 +555,7 @@ class HLLVTelemetryCollector:
         # CREATE TABLE IF NOT EXISTS does not add newer columns to an existing
         # table, which can break website seeding reconciliation after upgrades.
         await self.db.execute("ALTER TABLE hll_research_samples ADD COLUMN IF NOT EXISTS connected_delta_seconds INTEGER NOT NULL DEFAULT 0")
+        await self.db.execute("ALTER TABLE hll_research_samples ADD COLUMN IF NOT EXISTS server_player_count INTEGER")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_personnel_time ON hll_research_samples(personnel_id,observed_at DESC)")
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_research_role_time ON hll_research_samples(role_id,observed_at DESC)")
         # Exact weapon-attribution events from the HLLV admin log.  These are
@@ -721,7 +723,7 @@ class HLLVTelemetryCollector:
         seeding_now = self._is_seeding_credit_window(len(players))
         seeding_credits=[]
         for player in players:
-            filed=await self._file_player(match_id, player)
+            filed=await self._file_player(match_id, player, server_player_count=len(players))
             if seeding_now and filed and filed[0] and int(filed[1] or 0)>0:
                 seeding_credits.append((filed[0],int(filed[1] or 0)))
         if seeding_credits:
@@ -741,7 +743,7 @@ class HLLVTelemetryCollector:
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
 
     def _is_seeding_credit_window(self, player_count: int) -> bool:
-        """Credit only the configured nightly seeding period while population is below 40."""
+        """Credit 19:00–21:00 Eastern only while live server population is below 50."""
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         minutes=now_et.hour*60+now_et.minute
         return 19*60 <= minutes < 21*60 and int(player_count or 0) < SEEDING_STOP_PLAYERS
@@ -758,7 +760,7 @@ class HLLVTelemetryCollector:
                 INSERT INTO hll_seeding_service(personnel_id,service_date,credited_seconds,first_seen_at,last_seen_at)
                 VALUES($1::uuid,$2,$3,NOW(),NOW())
                 ON CONFLICT(personnel_id,service_date) DO UPDATE SET
-                  credited_seconds=hll_seeding_service.credited_seconds+EXCLUDED.credited_seconds,
+                  credited_seconds=LEAST(7200,hll_seeding_service.credited_seconds+EXCLUDED.credited_seconds),
                   last_seen_at=NOW()
             """,pid,service_date,seconds)
 
@@ -1109,7 +1111,7 @@ class HLLVTelemetryCollector:
         row = await self.db.fetchrow("SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1 AND verified=TRUE", steam_id)
         return str(row["personnel_id"]) if row else None
 
-    async def _file_player(self, match_id: int, player: Any):
+    async def _file_player(self, match_id: int, player: Any, server_player_count: int | None = None):
         d = _dump_model(player)
         player_key, steam_id64, platform_user_id, eos_id = _player_identity(d)
         if not player_key:
@@ -1227,10 +1229,10 @@ class HLLVTelemetryCollector:
         """, role_key, loadout, role_label or None, observed_speed_mps, vertical_speed_mps, high_speed_add, altitude_gain_m, inf_kill_delta, vehicle_kill_delta)
         if personnel_id:
             await self.db.execute("""
-                INSERT INTO hll_research_samples(match_id,steam_id,personnel_id,observed_at,role_id,observed_role_label,loadout,team_id,platoon,x,y,z,speed_mps,vertical_speed_mps,connected_delta_seconds,infantry_kills,deaths,vehicle_kills,vehicles_destroyed,combat_score,defense_score,offense_score,support_score)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+                INSERT INTO hll_research_samples(match_id,steam_id,personnel_id,observed_at,role_id,observed_role_label,loadout,team_id,platoon,x,y,z,speed_mps,vertical_speed_mps,connected_delta_seconds,server_player_count,infantry_kills,deaths,vehicle_kills,vehicles_destroyed,combat_score,defense_score,offense_score,support_score)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             """, match_id, steam_id, personnel_id, now, role_key, role_label or None, loadout, team_id, platoon, x, y, z, observed_speed_mps, vertical_speed_mps, accrue_seconds,
-                 cur_inf_kills, int(_first(stats, "deaths", default=0) or 0), cur_vehicle_kills, int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0),
+                 int(server_player_count) if server_player_count is not None else None, cur_inf_kills, int(_first(stats, "deaths", default=0) or 0), cur_vehicle_kills, int(_first(stats, "vehicles_destroyed", "vehiclesDestroyed", default=0) or 0),
                  int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0), int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0))
         await self.db.execute("""
             UPDATE hll_player_match_stats SET
