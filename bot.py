@@ -40,6 +40,7 @@ HLL_VIP_RESERVED_SLOTS = max(0,int(os.getenv('HLL_VIP_RESERVED_SLOTS','2') or 2)
 WEBSITE_STATUS_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_STATUS_CHECK_DAYS','14') or 14))
 WEBSITE_NEVER_LOGIN_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_NEVER_LOGIN_CHECK_DAYS','3') or 3))
 WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_REPEAT_DAYS','30') or 30))
+GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or 3))
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -80,13 +81,17 @@ pending_personnel_sync: Dict[Tuple[int, int], asyncio.Task] = {}
 # on_member_update must not echo transient cleanup states back into the website.
 role_sync_suppressed_members = set()
 
-RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","2LT","1LT","CPT","MAJ","LTC"}
+RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","WO1","CW2","CW3","CW4","2LT","1LT","CPT","MAJ","LTC"}
 MOS_ROLE_CODES = {"00C","11L","11R","11G","11M","91M","12E","76S","11S","11N","19C","19K","67L","67P","67C","67G","11O","11A","11T"}
 RANK_ROLE_ALIASES = {
     "PRIVATE":"PVT","PRIVATE FIRST CLASS":"PFC","CORPORAL":"CPL","SERGEANT":"SGT",
     "STAFF SERGEANT":"SSG","SERGEANT FIRST CLASS":"SFC","MASTER SERGEANT":"MSG",
-    "FIRST SERGEANT":"1SG","SERGEANT MAJOR":"SGM","SECOND LIEUTENANT":"2LT",
-    "FIRST LIEUTENANT":"1LT","CAPTAIN":"CPT","MAJOR":"MAJ","LIEUTENANT COLONEL":"LTC"
+    "FIRST SERGEANT":"1SG","SERGEANT MAJOR":"SGM",
+    "WARRANT OFFICER 1":"WO1","WARRANT OFFICER ONE":"WO1",
+    "CHIEF WARRANT OFFICER 2":"CW2","CHIEF WARRANT OFFICER TWO":"CW2",
+    "CHIEF WARRANT OFFICER 3":"CW3","CHIEF WARRANT OFFICER THREE":"CW3",
+    "CHIEF WARRANT OFFICER 4":"CW4","CHIEF WARRANT OFFICER FOUR":"CW4",
+    "SECOND LIEUTENANT":"2LT","FIRST LIEUTENANT":"1LT","CAPTAIN":"CPT","MAJOR":"MAJ","LIEUTENANT COLONEL":"LTC"
 }
 
 
@@ -113,17 +118,18 @@ DIVIDER_ROLE_NAMES = [
 ]
 
 RANK_ROLE_BLUEPRINT = [
-    "LTC", "MAJ", "CPT", "1LT", "2LT", "SGM", "1SG", "MSG", "SFC",
-    "SSG", "SGT", "SP7", "SP6", "SP5", "SP4", "CPL", "PFC", "PVT",
+    "LTC", "MAJ", "CPT", "1LT", "2LT", "CW4", "CW3", "CW2", "WO1",
+    "SGM", "1SG", "MSG", "SFC", "SSG", "SGT", "SP7", "SP6", "SP5",
+    "SP4", "CPL", "PFC", "PVT",
 ]
 
 RECRUITING_STATUS_ROLE_BLUEPRINT = [
-    "Prospective Replacement", "Replacement Depot",
+    "Replacement",
 ]
 # Old transitional recruiting role from the pre-Welcome-Packet workflow.
 # Never create/assign it again; Battalion Clerk removes it from members and
 # deletes the empty role when hierarchy permissions allow.
-LEGACY_RECRUITING_STATUS_ROLE_NAMES = {"Approved Replacement"}
+LEGACY_RECRUITING_STATUS_ROLE_NAMES = {"Approved Replacement", "Prospective Replacement", "Replacement Depot"}
 
 APPOINTMENT_ROLE_BLUEPRINT = [
     "Battalion Commander", "Battalion Executive Officer",
@@ -171,7 +177,7 @@ LEGACY_ASSIGNMENT_ROLE_NAMES = {
     "Alpha Company", "A/1-5 CAV", "Bravo Company", "B/1-5 CAV",
     "Charlie Company", "C/1-5 CAV", "HHC/1-5 CAV", "Headquarters & Headquarters Company",
 }
-MEMBERSHIP_ROLE_BLUEPRINT = ["5th Cavalry Regiment"]
+MEMBERSHIP_ROLE_BLUEPRINT = ["Member", "NCO", "5th Cavalry Regiment"]
 QUALIFICATION_ROLE_BLUEPRINT = [
     "Battalion Instructor", "M16 Qualified", "Mortar Qualified", "Recon Qualified",
     "Aviation Qualified", "Armor Qualified", "Medic Qualified",
@@ -200,12 +206,11 @@ ROLE_SECTIONS = [
 CHANNEL_BLUEPRINT = [
     {
         "category": "REPLACEMENT DETACHMENT",
-        "scope": "PUBLIC",
+        "scope": "REPLACEMENT",
         "channels": [
-            ("welcome-to-the-1-5", "text"),
+            ("start-here", "text"),
             ("recruiting-office", "text"),
-            ("standing-orders", "text"),
-            ("enlistment-help", "text"),
+            ("help-desk", "text"),
             ("replacement-reception", "voice"),
         ],
     },
@@ -353,10 +358,9 @@ async def _preserve_duplicate_role_overwrites(guild: discord.Guild, canonical: d
     return failures
 
 def _member_access_roles(guild: discord.Guild):
-    # A recognized rank is the basic battalion-member access token. Staff roles
-    # are also included so staff can reach shared headquarters spaces even when
-    # troubleshooting a personnel-role mismatch.
-    names = set(RANK_ROLE_BLUEPRINT + STAFF_ACCESS_ROLE_BLUEPRINT)
+    # Access follows membership/authority, not rank. Rank remains a display identity
+    # output of the website personnel record; a promotion alone never opens channels.
+    names = set(["Member", "NCO", "5th Cavalry Regiment"] + STAFF_ACCESS_ROLE_BLUEPRINT)
     return [r for r in guild.roles if r.name in names]
 
 
@@ -440,6 +444,10 @@ def _scope_overwrites(guild: discord.Guild, scope: str):
 
     if scope == "PUBLIC":
         overwrites[everyone] = _overwrite_member(view=True, send=True, voice=True)
+        return overwrites
+    if scope == "REPLACEMENT":
+        _add_roles(overwrites, guild, {"Replacement", "Member", "5th Cavalry Regiment"}, _overwrite_member())
+        _add_roles(overwrites, guild, {"Command Staff", "S-1 Personnel"}, _overwrite_staff())
         return overwrites
 
     # Battalion Commander/XO and Command Staff can reach every managed internal area.
@@ -760,10 +768,10 @@ async def recruiting_status_for(member: discord.Member):
         return {'ok':False,'exists':False}
 
 async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
-    # Approved applicants enter Replacement Depot and are recognized immediately as
+    # Approved applicants use the temporary Replacement access role and are recognized immediately as
     # members of the 5th Cavalry Regiment. Formation/rank/MOS roles still wait for the
-    # authoritative Website assignment after Welcome Packet acceptance.
-    desired_name='Replacement Depot' if approved else 'Prospective Replacement'
+    # authoritative Website assignment after Command files the Soldier formation.
+    desired_name='Replacement'
     desired=discord.utils.get(member.guild.roles,name=desired_name)
     if not desired:
         desired=await _ensure_dynamic_role(member.guild,desired_name)
@@ -887,7 +895,7 @@ async def _settled_personnel_sync(guild_id: int, member_id: int, reason: str):
             return
         if not case or status not in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
             await ensure_recruit_status_role(member,approved=False)
-            log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): Replacement Depot / approved recruiting case required',member.display_name,member.id)
+            log.warning('[PERSONNEL CREATION HOLD] member=%s (%s): approved recruiting case required',member.display_name,member.id)
             return
         # Approval opens the website-authoritative Replacement Detachment record immediately.
         # Discord rank/MOS/company/platoon/squad roles are outputs of S-1 processing, not
@@ -1053,7 +1061,7 @@ async def reset_discord_routing(guild_id:int):
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_SLOTS = ((20, 0), (20, 30), (21, 0), (21, 30))
 SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_READY_PLAYERS', '40') or 40))
-SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Prospective Replacement')
+SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Member', 'Replacement')
 SEEDING_MESSAGE = (
     "**BATTALION CALL — REPLACEMENTS NEEDED**\n\n"
     "**CURRENT SERVER POPULATION: {population} PLAYERS**\n\n"
@@ -1297,27 +1305,21 @@ async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
     await channel.send(body[:2000])
     return channel.id
 
-WELCOME_MESSAGE = """**HEADQUARTERS**
-**1ST BATTALION, 5TH CAVALRY REGIMENT**
-**1ST CAVALRY DIVISION (AIRMOBILE)**
+WELCOME_MESSAGE = """**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**
 
-**REPLACEMENT PERSONNEL — REPORTING NOTICE**
+**WELCOME TO THE 1/5 CAV**
 
-{member_mention}, you have reported to the **1st Battalion, 5th Cavalry Regiment**.
+{member_mention}, you are now in the Replacement lane. Your entry is intentionally simple:
 
-All newly arrived personnel will remain with the **Replacement Detachment** pending completion of battalion in-processing and assignment.
+**1 — APPLY** — file the short enlistment application.
+**2 — LINK** — your Discord and game identity attach to the same Soldier Record.
+**3 — GET ASSIGNED** — Command uses Accept & Assign to place you directly into a Company, Platoon, and Squad.
 
-Personnel who have already submitted an enlistment application will have their recruiting case reviewed by Battalion Headquarters. Upon approval, you will receive further instructions concerning your initial rank, MOS, company, platoon, and squad assignment.
+Once assigned, Battalion Clerk removes **Replacement**, adds **Member**, mirrors your formation roles, and sends your member login.
 
-Until processing is complete, review the battalion information, standing orders, and reporting instructions available within the server.
+No mandatory operation schedule. No long onboarding packet. Meet your squad, get in voice, and get in the fight.
 
-**DO NOT DEPART THE REPLACEMENT DETACHMENT UNTIL RELEASED OR ASSIGNED.**
-
-Further instructions will be issued by Battalion Headquarters.
-
-**BY ORDER OF THE BATTALION COMMANDER**
-**BATTALION CLERK**
-**1/5 CAV**"""
+**BATTALION CLERK • 1/5 CAV**"""
 
 async def set_welcome_channel(guild_id: int, channel_id: int):
     await ensure_clerk_settings_table()
@@ -1929,7 +1931,7 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             elif desired_platoon_name and n==_normalized_role_name(desired_platoon_name): pass
             else: remove.append(role)
         if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
-        if role.name=='5th Cavalry Regiment' and not (is_member or discord.utils.get(member.roles,name='Replacement Depot')): remove.append(role)
+        if role.name=='5th Cavalry Regiment' and not (is_member or discord.utils.get(member.roles,name='Replacement')): remove.append(role)
 
     # Separated/archived Soldiers retain protected Discord roles only.
     managed_appointment_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
@@ -1950,10 +1952,12 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             r=await _ensure_dynamic_role(member.guild,desired_squad_name)
             if r: desired.append(r); created.append(r.name) if r not in member.roles else None
         # Team is website-only; this intentionally removes legacy Alpha/Bravo Discord roles.
-        if is_member or discord.utils.get(member.roles,name='Replacement Depot'):
+        if is_member or discord.utils.get(member.roles,name='Replacement'):
             membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
             if membership: desired.append(membership)
         if is_member:
+            member_access=await _ensure_dynamic_role(member.guild,'Member')
+            if member_access: desired.append(member_access)
             for role in member.roles:
                 if role.name in set(RECRUITING_STATUS_ROLE_BLUEPRINT)|LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
 
@@ -1962,6 +1966,18 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
             if role.name in managed_appointment_names and role.name not in desired_appointment_names: remove.append(role)
         for role in member.guild.roles:
             if role.name in desired_appointment_names: desired.append(role)
+
+        # NCO is an authority/access role, not a rank mirror. It follows an active
+        # line-leadership billet so promotions alone do not grant leadership access.
+        nco_billet_names={'First Sergeant','Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
+        has_nco_billet=bool(set(result.get('appointment_roles') or []) & nco_billet_names)
+        nco_role=discord.utils.get(member.guild.roles,name='NCO')
+        if has_nco_billet:
+            if not nco_role:
+                nco_role=await _ensure_dynamic_role(member.guild,'NCO')
+            if nco_role: desired.append(nco_role)
+        elif nco_role and nco_role in member.roles:
+            remove.append(nco_role)
 
     remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))
     removed_names=[]; added_names=[]
@@ -2686,15 +2702,15 @@ async def welcome_preview(interaction: discord.Interaction):
         site=site,
     )
     packet_note=(
-        "**WEBSITE WELCOME PACKET**\n"
+        "**FIRST 24 HOURS**\n"
         f"{site}/welcome-packet\n"
-        "Command can preview the exact read-only member packet from Website → S-1 Personnel → Welcome Packet / Onboarding → MEMBER VIEW.\n"
+        "Command can preview the same read-only First 24 Hours record the Soldier sees on the website.\n"
         "This preview sends nothing, creates no credentials, changes no roles, and completes no onboarding tasks."
     )
     chunks=[
         "**WELCOME DELIVERY PREVIEW — NOTHING HAS BEEN ISSUED**\n\n**1. PUBLIC JOIN NOTICE**\n"+public_preview,
         "**2. APPROVAL / PRIVATE CREDENTIAL DM**\n"+credential_preview,
-        "**3. MEMBER WEBSITE PACKET**\n"+packet_note,
+        "**3. MEMBER FIRST 24 HOURS**\n"+packet_note,
     ]
     for i,text in enumerate(chunks):
         text=text[:1950]
@@ -3190,6 +3206,111 @@ async def canonical_role_sync_watch():
         except Exception as exc:
             log.warning('[CANONICAL ROLE SYNC WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
+async def ensure_game_link_reminder_table():
+    """Persist the 72-hour game-identity reminder clock across bot restarts."""
+    await collector.start()
+    db=collector.db
+    if not db.pool:
+        return
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS clerk_game_link_reminders (
+            guild_id TEXT NOT NULL,
+            personnel_id TEXT NOT NULL,
+            discord_user_id TEXT,
+            last_sent_at TIMESTAMPTZ,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (guild_id, personnel_id)
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_clerk_game_link_reminders_sent ON clerk_game_link_reminders(guild_id,last_sent_at)")
+
+
+@tasks.loop(hours=1)
+async def game_link_reminder_watch():
+    """DM active Members every three days until a Steam/Xbox/PSN identity is filed.
+
+    A pending console claim counts as linked for reminder purposes: the Soldier has
+    already completed /link-game and Battalion Clerk is simply waiting to observe
+    that identity on the HLL: Vietnam server.
+    """
+    await collector.start()
+    db=collector.db
+    if not db.pool:
+        return
+    await ensure_game_link_reminder_table()
+    cutoff=datetime.now(timezone.utc)-timedelta(days=GAME_LINK_REMINDER_DAYS)
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            rows=await db.fetch("""
+                SELECT p.id::text AS personnel_id,
+                       p.rank_code,p.first_name,p.last_name,
+                       w.discord_user_id::text AS discord_user_id,
+                       r.last_sent_at
+                  FROM personnel p
+                  JOIN website_member_links w
+                    ON w.personnel_id=p.id::text
+                   AND w.guild_id::text=$1
+             LEFT JOIN clerk_game_link_reminders r
+                    ON r.guild_id=$1 AND r.personnel_id=p.id::text
+                 WHERE COALESCE(p.archived,FALSE)=FALSE
+                   AND NOT EXISTS (
+                       SELECT 1 FROM hll_personnel_links h
+                        WHERE h.personnel_id=p.id::text
+                          AND COALESCE(h.verified,TRUE)=TRUE
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM hll_identity_claims c
+                        WHERE c.personnel_id=p.id::text
+                          AND UPPER(COALESCE(c.status,'')) IN ('PENDING','VERIFIED')
+                   )
+                   AND (r.last_sent_at IS NULL OR r.last_sent_at <= $2)
+            """,str(guild.id),cutoff)
+            for row in rows:
+                uid=str(row.get('discord_user_id') or '')
+                if not uid.isdigit():
+                    continue
+                member=guild.get_member(int(uid))
+                if not member or member.bot:
+                    continue
+                # Only established community Members receive the recurring notice;
+                # Replacement applicants are handled by the simplified intake flow.
+                role_names={r.name.strip().upper() for r in member.roles}
+                if 'MEMBER' not in role_names:
+                    continue
+                message=(
+                    "**BATTALION CLERK — GAME ACCOUNT NOT LINKED**\n\n"
+                    "Your Steam/Gamertag is not currently linked to your 1/5 Cavalry personnel record.\n\n"
+                    "Until it is linked, Battalion Clerk cannot reliably credit your server activity toward your service record, including server time, seeding, ribbons, campaign progress, and other tracked statistics.\n\n"
+                    "Use **`/link-game`** to connect your game account.\n\n"
+                    "**You can use `/link-game` in any text channel in the 1/5 Cavalry Discord.**\n\n"
+                    "Once your account is successfully linked, these reminders will stop automatically."
+                )
+                try:
+                    await member.send(message)
+                except discord.Forbidden:
+                    log.info('[GAME LINK REMINDER DM BLOCKED] guild=%s member=%s',guild.id,member.id)
+                    continue
+                except Exception as exc:
+                    log.warning('[GAME LINK REMINDER DM FAILED] guild=%s member=%s error=%s',guild.id,member.id,exc)
+                    continue
+                await db.execute("""
+                    INSERT INTO clerk_game_link_reminders(
+                        guild_id,personnel_id,discord_user_id,last_sent_at,sent_count,updated_at
+                    ) VALUES($1,$2,$3,NOW(),1,NOW())
+                    ON CONFLICT(guild_id,personnel_id) DO UPDATE SET
+                        discord_user_id=EXCLUDED.discord_user_id,
+                        last_sent_at=NOW(),
+                        sent_count=clerk_game_link_reminders.sent_count+1,
+                        updated_at=NOW()
+                """,str(guild.id),str(row.get('personnel_id')),uid)
+                log.info('[GAME LINK REMINDER SENT] guild=%s member=%s personnel=%s',guild.id,member.id,row.get('personnel_id'))
+        except Exception as exc:
+            log.warning('[GAME LINK REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
 @tasks.loop(minutes=60)
 async def member_record_reminder_watch():
     """Low-noise personal reminders for approaching weapon/qualification suspense."""
@@ -3211,7 +3332,7 @@ async def member_record_reminder_watch():
 
 @tasks.loop(minutes=1)
 async def welcome_packet_watch():
-    """Deliver Website-authoritative Welcome Packet phase changes through Discord."""
+    """Deliver Website-authoritative First 24 Hours milestone changes through Discord."""
     if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
         return
     for guild in bot.guilds:
@@ -3225,7 +3346,7 @@ async def welcome_packet_watch():
                 if member:
                     event_type=str(item.get('event_type') or '').upper()
                     destination=f"{WEBSITE_BASE_URL}/welcome-packet"
-                    destination_label='Open your packet'
+                    destination_label='Open First 24 Hours'
                     if event_type=='ASSIGNMENT':
                         destination=f"{WEBSITE_BASE_URL}/my-201-file"; destination_label='Open your 201 File'
                     elif event_type=='ONBOARDING_COMPLETE':
@@ -3246,7 +3367,7 @@ async def welcome_packet_watch():
                              or discord.utils.get(guild.text_channels,name='personnel-orders')
                              or discord.utils.get(guild.text_channels,name='battalion-orders'))
                     if channel:
-                        try: await channel.send(f"**S-1 ONBOARDING COMPLETE**\n{member.mention} has completed the 1/5 CAV Welcome Packet and filed Report for Duty."[:1900])
+                        try: await channel.send(f"**FIRST 24 HOURS COMPLETE**\n{member.mention} has completed the automatic 1/5 CAV First 24 Hours milestones."[:1900])
                         except Exception: pass
                 await web.request('POST',f"/internal/clerk/welcome-packet/notifications/{item.get('id')}/delivered",json={'ok':ok,'error':error})
         except Exception as exc:
@@ -3344,6 +3465,8 @@ async def on_ready():
         welcome_packet_watch.start()
     if not website_status_check_watch.is_running():
         website_status_check_watch.start()
+    if not game_link_reminder_watch.is_running():
+        game_link_reminder_watch.start()
     global collector_started, commands_synced
 
     # Persistent Help Desk buttons survive bot restarts.
@@ -3760,7 +3883,7 @@ async def _retroactive_accession_member(member: discord.Member, *, send_message:
         msg=("**1/5 CAV — REPORT TO RECRUITING**\n\n"
              "You are in the battalion Discord, but no linked Soldier Record or Recruiting Case was found for you.\n\n"
              f"Complete your enlistment application here: {app_url}\n\n"
-             "Once approved, Battalion Clerk will move you through Replacement Detachment and issue your website access automatically.\n\n"
+             "Once accepted, Battalion Clerk will assign the temporary Replacement access state until Command files your formation, then switch you to Member and issue your website access automatically.\n\n"
              "If you already applied, do **not** apply again. Use **/apply** and choose **I ALREADY APPLIED** to attach your existing case.")
     try:
         await member.send(msg)
@@ -3802,7 +3925,7 @@ async def accessions_backfill(interaction: discord.Interaction, send_messages: b
         await asyncio.sleep(0.15)
     summary=("**ACCESSIONS BACKFILL COMPLETE**\n"
              f"Established Soldiers untouched: **{counts['linked']}**\n"
-             f"Prospective Replacements staged: **{counts['prospective']}**\n"
+             f"Replacements staged: **{counts['prospective']}**\n"
              f"Existing recruiting cases reconciled: **{counts['case']}**\n"
              f"Approved Replacements reconciled: **{counts['approved']}**\n"
              f"Recruiting DMs sent: **{counts['messaged']}**\n"
@@ -3892,21 +4015,33 @@ async def auto_join_approved_recruit(guild: discord.Guild, case: dict) -> Option
 
 
 def build_recruit_credentials_message(case: dict, provision: dict, *, site: str | None = None) -> str:
-    """Build the exact approval/credential DM used for live delivery and Command preview."""
+    """Build the simplified orders/credential DM used for delivery and Command preview."""
     roster=provision.get('roster_number') or ((provision.get('roster') or {}).get('roster_number') if isinstance(provision.get('roster'),dict) else None)
     field_code=provision.get('field_code')
-    weapon_line=f"\nIssued M16: **{provision.get('weapon_serial')}**" if provision.get('weapon_serial') else "\nIssued M16: **Pending S-4 issue**"
     site=site or WEBSITE_BASE_URL or 'the battalion website'
+    company=provision.get('company') or provision.get('company_name')
+    platoon=provision.get('platoon') or provision.get('platoon_name')
+    squad=provision.get('squad') or provision.get('squad_name')
+    mos=provision.get('mos_name') or provision.get('mos') or provision.get('mos_code') or 'Rifleman'
+    leader=provision.get('squad_leader_name') or provision.get('leader_name')
+    assignment=' / '.join(str(x) for x in (company,platoon,squad) if x) or 'See your current orders on the website'
+    weapon_line=f"\nIssued M16: **{provision.get('weapon_serial')}**" if provision.get('weapon_serial') else ""
+    leader_line=f"\nSquad Leader: **{leader}**" if leader else ""
     return (
-        "**APPLICATION APPROVED — REPORT FOR DUTY**\n"
-        f"Recruiting Case **{case.get('case_number')}** has been approved by Battalion Headquarters. Your Soldier Record is open and you are attached to **Replacement Detachment** while you complete your Welcome Packet. Permanent Company / Platoon assignment follows after Command accepts that packet.\n\n"
+        "**ORDERS RECEIVED — WELCOME TO THE 1/5 CAV**\n"
+        f"Recruiting Case **{case.get('case_number')}** is accepted. Your personnel record and member access are ready.\n\n"
+        "**YOUR ORDERS**\n"
+        f"Assignment: **{assignment}**\n"
+        f"Initial MOS: **{mos}**" + leader_line + weapon_line + "\n\n"
         "**WEBSITE ACCESS**\n"
         f"Website: {site}\n"
         f"Battle Roster Number: **{roster}**\n"
-        f"Field Code: **{field_code}**" + weapon_line + "\n\n"
-        "Keep these credentials private. Use **Member Access** on the website once, then follow the single next-step screen.\n\n"
-        f"**REPORT FOR DUTY**\n{site}/report-for-duty\n"
-        "That page shows your account verification, Welcome Packet progress, and permanent assignment status in one place. Discord/game identity verification happens automatically whenever possible."
+        f"Field Code: **{field_code}**\n\n"
+        "Keep those credentials private. Your first 24 hours are automatic — no packet submission and no orientation gate. "
+        "Meet your squad, link your game account if needed, and get in the fight.\n\n"
+        f"**OPEN YOUR WALL LOCKER / 201 FILE**\n{site}/my-soldier-record\n"
+        f"**FIRST 24 HOURS**\n{site}/welcome-packet\n"
+        f"**REPORT FOR DUTY**\n{site}/report-for-duty"
     )
 
 
@@ -3986,8 +4121,8 @@ async def recruit_status_watch():
                     continue
                 elif status == 'ENLISTED':
                     await clear_recruit_status_roles(member)
-                    message=(f"**REPLACEMENT DETACHMENT — RELEASED TO UNIT**\n"
-                             f"Recruiting Case **{case.get('case_number')}** is complete. S-1 has released you to your permanent formation; your website personnel record is now the authoritative source for Discord unit roles.")
+                    message=(f"**ORDERS FILED — MEMBER ASSIGNMENT ACTIVE**\n"
+                             f"Recruiting Case **{case.get('case_number')}** is complete. Your permanent formation is active. Battalion Clerk has removed the temporary Replacement role, added Member, and your website personnel record remains authoritative for formation roles.")
                 elif status == 'MORE_INFO_REQUIRED':
                     await ensure_recruit_status_role(member,approved=False)
                     status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}"
@@ -4128,7 +4263,7 @@ async def on_member_join(member: discord.Member):
                     msg=("**WELCOME TO THE 1/5 CAVALRY — REPORT TO RECRUITING**\n\n"
                          "You have arrived in the battalion Discord, but you are **not on the rolls yet**.\n\n"
                          f"**NEXT STEP:** Complete your enlistment application here: {app_url}\n\n"
-                         "Once Battalion Headquarters approves your application, Battalion Clerk will move you into the Replacement Detachment, issue your website access, synchronize your Discord status, and begin your Soldier record.\n\n"
+                         "Once Battalion Headquarters accepts and assigns you, Battalion Clerk will issue your website access, switch you from Replacement to Member, synchronize your formation roles, and begin your Soldier record.\n\n"
                          "**Already applied?** Do not submit another application. Use **/apply** and choose **I ALREADY APPLIED** to attach this Discord account to the case already on file.")
                 if msg:
                     await member.send(msg)
@@ -5237,6 +5372,16 @@ async def link_game(interaction:discord.Interaction, platform:app_commands.Choic
     result=await hllv.staff_link_identity(interaction.guild.id,interaction.user.id,platform.value,identity,f'DISCORD LINK-GAME:{interaction.user.id}')
     if not result.get('ok'):
         await interaction.followup.send(f"Game link not filed: **{result.get('error','unknown error')}**\n\nIf this identity is already attached to another Soldier, contact S-1; Battalion Clerk will not move server statistics between records automatically.",ephemeral=True); return
+    # The Soldier completed the required self-link step. A pending console claim
+    # also stops reminders while Battalion Clerk waits to observe it in-game.
+    try:
+        await collector.start()
+        await collector.db.execute(
+            "DELETE FROM clerk_game_link_reminders WHERE guild_id=$1 AND personnel_id=$2",
+            str(interaction.guild.id),str(result.get('personnel_id') or '')
+        )
+    except Exception as exc:
+        log.warning('[GAME LINK REMINDER CLEAR FAILED] guild=%s member=%s error=%s',interaction.guild.id,interaction.user.id,exc)
     verified=str(result.get('status') or '').upper()=='VERIFIED'
     state='VERIFIED' if verified else 'PENDING SERVER VERIFICATION'
     await interaction.followup.send(
