@@ -1076,21 +1076,46 @@ class HLLVTelemetryCollector:
 
     async def _ensure_match(self, server: dict) -> int:
         signature = f"{server.get('map_id')}|{server.get('game_mode')}"
+        # Railway/process restarts must not split one live round into multiple match
+        # ledgers.  Resume a recently observed, still-open session for this exact
+        # map/mode before creating a new one.  The recency fence prevents attaching
+        # to a stale abandoned round from an earlier rotation.
+        if self._active_match_id is None:
+            resumed = await self.db.fetchrow("""SELECT id FROM hll_match_sessions
+                WHERE ended_at IS NULL AND COALESCE(map_id,'')=COALESCE($1,'')
+                  AND COALESCE(game_mode,'')=COALESCE($2,'')
+                  AND last_seen_at >= NOW() - INTERVAL '20 minutes'
+                ORDER BY last_seen_at DESC LIMIT 1""",
+                server.get('map_id'),server.get('game_mode'))
+            if resumed:
+                self._active_match_id=int(resumed['id'])
+                self._active_match_signature=signature
+                log.info("[HLLV MATCH RESUME] id=%s map=%s mode=%s",self._active_match_id,server.get('map_name'),server.get('game_mode'))
         # Map/mode changes are authoritative round boundaries. A match timer reset
         # on the same layer is also detected by closing records that have been stale.
         if self._active_match_id and self._active_match_signature == signature:
+            # Preserve the latest score from THIS active round on every poll.  When
+            # the layer changes, the first payload belongs to the NEW round and its
+            # score is usually reset to 0-0.  Persisting the old round continuously
+            # prevents that new-round score from being written over the completed
+            # match and corrupting Commander win/loss history.
             await self.db.execute("""UPDATE hll_match_sessions SET last_seen_at=NOW(),
-                allied_faction_id=COALESCE(NULLIF($1,''),allied_faction_id),
-                axis_faction_id=COALESCE(NULLIF($2,''),axis_faction_id) WHERE id=$3""",
+                final_allied_score=$1,final_axis_score=$2,
+                allied_faction_id=COALESCE(NULLIF($3,''),allied_faction_id),
+                axis_faction_id=COALESCE(NULLIF($4,''),axis_faction_id) WHERE id=$5""",
+                int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),
                 str(server.get('allied_faction_id') or ''),str(server.get('axis_faction_id') or ''),self._active_match_id)
             return self._active_match_id
         if self._active_match_id:
             closed_match_id=self._active_match_id
+            # DO NOT use `server` scores here: `server` is already the newly
+            # detected map/layer.  The completed round's last score was preserved
+            # above during its final successful same-signature poll.
             await self.db.execute("""
                 UPDATE hll_match_sessions SET ended_at=COALESCE(ended_at,NOW()),
-                    final_allied_score=$1,final_axis_score=$2,last_seen_at=NOW()
-                WHERE id=$3
-            """, int(server.get("allied_score") or 0), int(server.get("axis_score") or 0), closed_match_id)
+                    last_seen_at=NOW()
+                WHERE id=$1
+            """, closed_match_id)
             try:
                 credit=await self.reconcile_kill_round_credits(closed_match_id)
                 if credit.get("rounds"):
@@ -1098,10 +1123,11 @@ class HLLVTelemetryCollector:
             except Exception:
                 log.exception("[HLL KILL ROUND RECONCILE FAILED] match=%s",closed_match_id)
         row = await self.db.fetchrow("""
-            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id)
-            VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id
+            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id,final_allied_score,final_axis_score)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
         """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0),
-             str(server.get('allied_faction_id') or '') or None,str(server.get('axis_faction_id') or '') or None)
+             str(server.get('allied_faction_id') or '') or None,str(server.get('axis_faction_id') or '') or None,
+             int(server.get("allied_score") or 0),int(server.get("axis_score") or 0))
         self._active_match_id = int(row["id"])
         self._active_match_signature = signature
         log.info("[HLLV MATCH OPEN] id=%s map=%s mode=%s", self._active_match_id, server.get("map_name"), server.get("game_mode"))

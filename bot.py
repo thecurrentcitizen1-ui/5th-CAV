@@ -3327,6 +3327,144 @@ async def game_link_reminder_watch():
             log.warning('[GAME LINK REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
+
+async def ensure_leadership_due_out_schema():
+    """Shared V114/V51 due-out schema. Website owns task creation/status; Clerk owns delivery."""
+    await collector.start()
+    db=collector.db
+    if not db.pool: return
+    await db.execute("""CREATE TABLE IF NOT EXISTS leadership_due_outs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), company_node_id UUID NOT NULL REFERENCES unit_nodes(id) ON DELETE CASCADE,
+        created_by_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL, created_by_label VARCHAR(160), title VARCHAR(180) NOT NULL,
+        instructions TEXT, priority VARCHAR(20) NOT NULL DEFAULT 'ROUTINE', due_at TIMESTAMPTZ,
+        audience_type VARCHAR(40) NOT NULL DEFAULT 'ALL_SQUAD_LEADERS', target_unit_node_id UUID REFERENCES unit_nodes(id) ON DELETE SET NULL,
+        target_personnel_id UUID REFERENCES personnel(id) ON DELETE SET NULL, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), closed_at TIMESTAMPTZ, closed_by VARCHAR(160))""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS leadership_due_out_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), due_out_id UUID NOT NULL REFERENCES leadership_due_outs(id) ON DELETE CASCADE,
+        personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE, appointment_code VARCHAR(40), status VARCHAR(20) NOT NULL DEFAULT 'NOT STARTED',
+        completion_note TEXT, completed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        discord_notified_at TIMESTAMPTZ, discord_reminded_at TIMESTAMPTZ,
+        UNIQUE(due_out_id,personnel_id))""")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_due_out_assign_personnel ON leadership_due_out_assignments(personnel_id,status)")
+    await db.execute("""CREATE TABLE IF NOT EXISTS squad_handoff_tasks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), recruit_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+        assigned_to_personnel_id UUID NOT NULL REFERENCES personnel(id) ON DELETE CASCADE,
+        assigned_appointment_code VARCHAR(40), status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ,
+        discord_notified_at TIMESTAMPTZ, UNIQUE(recruit_personnel_id))""")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_squad_handoff_assignee ON squad_handoff_tasks(assigned_to_personnel_id,status)")
+
+
+async def _deliver_due_out_dm(guild,row,reminder=False):
+    uid=str(row.get('discord_user_id') or '')
+    if not uid.isdigit(): return False
+    member=guild.get_member(int(uid))
+    if not member or member.bot: return False
+    due=row.get('due_at')
+    due_text=f"\n**DUE:** {due.strftime('%d %b %Y • %I:%M %p %Z') if hasattr(due,'strftime') else due}" if due else ''
+    heading='**BATTALION CLERK — 1SG DUE-OUT REMINDER**' if reminder else '**BATTALION CLERK — NEW 1SG DUE OUT**'
+    site=(WEBSITE_BASE_URL or 'https://5thcavgaming.com')+'/nco#due-outs'
+    message=(f"{heading}\n\n"
+             f"**{row.get('priority') or 'ROUTINE'} — {row.get('title')}**{due_text}\n"
+             f"{row.get('instructions') or 'Report to your NCO Dashboard for instructions.'}\n\n"
+             "This task was sent to your current NCO billet by the Company First Sergeant. "
+             "Open your **NCO Dashboard → Due Outs from 1SG** to mark it **IN PROGRESS** or **COMPLETE** and file a completion note.\n"
+             f"{site}")
+    try:
+        await member.send(message[:1950]); return True
+    except discord.Forbidden:
+        log.info('[1SG DUE OUT DM BLOCKED] guild=%s member=%s assignment=%s',guild.id,member.id,row.get('assignment_id'))
+    except Exception as exc:
+        log.warning('[1SG DUE OUT DM FAILED] guild=%s member=%s assignment=%s error=%s',guild.id,member.id,row.get('assignment_id'),exc)
+    return False
+
+
+@tasks.loop(minutes=1)
+async def leadership_due_out_watch():
+    """Deliver new 1SG due-outs and one low-noise 24h reminder near/after suspense."""
+    await collector.start(); db=collector.db
+    if not db.pool: return
+    try: await ensure_leadership_due_out_schema()
+    except Exception:
+        log.exception('[1SG DUE OUT SCHEMA INIT FAILED]'); return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            rows=await db.fetch("""SELECT a.id::text AS assignment_id,a.personnel_id::text AS personnel_id,a.status AS assignment_status,
+                       a.discord_notified_at,a.discord_reminded_at,d.title,d.instructions,d.priority,d.due_at,d.created_at,
+                       w.discord_user_id::text AS discord_user_id
+                  FROM leadership_due_out_assignments a JOIN leadership_due_outs d ON d.id=a.due_out_id
+                  JOIN website_member_links w ON w.personnel_id=a.personnel_id::text AND w.guild_id::text=$1
+                 WHERE d.status='ACTIVE' AND a.status<>'COMPLETE'
+                   AND (a.discord_notified_at IS NULL OR
+                        (d.due_at IS NOT NULL AND d.due_at<=NOW()+INTERVAL '24 hours'
+                         AND (a.discord_reminded_at IS NULL OR a.discord_reminded_at<=NOW()-INTERVAL '24 hours')))
+                 ORDER BY d.created_at ASC LIMIT 100""",str(guild.id))
+            for row in rows:
+                reminder=row.get('discord_notified_at') is not None
+                if await _deliver_due_out_dm(guild,row,reminder=reminder):
+                    if reminder:
+                        await db.execute("UPDATE leadership_due_out_assignments SET discord_reminded_at=NOW(),updated_at=NOW() WHERE id=$1::uuid",row.get('assignment_id'))
+                    else:
+                        await db.execute("UPDATE leadership_due_out_assignments SET discord_notified_at=NOW(),updated_at=NOW() WHERE id=$1::uuid",row.get('assignment_id'))
+        except Exception as exc:
+            log.warning('[1SG DUE OUT WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@tasks.loop(minutes=1)
+async def squad_handoff_watch():
+    """DM the receiving NCO once when Accept & Assign creates a new Soldier handoff."""
+    await collector.start(); db=collector.db
+    if not db.pool: return
+    try: await ensure_leadership_due_out_schema()
+    except Exception:
+        log.exception('[SQUAD HANDOFF SCHEMA INIT FAILED]'); return
+    # Close handoffs even if the NCO has not opened the website since the recruit
+    # completed First 24 Hours; this prevents stale Discord delivery.
+    try:
+        await db.execute("""UPDATE squad_handoff_tasks sht SET status='COMPLETE',completed_at=COALESCE(completed_at,NOW())
+                          FROM welcome_packets wp WHERE wp.personnel_id=sht.recruit_personnel_id
+                            AND sht.status<>'COMPLETE' AND UPPER(COALESCE(wp.status,'')) IN ('COMPLETE','CLOSED','ARCHIVED')""")
+    except Exception:
+        log.exception('[SQUAD HANDOFF AUTO-CLOSE FAILED]')
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            rows=await db.fetch("""SELECT sht.id::text AS task_id,sht.recruit_personnel_id::text AS recruit_personnel_id,
+                       p.rank_code,p.first_name,p.last_name,p.unit_code,p.platoon,p.squad,
+                       w.discord_user_id::text AS discord_user_id
+                  FROM squad_handoff_tasks sht
+                  JOIN personnel p ON p.id=sht.recruit_personnel_id
+                  JOIN website_member_links w ON w.personnel_id=sht.assigned_to_personnel_id::text AND w.guild_id::text=$1
+                 WHERE sht.status='OPEN' AND sht.discord_notified_at IS NULL
+                 ORDER BY sht.created_at ASC LIMIT 100""",str(guild.id))
+            for row in rows:
+                uid=str(row.get('discord_user_id') or '')
+                if not uid.isdigit(): continue
+                member=guild.get_member(int(uid))
+                if not member or member.bot: continue
+                site=(WEBSITE_BASE_URL or 'https://5thcavgaming.com')+'/nco#handoffs'
+                msg=("**BATTALION CLERK — NEW SOLDIER HANDOFF**\n\n"
+                     f"**{row.get('rank_code') or 'PVT'} {row.get('first_name') or ''} {row.get('last_name') or ''}** has been assigned to your formation.\n\n"
+                     "Your NCO handoff is to:\n"
+                     "• Make contact with the Soldier\n"
+                     "• Confirm Discord access and `/link-game` status\n"
+                     "• Introduce them to the squad / voice channels\n"
+                     "• Get them through their first server session\n\n"
+                     "This task closes automatically when the Soldier's **First 24 Hours** is complete.\n"
+                     f"{site}")
+                try:
+                    await member.send(msg[:1950])
+                    await db.execute("UPDATE squad_handoff_tasks SET discord_notified_at=NOW() WHERE id=$1::uuid",row.get('task_id'))
+                except discord.Forbidden:
+                    log.info('[SQUAD HANDOFF DM BLOCKED] guild=%s member=%s task=%s',guild.id,member.id,row.get('task_id'))
+                except Exception as exc:
+                    log.warning('[SQUAD HANDOFF DM FAILED] guild=%s member=%s task=%s error=%s',guild.id,member.id,row.get('task_id'),exc)
+        except Exception as exc:
+            log.warning('[SQUAD HANDOFF WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
 @tasks.loop(minutes=60)
 async def member_record_reminder_watch():
     """Low-noise personal reminders for approaching weapon/qualification suspense."""
@@ -3483,6 +3621,10 @@ async def on_ready():
         website_status_check_watch.start()
     if not game_link_reminder_watch.is_running():
         game_link_reminder_watch.start()
+    if not leadership_due_out_watch.is_running():
+        leadership_due_out_watch.start()
+    if not squad_handoff_watch.is_running():
+        squad_handoff_watch.start()
     global collector_started, commands_synced
 
     # Persistent Help Desk buttons survive bot restarts.
