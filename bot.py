@@ -4296,40 +4296,89 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
 
 @tasks.loop(seconds=5)
 async def manual_recruit_intake_watch():
-    """Deliver Command-requested Discord intake to adopted Recruiting Cases."""
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
-    for guild in bot.guilds:
-        if GUILD_ID and guild.id != GUILD_ID:
-            continue
-        try:
-            data=await web.request('GET','/internal/clerk/recruiting/intake-requests',params={'guild_id':guild.id})
-            for case in data.get('cases',[]):
-                member=guild.get_member(int(case.get('discord_user_id') or 0))
+    """Deliver Command-requested Discord intake from one global queue.
+
+    Recruiting Cases may be Command-adopted before guild_id is populated, so queue
+    discovery must never depend on a per-guild filter. Resolve the actual guild and
+    member only after the queued case has been fetched.
+    """
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        data=await web.request('GET','/internal/clerk/recruiting/intake-requests')
+        cases=data.get('cases',[]) if data.get('ok',True) else []
+        if cases:
+            log.info('[MANUAL RECRUIT INTAKE QUEUE] pending=%s',len(cases))
+        for case in cases:
+            case_id=case.get('id')
+            user_id=int(case.get('discord_user_id') or 0)
+            if not user_id:
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':'Recruiting Case has no Discord user id'})
+                continue
+
+            # Prefer the case guild, then configured battalion guild, then any guild
+            # where this Discord user is actually present.
+            guild=None
+            case_gid=int(case.get('guild_id') or 0)
+            preferred_gid=case_gid or int(GUILD_ID or 0)
+            if preferred_gid:
+                guild=bot.get_guild(preferred_gid)
+
+            member=None
+            if guild:
+                member=guild.get_member(user_id)
                 if not member:
                     try:
-                        member=await guild.fetch_member(int(case.get('discord_user_id') or 0))
+                        member=await guild.fetch_member(user_id)
                     except Exception:
                         member=None
-                if not member:
-                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':False,'error':'Discord member is not currently present in the battalion server'})
-                    continue
-                message=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
-                         f"**REPORT TO THE REPLACEMENT LINE — {case.get('case_number')}**\n\n"
-                         "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
-                         "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
-                         "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
-                         "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
-                         "**BATTALION CLERK • 1/5 CAV**")
-                try:
-                    await member.send(message,view=RecruitIntakePromptView())
-                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':True})
-                    log.info('[MANUAL RECRUIT INTAKE SENT] case=%s member=%s',case.get('case_number'),member.id)
-                except discord.Forbidden:
-                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':False,'error':'Discord direct messages are disabled or blocked for this recruit'})
-                except Exception as exc:
-                    await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':False,'error':str(exc)[:500]})
-        except Exception as exc:
-            log.warning('[MANUAL RECRUIT INTAKE WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+            if not member:
+                for candidate in bot.guilds:
+                    if GUILD_ID and candidate.id != GUILD_ID:
+                        continue
+                    maybe=candidate.get_member(user_id)
+                    if not maybe:
+                        try:
+                            maybe=await candidate.fetch_member(user_id)
+                        except Exception:
+                            maybe=None
+                    if maybe:
+                        guild=candidate
+                        member=maybe
+                        break
+
+            if not member or not guild:
+                err=f'Discord member {user_id} could not be resolved in the battalion server'
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
+                log.warning('[MANUAL RECRUIT INTAKE MEMBER NOT FOUND] case=%s user=%s',case.get('case_number'),user_id)
+                continue
+
+            message=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
+                     f"**REPORT TO THE REPLACEMENT LINE — {case.get('case_number')}**\n\n"
+                     "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
+                     "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
+                     "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
+                     "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
+                     "**BATTALION CLERK • 1/5 CAV**")
+            try:
+                await member.send(message,view=RecruitIntakePromptView())
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':True,'guild_id':guild.id})
+                log.info('[MANUAL RECRUIT INTAKE SENT] case=%s member=%s guild=%s',case.get('case_number'),member.id,guild.id)
+            except discord.Forbidden:
+                err='Discord direct messages are disabled or blocked for this recruit'
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
+                log.warning('[MANUAL RECRUIT INTAKE DM BLOCKED] case=%s member=%s',case.get('case_number'),member.id)
+            except Exception as exc:
+                err=f'{type(exc).__name__}: {exc}'[:500]
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
+                log.exception('[MANUAL RECRUIT INTAKE DM FAILED] case=%s member=%s',case.get('case_number'),member.id)
+    except Exception as exc:
+        log.exception('[MANUAL RECRUIT INTAKE WATCH FAILED] error=%s',exc)
+
+@manual_recruit_intake_watch.before_loop
+async def before_manual_recruit_intake_watch():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=30)
