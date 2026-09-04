@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import io
 import json
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Tuple, Optional
@@ -41,6 +42,8 @@ WEBSITE_STATUS_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_STATUS_CHECK_DAYS','14
 WEBSITE_NEVER_LOGIN_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_NEVER_LOGIN_CHECK_DAYS','3') or 3))
 WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_REPEAT_DAYS','30') or 30))
 GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or 3))
+NEW_ARRIVAL_ROLE_NAME = os.getenv('NEW_ARRIVAL_ROLE_NAME', 'NEW ARRIVAL').strip() or 'NEW ARRIVAL'
+NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -2131,6 +2134,242 @@ async def require_manage_guild(interaction: discord.Interaction) -> bool:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# V61 — DISCORD TRAINING SCHEDULER / RSVP / VERIFIED HLL ATTENDANCE
+# ---------------------------------------------------------------------------
+TRAINING_AUDIENCE_CHOICES = [
+    app_commands.Choice(name='My Squad', value='SQUAD'),
+    app_commands.Choice(name='My Platoon', value='PLATOON'),
+    app_commands.Choice(name='My Company', value='COMPANY'),
+    app_commands.Choice(name='Battalion', value='BATTALION'),
+    app_commands.Choice(name='Open Training', value='OPEN'),
+]
+TRAINING_HOST_ROLE_NAMES = {
+    'Squad Leader','Platoon Sergeant','First Sergeant','Company Commander',
+    'Executive Officer','Battalion Commander','NCO','S-3','Command Staff'
+}
+
+def can_host_training(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+        return True
+    return bool(set(member_role_names(member)) & TRAINING_HOST_ROLE_NAMES)
+
+async def require_training_host(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message('Use this command inside the 1/5 Cav Discord.', ephemeral=True)
+        return False
+    if not can_host_training(interaction.user):
+        await interaction.response.send_message('Training scheduling is limited to Squad Leaders, platoon/company leadership, NCOs, and Command staff.', ephemeral=True)
+        return False
+    return True
+
+def _parse_training_et(date_text: str, time_text: str) -> datetime:
+    clean_date=str(date_text or '').strip()
+    clean_time=str(time_text or '').strip().upper().replace(' ','')
+    d=datetime.strptime(clean_date,'%Y-%m-%d').date()
+    parsed=None
+    for fmt in ('%H:%M','%I:%M%p','%I%p'):
+        try:
+            parsed=datetime.strptime(clean_time,fmt).time(); break
+        except ValueError:
+            pass
+    if parsed is None:
+        raise ValueError('time must be HH:MM or 8:00PM')
+    return datetime.combine(d,parsed,tzinfo=ZoneInfo(BATTALION_TIMEZONE))
+
+def _training_event_embed(event: dict, rsvps: list, *, guild: Optional[discord.Guild]=None, state_note: Optional[str]=None) -> discord.Embed:
+    title=str(event.get('title') or 'TRAINING')
+    start_raw=event.get('starts_at'); end_raw=event.get('ends_at')
+    def dt(v):
+        if isinstance(v,datetime): return v
+        text=str(v or '').strip()
+        try: return datetime.fromisoformat(text.replace('Z','+00:00'))
+        except Exception:
+            try: return parsedate_to_datetime(text)
+            except Exception: return None
+    start,end=dt(start_raw),dt(end_raw)
+    start_ts=int(start.timestamp()) if start else 0
+    end_ts=int(end.timestamp()) if end else 0
+    status=str(event.get('status') or 'SCHEDULED').upper()
+    desc=[]
+    if start_ts:
+        desc.append(f'**TIME:** <t:{start_ts}:F> — <t:{end_ts}:t>')
+    desc.append(f"**HOST:** <@{event.get('host_discord_user_id')}>" if event.get('host_discord_user_id') else '**HOST:** Battalion Training Staff')
+    desc.append(f"**FORMATION:** {str(event.get('audience') or 'OPEN').replace('_',' ')}")
+    if event.get('notes'): desc.append(f"**ORDERS:** {event.get('notes')}")
+    desc.append(f"**STATUS:** {status.replace('_',' ')}")
+    if state_note: desc.append(state_note)
+    embed=discord.Embed(title=f'1/5 CAV — {title}', description='\n'.join(desc))
+    groups={'ATTENDING':[],'MAYBE':[],'UNABLE':[]}
+    for row in rsvps or []:
+        response=str(row.get('response') or '').upper()
+        if response not in groups: continue
+        name=str(row.get('roster_name') or row.get('display_name') or '').strip()
+        uid=row.get('discord_user_id')
+        if (not name or name==str(uid)) and uid: name=f'<@{uid}>'
+        minutes=int(row.get('credited_minutes') or 0)
+        suffix=f' — {minutes} min verified' if minutes>0 else ''
+        groups[response].append(f'{name}{suffix}')
+    labels=[('ATTENDING','ATTENDING'),('MAYBE','MAYBE'),('UNABLE','NOT ABLE')]
+    for key,label in labels:
+        values=groups[key]
+        text='\n'.join(values[:18]) if values else '—'
+        if len(values)>18: text += f'\n+ {len(values)-18} more'
+        embed.add_field(name=f'{label} — {len(values)}',value=text[:1024],inline=False)
+    embed.set_footer(text='RSVP below. Automatic training credit uses verified 1/5 Cav HLL server time during the scheduled window.')
+    return embed
+
+async def _fetch_training_event(event_id: str):
+    result=await web.request('GET','/internal/clerk/training-events',params={'event_id':event_id})
+    events=result.get('events') or []
+    return events[0] if events else None
+
+async def _refresh_training_message(interaction: discord.Interaction, event_id: str):
+    event=await _fetch_training_event(event_id)
+    if not event or not interaction.message: return
+    try:
+        await interaction.message.edit(embed=_training_event_embed(event,event.get('rsvps') or [],guild=interaction.guild),view=TrainingRSVPView())
+    except Exception:
+        log.exception('[TRAINING RSVP MESSAGE REFRESH FAILED] event=%s',event_id)
+
+class TrainingRSVPView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _rsvp(self, interaction: discord.Interaction, response: str):
+        if not interaction.guild or not interaction.message:
+            await interaction.response.send_message('Training RSVP is unavailable here.',ephemeral=True); return
+        # Event lookup by Discord message id keeps the persistent buttons restart-safe.
+        data=await web.request('GET','/internal/clerk/training-events',params={'guild_id':interaction.guild_id})
+        event=next((e for e in (data.get('events') or []) if str(e.get('discord_message_id') or '')==str(interaction.message.id)),None)
+        if not event:
+            await interaction.response.send_message('This training roster is no longer linked to an active event record.',ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        result=await web.request('POST',f"/internal/clerk/training-events/{event['id']}/rsvp",json={
+            'discord_user_id':interaction.user.id,'display_name':interaction.user.display_name,'response':response})
+        if not result.get('ok',True):
+            await interaction.followup.send(f"RSVP failed: {result.get('error','unknown error')}",ephemeral=True); return
+        await interaction.message.edit(embed=_training_event_embed(event,result.get('rsvps') or [],guild=interaction.guild),view=self)
+        label={'ATTENDING':'ATTENDING','MAYBE':'MAYBE','UNABLE':'NOT ABLE TO ATTEND'}[response]
+        await interaction.followup.send(f'RSVP filed: **{label}**.',ephemeral=True)
+
+    @discord.ui.button(label='ATTENDING',style=discord.ButtonStyle.success,custom_id='training_rsvp_attending')
+    async def attending(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'ATTENDING')
+    @discord.ui.button(label='MAYBE',style=discord.ButtonStyle.secondary,custom_id='training_rsvp_maybe')
+    async def maybe(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'MAYBE')
+    @discord.ui.button(label='NOT ABLE',style=discord.ButtonStyle.danger,custom_id='training_rsvp_unable')
+    async def unable(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'UNABLE')
+
+@bot.tree.command(name='schedule-training',description='Schedule a 1/5 Cav training with RSVP roster and automatic HLL attendance credit.')
+@app_commands.describe(title='Training title',date='Date in YYYY-MM-DD',time='Eastern time, e.g. 20:00 or 8:00PM',duration_minutes='Training length in minutes',audience='Who the training is intended for',channel='Channel where the roster should be posted',notes='Optional short training orders / focus')
+@app_commands.choices(audience=TRAINING_AUDIENCE_CHOICES)
+async def schedule_training(interaction:discord.Interaction,title:str,date:str,time:str,duration_minutes:app_commands.Range[int,15,360],audience:app_commands.Choice[str],channel:Optional[discord.TextChannel]=None,notes:Optional[str]=None):
+    if not await require_training_host(interaction): return
+    post_channel=channel or (interaction.channel if isinstance(interaction.channel,discord.TextChannel) else None)
+    if not post_channel:
+        await interaction.response.send_message('Choose a text channel for the training roster.',ephemeral=True); return
+    try:
+        start_et=_parse_training_et(date,time)
+    except Exception as exc:
+        await interaction.response.send_message(f'Invalid date/time: **{exc}**. Use `YYYY-MM-DD` and `20:00` or `8:00PM`.',ephemeral=True); return
+    if start_et <= datetime.now(ZoneInfo(BATTALION_TIMEZONE))-timedelta(minutes=2):
+        await interaction.response.send_message('Training start time must be in the future.',ephemeral=True); return
+    end_et=start_et+timedelta(minutes=int(duration_minutes))
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await web.request('POST','/internal/clerk/training-events',json={
+        'guild_id':interaction.guild_id,'host_discord_user_id':interaction.user.id,'title':title[:120],
+        'starts_at':start_et.astimezone(timezone.utc).isoformat(),'ends_at':end_et.astimezone(timezone.utc).isoformat(),
+        'audience':audience.value,'notes':(notes or '')[:1000]})
+    if not result.get('ok',True) or not result.get('event_id'):
+        await interaction.followup.send(f"Training could not be scheduled: {result.get('error','unknown error')}",ephemeral=True); return
+    event=result.get('event') or {}; event['host_discord_user_id']=interaction.user.id; event['audience']=audience.value; event['notes']=notes or ''
+    msg=await post_channel.send(embed=_training_event_embed(event,[],guild=interaction.guild),view=TrainingRSVPView())
+    await web.request('PATCH',f"/internal/clerk/training-events/{result['event_id']}/message",json={'channel_id':post_channel.id,'message_id':msg.id})
+    await interaction.followup.send(f'**TRAINING SCHEDULED** — {post_channel.mention}\nEvent ID: `{result["event_id"]}`',ephemeral=True)
+
+@bot.tree.command(name='training-events',description='Show upcoming 1/5 Cav training events and RSVP counts.')
+async def training_events_command(interaction:discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message('Use this inside the battalion server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    data=await web.request('GET','/internal/clerk/training-events',params={'guild_id':interaction.guild_id})
+    now=utc_now(); lines=[]
+    for e in data.get('events') or []:
+        try:
+            raw=str(e.get('starts_at') or '')
+            try: starts=datetime.fromisoformat(raw.replace('Z','+00:00'))
+            except Exception: starts=parsedate_to_datetime(raw)
+        except Exception: continue
+        if starts < now-timedelta(hours=6): continue
+        roster=e.get('rsvps') or []; counts={k:sum(1 for r in roster if r.get('response')==k) for k in ('ATTENDING','MAYBE','UNABLE')}
+        lines.append(f"**{e.get('title')}** — <t:{int(starts.timestamp())}:F>\n`{e.get('id')}` • {counts['ATTENDING']} attending / {counts['MAYBE']} maybe / {counts['UNABLE']} unable")
+        if len(lines)>=10: break
+    await interaction.followup.send('\n\n'.join(lines) if lines else 'NO UPCOMING TRAINING EVENTS.',ephemeral=True)
+
+@bot.tree.command(name='training-roster',description='Host: show the RSVP and verified HLL attendance roster for a training event.')
+@app_commands.describe(event_id='Training event ID shown by /training-events')
+async def training_roster_command(interaction:discord.Interaction,event_id:str):
+    if not await require_training_host(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    await web.request('POST','/internal/clerk/training-events/reconcile',json={'event_id':event_id.strip()})
+    event=await _fetch_training_event(event_id.strip())
+    if not event:
+        await interaction.followup.send('Training event not found.',ephemeral=True); return
+    await interaction.followup.send(embed=_training_event_embed(event,event.get('rsvps') or [],guild=interaction.guild),ephemeral=True)
+
+@bot.tree.command(name='training-credit',description='Host: manually correct one member’s credited training minutes.')
+@app_commands.describe(event_id='Training event ID',member='Member to correct',minutes='Verified training minutes to file')
+async def training_credit_command(interaction:discord.Interaction,event_id:str,member:discord.Member,minutes:app_commands.Range[int,0,360]):
+    if not await require_training_host(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    result=await web.request('POST',f'/internal/clerk/training-events/{event_id.strip()}/manual-credit',json={'discord_user_id':member.id,'minutes':int(minutes)})
+    if not result.get('ok',True):
+        await interaction.followup.send(f"Credit correction failed: {result.get('error','unknown error')}",ephemeral=True); return
+    await interaction.followup.send(f'**TRAINING CREDIT UPDATED** — {member.mention}: **{minutes} minutes**.',ephemeral=True)
+
+@bot.tree.command(name='close-training',description='Host: finalize a completed training and file the attendance roster.')
+@app_commands.describe(event_id='Training event ID')
+async def close_training_command(interaction:discord.Interaction,event_id:str):
+    if not await require_training_host(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    result=await web.request('POST',f'/internal/clerk/training-events/{event_id.strip()}/close',json={})
+    if not result.get('ok',True):
+        await interaction.followup.send(f"Training close failed: {result.get('error','unknown error')}",ephemeral=True); return
+    summary=result.get('summary') or {}
+    await interaction.followup.send(f"**TRAINING CLOSED**\nAttending RSVP: **{summary.get('attending',0)}**\nVerified on server: **{summary.get('verified',0)}**\nTotal verified training time: **{summary.get('minutes',0)} minutes**",ephemeral=True)
+
+@tasks.loop(minutes=1)
+async def training_scheduler_watch():
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id!=GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/training-events/automation',params={'guild_id':guild.id})
+            for notice in data.get('notices') or []:
+                kind=notice.get('kind'); event=notice.get('event') or {}; roster=notice.get('rsvps') or []
+                cid=event.get('discord_channel_id'); mid=event.get('discord_message_id')
+                channel=guild.get_channel(int(cid)) if cid else None
+                if channel is None and cid:
+                    try: channel=await guild.fetch_channel(int(cid))
+                    except Exception: channel=None
+                msg=None
+                if channel and mid:
+                    try: msg=await channel.fetch_message(int(mid))
+                    except Exception: msg=None
+                note={'REMINDER_60':'**TRAINING IN 60 MINUTES**','REMINDER_15':'**TRAINING IN 15 MINUTES**','START':'**TRAINING WINDOW IS NOW OPEN — HLL ATTENDANCE TRACKING ACTIVE**','END':'**TRAINING WINDOW CLOSED — HOST REVIEW REQUIRED**'}.get(kind)
+                if msg:
+                    await msg.edit(embed=_training_event_embed(event,roster,guild=guild,state_note=note),view=TrainingRSVPView())
+                if channel and kind in {'REMINDER_60','REMINDER_15','START','END'}:
+                    mention=f"<@{event.get('host_discord_user_id')}> " if kind=='END' and event.get('host_discord_user_id') else ''
+                    await channel.send(f"{mention}**{event.get('title')}** — {note}",allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+        except Exception:
+            log.exception('[TRAINING SCHEDULER WATCH FAILED] guild=%s',guild.id)
+
+@training_scheduler_watch.before_loop
+async def before_training_scheduler_watch():
+    await bot.wait_until_ready()
+
 @bot.tree.command(name='setup-roles', description='Build or repair the complete 1/5 CAV role hierarchy, including divider roles.')
 @app_commands.describe(confirm='Set to True to build the battalion role structure')
 async def setup_roles(interaction: discord.Interaction, confirm: bool):
@@ -3617,6 +3856,10 @@ async def on_ready():
         credential_resend_watch.start()
     if not approved_recruit_watch.is_running():
         approved_recruit_watch.start()
+    if not new_arrival_role_watch.is_running():
+        new_arrival_role_watch.start()
+    if not training_scheduler_watch.is_running():
+        training_scheduler_watch.start()
     if not welcome_packet_watch.is_running():
         welcome_packet_watch.start()
     if not website_status_check_watch.is_running():
@@ -3640,6 +3883,7 @@ async def on_ready():
         bot.add_view(RecruitReferralView())
         bot.add_view(RecruiterMemberSelectView())
         bot.add_view(RecruitIntakePromptView())
+        bot.add_view(TrainingRSVPView())
         bot._helpdesk_views_registered = True
 
     if not collector_started:
@@ -3738,6 +3982,12 @@ async def on_ready():
                     reason="guild_sync",deliver_credentials=False)
                 schedule_personnel_role_sync(member, reason="guild_roles_settled")
             synced_members += 1
+
+        # Retroactive/restart-safe seven-day NEW ARRIVAL role backfill.
+        try:
+            await _backfill_new_arrival_roles(guild)
+        except Exception:
+            log.exception('[NEW ARRIVAL STARTUP BACKFILL FAILED] guild=%s', guild.id)
 
         recovered_count = 0
         for channel in guild.voice_channels:
@@ -4559,6 +4809,136 @@ async def credential_resend_watch():
             log.warning('[CREDENTIAL RESEND WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
 
+
+async def _first_discord_join_at(member: discord.Member) -> datetime:
+    """Return the preserved first-seen Discord join time when available.
+
+    discord_members.joined_at is intentionally COALESCE-preserved by the collector,
+    so leaving and rejoining does not restart the NEW ARRIVAL clock.
+    """
+    try:
+        await collector.start()
+        if collector.db.pool:
+            row = await collector.db.fetchrow(
+                "SELECT joined_at FROM discord_members WHERE guild_id=$1 AND discord_user_id=$2",
+                member.guild.id, member.id,
+            )
+            if row and row.get('joined_at'):
+                value = row.get('joined_at')
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
+    except Exception as exc:
+        log.warning('[NEW ARRIVAL JOIN DATE LOOKUP FAILED] member=%s error=%s', member.id, exc)
+    value = member.joined_at or utc_now()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def _ensure_new_arrival_role(guild: discord.Guild) -> Optional[discord.Role]:
+    role = _role_by_name(guild, NEW_ARRIVAL_ROLE_NAME)
+    if role:
+        return role
+    me = guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        log.warning('[NEW ARRIVAL ROLE CREATE BLOCKED] guild=%s missing Manage Roles', guild.id)
+        return None
+    try:
+        return await guild.create_role(
+            name=NEW_ARRIVAL_ROLE_NAME,
+            permissions=discord.Permissions.none(),
+            hoist=False,
+            mentionable=False,
+            reason='Battalion Clerk — seven-day new arrival marker',
+        )
+    except Exception as exc:
+        log.warning('[NEW ARRIVAL ROLE CREATE FAILED] guild=%s error=%s', guild.id, exc)
+        return None
+
+
+async def _apply_new_arrival_role(member: discord.Member, *, reason: str) -> bool:
+    if member.bot:
+        return False
+    joined_at = await _first_discord_join_at(member)
+    if utc_now() - joined_at >= timedelta(days=NEW_ARRIVAL_DAYS):
+        return False
+    role = await _ensure_new_arrival_role(member.guild)
+    if not role or role in member.roles:
+        return bool(role)
+    me = member.guild.me
+    if not me or role >= me.top_role:
+        log.warning('[NEW ARRIVAL ROLE BLOCKED] member=%s role_above_bot=true', member.id)
+        return False
+    try:
+        await member.add_roles(role, reason=reason)
+        log.info('[NEW ARRIVAL ROLE ADDED] member=%s joined_at=%s', member.id, joined_at.isoformat())
+        return True
+    except Exception as exc:
+        log.warning('[NEW ARRIVAL ROLE ADD FAILED] member=%s error=%s', member.id, exc)
+        return False
+
+
+async def _remove_expired_new_arrival_roles(guild: discord.Guild) -> int:
+    role = _role_by_name(guild, NEW_ARRIVAL_ROLE_NAME)
+    if not role:
+        return 0
+    removed = 0
+    now = utc_now()
+    for member in list(role.members):
+        if member.bot:
+            continue
+        joined_at = await _first_discord_join_at(member)
+        if now - joined_at < timedelta(days=NEW_ARRIVAL_DAYS):
+            continue
+        try:
+            await member.remove_roles(role, reason=f'Battalion Clerk — {NEW_ARRIVAL_DAYS}-day new arrival period complete')
+            removed += 1
+            log.info('[NEW ARRIVAL ROLE EXPIRED] member=%s joined_at=%s', member.id, joined_at.isoformat())
+        except Exception as exc:
+            log.warning('[NEW ARRIVAL ROLE REMOVE FAILED] member=%s error=%s', member.id, exc)
+    return removed
+
+
+async def _backfill_new_arrival_roles(guild: discord.Guild) -> dict:
+    """One-time/restart-safe backfill for current members inside the seven-day window."""
+    added = 0
+    eligible = 0
+    await collector.start()
+    for member in guild.members:
+        if member.bot:
+            continue
+        await collector.upsert_member(member)
+        joined_at = await _first_discord_join_at(member)
+        if utc_now() - joined_at >= timedelta(days=NEW_ARRIVAL_DAYS):
+            continue
+        eligible += 1
+        role = _role_by_name(guild, NEW_ARRIVAL_ROLE_NAME)
+        already = bool(role and role in member.roles)
+        if await _apply_new_arrival_role(member, reason='Battalion Clerk — retroactive seven-day new arrival backfill') and not already:
+            added += 1
+    removed = await _remove_expired_new_arrival_roles(guild)
+    log.info('[NEW ARRIVAL BACKFILL] guild=%s eligible=%s added=%s expired_removed=%s', guild.id, eligible, added, removed)
+    return {'eligible': eligible, 'added': added, 'expired_removed': removed}
+
+
+@tasks.loop(minutes=30)
+async def new_arrival_role_watch():
+    """Expire NEW ARRIVAL tags. It intentionally never re-adds manually removed tags."""
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            await _remove_expired_new_arrival_roles(guild)
+        except Exception:
+            log.exception('[NEW ARRIVAL EXPIRY WATCH FAILED] guild=%s', guild.id)
+
+
+@new_arrival_role_watch.before_loop
+async def before_new_arrival_role_watch():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=10)
 async def approved_recruit_watch():
     """Near-immediate approval pipeline: join -> role -> provision -> credential DM."""
@@ -4580,6 +4960,8 @@ async def on_member_join(member: discord.Member):
         return
     await collector.upsert_member(member)
     if not member.bot:
+        # Temporary seven-day visual marker, independent of recruiting/member status.
+        await _apply_new_arrival_role(member, reason='Battalion Clerk — new Discord arrival')
         # Public reception notice is independent of recruiting status and is posted once on guild join.
         await post_public_welcome(member)
         existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
