@@ -1322,15 +1322,15 @@ WELCOME_MESSAGE = """**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**
 
 **WELCOME TO THE 1/5 CAV**
 
-{member_mention}, you are now in the Replacement lane. Your entry is intentionally simple:
+{member_mention}, you've hit the Replacement line. Keep it simple, trooper:
 
-**1 — APPLY** — file the short enlistment application.
-**2 — LINK** — your Discord and game identity attach to the same Soldier Record.
-**3 — GET ASSIGNED** — Command uses Accept & Assign to place you directly into a Company, Platoon, and Squad.
+**1 — REPORT IN** — Put your name on the roster and get your papers filed.
+**2 — GET IDENTIFIED** — Make sure we know who you are in Discord and in the field.
+**3 — JOIN YOUR OUTFIT** — Get assigned to your Company, Platoon, and Squad, then report to your people.
 
-Once assigned, Battalion Clerk removes **Replacement**, adds **Member**, mirrors your formation roles, and sends your member login.
+Once you've got your assignment, you're in-country with the rest of the Cav. Find your squad, get on comms, learn the faces around you, and get into the fight.
 
-No mandatory operation schedule. No long onboarding packet. Meet your squad, get in voice, and get in the fight.
+No mandatory operation nights. No drawn-out processing. Just report in, find your place in the formation, and start writing your own tour.
 
 **BATTALION CLERK • 1/5 CAV**"""
 
