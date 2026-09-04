@@ -4294,7 +4294,7 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
 
 
 
-@tasks.loop(seconds=10)
+@tasks.loop(seconds=5)
 async def manual_recruit_intake_watch():
     """Deliver Command-requested Discord intake to adopted Recruiting Cases."""
     if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
@@ -4323,6 +4323,7 @@ async def manual_recruit_intake_watch():
                 try:
                     await member.send(message,view=RecruitIntakePromptView())
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':True})
+                    log.info('[MANUAL RECRUIT INTAKE SENT] case=%s member=%s',case.get('case_number'),member.id)
                 except discord.Forbidden:
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/intake-request-status",json={'sent':False,'error':'Discord direct messages are disabled or blocked for this recruit'})
                 except Exception as exc:
