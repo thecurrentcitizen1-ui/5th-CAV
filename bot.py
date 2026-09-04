@@ -4562,12 +4562,12 @@ def build_recruit_credentials_message(case: dict, provision: dict, *, site: str 
         "**BATTALION HEADQUARTERS — APPLICATION ACCEPTED**\n"
         f"Recruiting Case **{case.get('case_number')}** has been accepted. You are now on the **Ready to Assign** roster with the Replacement Detachment.\n\n"
         "**WEBSITE ACCESS**\n"
-        f"Website: {site}\n"
+        f"Website: <{site}>\n"
         f"Battle Roster Number: **{roster}**\n"
         f"Field Code: **{field_code}**\n\n"
         "Keep those credentials private. Command has **not** assigned your Company, Platoon, Squad, or permanent MOS yet. "
-        "Stand by for placement and use your Wall Locker / 201 File in the meantime.\n\n"
-        f"**OPEN YOUR WALL LOCKER / 201 FILE**\n{site}/my-soldier-record\n\n"
+        "Stand by for placement and use the website above to open your Wall Locker / 201 File.\n\n"
+        "After logging in, your **First 24 Hours** and **Report for Duty** actions are available from your member area.\n\n"
         "No mandatory operation schedule. Find the Cav in voice, get acquainted, and stand by for your outfit.\n\n"
         "**BATTALION CLERK • 1/5 CAV**"
     )
@@ -4589,7 +4589,7 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         message=("**BATTALION HEADQUARTERS — LOGIN INFORMATION REISSUED**\n"
                  "Command requested another copy of your Website login information. Use the credentials below; if your Field Code was rotated, the older code is no longer valid.\n\n" + message)
     try:
-        await member.send(message)
+        await member.send(message, suppress_embeds=True)
         await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/credentials-status",json={'sent':True})
         log.info('[RECRUIT CREDENTIALS DELIVERED] case=%s member=%s',case.get('case_number'),member.id)
         return True
