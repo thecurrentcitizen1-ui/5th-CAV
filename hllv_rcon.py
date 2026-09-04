@@ -398,6 +398,31 @@ class HLLVTelemetryCollector:
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_match_sessions_time ON hll_match_sessions(started_at DESC)")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS allied_faction_id TEXT")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS axis_faction_id TEXT")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS winner_side TEXT")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS winner_faction_id TEXT")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS result_verified_at TIMESTAMPTZ")
+        # Historical HLL: Vietnam collector rows may predate faction-id retention.
+        # WDEV launch factions are US=2 (Allied/Southern) and NVA=1 (Axis/Northern).
+        await self.db.execute("""UPDATE hll_match_sessions
+            SET allied_faction_id=COALESCE(NULLIF(allied_faction_id,''),'2'),
+                axis_faction_id=COALESCE(NULLIF(axis_faction_id,''),'1')
+            WHERE ended_at IS NOT NULL AND UPPER(COALESCE(map_id,'')) LIKE 'WDEV%'""")
+        await self.db.execute("""UPDATE hll_match_sessions
+            SET winner_side=CASE
+                  WHEN final_allied_score > final_axis_score THEN 'ALLIED'
+                  WHEN final_axis_score > final_allied_score THEN 'AXIS'
+                  ELSE winner_side END,
+                winner_faction_id=CASE
+                  WHEN final_allied_score > final_axis_score THEN allied_faction_id
+                  WHEN final_axis_score > final_allied_score THEN axis_faction_id
+                  ELSE winner_faction_id END,
+                result_verified_at=CASE
+                  WHEN final_allied_score <> final_axis_score
+                       AND (COALESCE(final_allied_score,0)>0 OR COALESCE(final_axis_score,0)>0)
+                  THEN COALESCE(result_verified_at,NOW()) ELSE result_verified_at END
+            WHERE ended_at IS NOT NULL
+              AND final_allied_score IS NOT NULL AND final_axis_score IS NOT NULL
+              AND final_allied_score <> final_axis_score""")
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_player_match_stats (
                 id BIGSERIAL PRIMARY KEY,
@@ -1113,7 +1138,19 @@ class HLLVTelemetryCollector:
             # above during its final successful same-signature poll.
             await self.db.execute("""
                 UPDATE hll_match_sessions SET ended_at=COALESCE(ended_at,NOW()),
-                    last_seen_at=NOW()
+                    last_seen_at=NOW(),
+                    winner_side=CASE
+                      WHEN final_allied_score > final_axis_score THEN 'ALLIED'
+                      WHEN final_axis_score > final_allied_score THEN 'AXIS'
+                      ELSE NULL END,
+                    winner_faction_id=CASE
+                      WHEN final_allied_score > final_axis_score THEN allied_faction_id
+                      WHEN final_axis_score > final_allied_score THEN axis_faction_id
+                      ELSE NULL END,
+                    result_verified_at=CASE
+                      WHEN final_allied_score <> final_axis_score
+                           AND (COALESCE(final_allied_score,0)>0 OR COALESCE(final_axis_score,0)>0)
+                      THEN NOW() ELSE NULL END
                 WHERE id=$1
             """, closed_match_id)
             try:
