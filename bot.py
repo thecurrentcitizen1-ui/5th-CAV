@@ -4045,6 +4045,68 @@ class RecruitIntakePromptView(discord.ui.View):
         await _begin_or_resume_recruit_application(interaction)
 
 
+def _manual_recruit_intake_message(case_number: str | None = None) -> str:
+    case_label=(case_number or 'RECRUITING CASE').strip()
+    return (f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
+            f"**REPORT TO THE REPLACEMENT LINE — {case_label}**\n\n"
+            "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
+            "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
+            "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
+            "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
+            "**BATTALION CLERK • 1/5 CAV**")
+
+
+@bot.tree.command(name='recruit-intake-health',description='Check the Website → Battalion Clerk Replacement Interview queue.')
+async def recruit_intake_health(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        await interaction.followup.send(
+            '**REPLACEMENT INTERVIEW PIPELINE — CONFIGURATION HOLD**\n'
+            f'Website URL configured: **{"YES" if WEBSITE_BASE_URL else "NO"}**\n'
+            f'Clerk sync key configured: **{"YES" if CLERK_SYNC_KEY else "NO"}**\n'
+            'The bot cannot poll the intake queue until both are configured.',ephemeral=True)
+        return
+    try:
+        data=await web.request('GET','/internal/clerk/recruiting/intake-requests')
+        if not data.get('ok',True):
+            raise RuntimeError(data.get('error') or 'Website returned an unsuccessful queue response')
+        cases=data.get('cases',[]) or []
+        sample=', '.join(str(c.get('case_number') or c.get('id')) for c in cases[:5]) or 'NONE'
+        await interaction.followup.send(
+            '**REPLACEMENT INTERVIEW PIPELINE — ONLINE**\n'
+            f'Website queue reachable: **YES**\nPending manual interviews: **{len(cases)}**\n'
+            f'Queue sample: **{sample}**\n'
+            f'Configured battalion guild: **{GUILD_ID or "AUTO"}**\n'
+            'If a case is pending here for more than one poll cycle, use `/test-recruit-intake` to separate a Discord DM problem from a Website queue problem.',
+            ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(
+            '**REPLACEMENT INTERVIEW PIPELINE — FAILED**\n'
+            f'Website queue could not be read: `{type(exc).__name__}: {str(exc)[:350]}`\n'
+            'Check the Website service URL, CLERK_SYNC_KEY on both services, and Railway logs.',ephemeral=True)
+
+
+@bot.tree.command(name='test-recruit-intake',description='Send the exact Replacement Interview DM directly to a Discord member for testing.')
+@app_commands.describe(member='Member who should receive the test DM')
+async def test_recruit_intake(interaction:discord.Interaction, member:discord.Member):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await member.send(_manual_recruit_intake_message('TEST DELIVERY'),view=RecruitIntakePromptView())
+        await interaction.followup.send(
+            f'**TEST REPLACEMENT INTERVIEW SENT**\nRecipient: **{member.display_name}** (`{member.id}`)\n'
+            'This bypassed the Website queue and tested Discord DM delivery directly. The **BEGIN / RESUME INTAKE** button is live.',
+            ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f'**TEST DM BLOCKED**\nDiscord would not allow Battalion Clerk to DM **{member.display_name}**. '
+            'Have the member enable server DMs or message/interact with the bot first.',ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(
+            f'**TEST DM FAILED**\n`{type(exc).__name__}: {str(exc)[:400]}`',ephemeral=True)
+
+
 @bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry enlistment application in Discord.')
 async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
@@ -4354,13 +4416,7 @@ async def manual_recruit_intake_watch():
                 log.warning('[MANUAL RECRUIT INTAKE MEMBER NOT FOUND] case=%s user=%s',case.get('case_number'),user_id)
                 continue
 
-            message=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
-                     f"**REPORT TO THE REPLACEMENT LINE — {case.get('case_number')}**\n\n"
-                     "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
-                     "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
-                     "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
-                     "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
-                     "**BATTALION CLERK • 1/5 CAV**")
+            message=_manual_recruit_intake_message(case.get('case_number'))
             try:
                 await member.send(message,view=RecruitIntakePromptView())
                 await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':True,'guild_id':guild.id})
