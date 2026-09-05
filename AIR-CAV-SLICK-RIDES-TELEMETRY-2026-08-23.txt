@@ -1,6 +1,0 @@
-AIR CAV TELEMETRY UPDATE — 23 AUG 2026
-
-- Adds role_airmobile_seconds and role_airmobile_distance_meters to match telemetry.
-- Air Cav movement signature defaults to 20 m/s (72 km/h), configurable via HLL_RCON_AIRMOBILE_MIN_SPEED_MPS.
-- Website decides Pilot vs Slick Ride using the verified HLL role mapping: only verified Pilot role gets flight credit; all other roles get Slick Ride credit.
-- This remains a movement-based inference because HLLV RCON does not expose direct helicopter seat occupancy.

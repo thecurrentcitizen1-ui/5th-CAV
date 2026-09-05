@@ -1,7 +1,0 @@
-OPERATIONS SIMPLE CONTROL RELEASE — 2026-08-22
-
-Battalion Clerk Operations distribution changes:
-- Scheduled Website Operations continue to post automatically to Discord.
-- Operation reminders no longer require a separately configured reminder channel; safe fallback routing is used.
-- Operation duty-roster distribution no longer requires a separately configured duty-roster channel; safe fallback routing is used.
-- Event-specific Operation voice tracking remains authoritative for attendance and M16 round expenditure.

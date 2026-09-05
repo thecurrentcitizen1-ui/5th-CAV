@@ -1,7 +1,0 @@
-AIR CAV SERVICE UPDATE — 23 AUG 2026
-
-- Member-facing SERVER ROUNDS renamed IN THE SHIT.
-- AIRMOBILE STATUS renamed SLICK RIDES.
-- Only a staff-verified Pilot role receives Airmobile Flight Time and Distance Flown.
-- Every other role (gunner, crew, infantry passenger, squad leader, etc.) receives Slick Ride time/distance when the collector observes the Air Cav movement signature.
-- Raw telemetry remains staff/research evidence; the game still does not expose direct vehicle-seat occupancy.

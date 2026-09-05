@@ -1,7 +1,0 @@
-HLLV M16 WEAPON LOG EXPANSION
-
-- Polls RCON V2 GetAdminLog in overlapping windows and deduplicates events.
-- Stores exact weapon-attributed KILL and BLUE_ON_BLUE events.
-- Identifies M16/XM16 family events without inventing shots fired.
-- Accumulates verified time/distance when the live HLLV loadout contains M16/XM16.
-- Keeps estimated ammunition expenditure separate from exact weapon-event evidence.

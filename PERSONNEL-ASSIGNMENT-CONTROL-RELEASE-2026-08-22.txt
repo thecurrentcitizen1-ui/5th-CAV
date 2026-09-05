@@ -1,9 +1,0 @@
-PERSONNEL ASSIGNMENT CONTROL / FIRE TEAM DISCORD MIRROR — 2026-08-22
-
-- Existing Discord role structure preserved.
-- Team Leader appointment role remains managed by Battalion Clerk.
-- Adds simple Alpha Team / Bravo Team roles.
-- Fire Team roles are mirrored from website-authoritative personnel records.
-- Only one Fire Team role is retained per member.
-- Missing Alpha/Bravo role can be created on demand if the bot has Manage Roles.
-- Rank, MOS, Company, Platoon, Squad and field-leadership role synchronization remains intact.

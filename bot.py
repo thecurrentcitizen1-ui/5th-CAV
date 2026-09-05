@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import io
 import json
+import random
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -45,6 +46,15 @@ GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or
 NEW_ARRIVAL_ROLE_NAME = os.getenv('NEW_ARRIVAL_ROLE_NAME', 'NEW ARRIVAL').strip() or 'NEW ARRIVAL'
 NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
 
+# Canonical public publication channels. Stored Command routes always win; these
+# are regression-safe fallbacks so a lost/missing route cannot silently stop
+# awards, promotions, or Headquarters orders from reaching their public channels.
+HONORS_PROMOTIONS_CHANNEL_ID = int(os.getenv('HONORS_PROMOTIONS_CHANNEL_ID', '1537242629131993159') or 0)
+HEADQUARTERS_ORDERS_CHANNEL_ID = int(os.getenv('HEADQUARTERS_ORDERS_CHANNEL_ID', '1534357136858157157') or 0)
+HONORS_PROMOTIONS_CHANNEL_NAME = os.getenv('HONORS_PROMOTIONS_CHANNEL_NAME', 'honors-and-promotions').strip() or 'honors-and-promotions'
+HEADQUARTERS_ORDERS_CHANNEL_NAME = os.getenv('HEADQUARTERS_ORDERS_CHANNEL_NAME', 'orders-from-headquarters').strip() or 'orders-from-headquarters'
+
+
 intents = discord.Intents.none()
 intents.guilds = True
 intents.members = True
@@ -72,8 +82,13 @@ duty_voice_presence: Dict[Tuple[int, int, int], datetime] = {}
 # uninterrupted bot process. Persistent channel configuration is stored in PostgreSQL.
 announcement_notice_sent = set()
 announcement_reminder_sent = set()
+training_event_message_cache = {}  # (guild_id, message_id) -> training event id
 announcement_start_sent = set()
 announcement_end_sent = set()
+
+# Live Match Formation state is persisted in PostgreSQL; this in-memory set only
+# prevents overlapping work inside one bot process.
+match_formation_busy = set()
 
 # Personnel role changes are deliberately debounced. Staff often add rank, MOS,
 # unit, platoon, squad and access roles one after another; waiting 30 seconds
@@ -1147,14 +1162,54 @@ async def get_orders_channel_id(guild_id: int) -> Optional[int]:
     if await discord_routing_is_paused(guild_id): return None
     await ensure_clerk_settings_table()
     db = getattr(collector, 'db', None)
-    if not db or not getattr(db, 'pool', None):
+    value = None
+    if db and getattr(db, 'pool', None):
+        async with db.pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT orders_channel_id FROM clerk_guild_settings WHERE guild_id = $1",
+                str(guild_id),
+            )
+    # Regression-safe fallback. A configured route always wins.
+    return int(value) if value else (HEADQUARTERS_ORDERS_CHANNEL_ID or None)
+
+
+def _canonical_publication_channel(guild: discord.Guild, kind: str):
+    """Resolve the canonical public channel by stable ID first, then name.
+
+    This never bypasses the persistent routing pause. Callers must check pause before
+    using it. The name fallback makes the repair survive a future channel recreation.
+    """
+    kind=(kind or '').upper()
+    if kind in {'AWARD','PROMOTION'}:
+        cid=HONORS_PROMOTIONS_CHANNEL_ID; name=HONORS_PROMOTIONS_CHANNEL_NAME
+    else:
+        cid=HEADQUARTERS_ORDERS_CHANNEL_ID; name=HEADQUARTERS_ORDERS_CHANNEL_NAME
+    channel=guild.get_channel(cid) if cid else None
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return discord.utils.get(guild.text_channels, name=name)
+
+
+async def resolve_personnel_order_channel(guild: discord.Guild, kind: str, routes: dict):
+    """Configured per-type/ALL route first; canonical selective channel second."""
+    if await discord_routing_is_paused(guild.id):
         return None
-    async with db.pool.acquire() as conn:
-        value = await conn.fetchval(
-            "SELECT orders_channel_id FROM clerk_guild_settings WHERE guild_id = $1",
-            str(guild_id),
-        )
-    return int(value) if value else None
+    kind=(kind or '').upper()
+    # Awards/promotions are intentionally selective: a specific Command route wins,
+    # then the honors channel. A generic ALL route must not swallow them.
+    channel_id=routes.get(kind)
+    if channel_id:
+        channel=guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    if kind in {'AWARD','PROMOTION'}:
+        return _canonical_publication_channel(guild, kind)
+    channel_id=routes.get('ALL')
+    if channel_id:
+        channel=guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    return _canonical_publication_channel(guild, kind)
 
 
 async def set_operation_duty_channel(guild_id: int, channel_id: int):
@@ -1440,6 +1495,8 @@ async def post_battalion_order(
         return False
     channel = guild.get_channel(channel_id)
     if not isinstance(channel, discord.TextChannel):
+        channel = _canonical_publication_channel(guild, 'ORDER')
+    if not isinstance(channel, discord.TextChannel):
         return False
 
     title = event.get('title') or event.get('event_type') or 'UNNAMED DUTY'
@@ -1538,15 +1595,16 @@ async def personnel_orders_watch():
     for guild in bot.guilds:
         if GUILD_ID and guild.id != GUILD_ID: continue
         try:
+            if await discord_routing_is_paused(guild.id):
+                continue
             routes = await get_order_routes(guild.id)
-            if not routes: continue
             payload = await web.request('GET','/internal/clerk/orders/pending',params={'guild_id':guild.id})
             for order in payload.get('orders',[]):
                 kind = str(order.get('document_type') or '').upper()
-                channel_id = routes.get(kind) or routes.get('ALL')
-                if not channel_id: continue
-                channel = guild.get_channel(channel_id)
-                if not isinstance(channel, discord.TextChannel): continue
+                channel = await resolve_personnel_order_channel(guild, kind, routes)
+                if not isinstance(channel, discord.TextChannel):
+                    log.warning('[PERSONNEL ORDERS] no channel resolved guild=%s type=%s',guild.id,kind)
+                    continue
                 soldier = f"{order.get('rank_code') or ''} {order.get('first_name') or ''} {order.get('last_name') or ''}".strip()
                 body = (f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
                         f"**{order.get('document_number')} — {order.get('title')}**\n\n"
@@ -2180,6 +2238,7 @@ def _parse_training_et(date_text: str, time_text: str) -> datetime:
     return datetime.combine(d,parsed,tzinfo=ZoneInfo(BATTALION_TIMEZONE))
 
 def _training_event_embed(event: dict, rsvps: list, *, guild: Optional[discord.Guild]=None, state_note: Optional[str]=None) -> discord.Embed:
+    """Compact training order that remains readable on desktop and Discord mobile."""
     title=str(event.get('title') or 'TRAINING')
     start_raw=event.get('starts_at'); end_raw=event.get('ends_at')
     def dt(v):
@@ -2192,33 +2251,43 @@ def _training_event_embed(event: dict, rsvps: list, *, guild: Optional[discord.G
     start,end=dt(start_raw),dt(end_raw)
     start_ts=int(start.timestamp()) if start else 0
     end_ts=int(end.timestamp()) if end else 0
-    status=str(event.get('status') or 'SCHEDULED').upper()
-    desc=[]
+    status=str(event.get('status') or 'SCHEDULED').upper().replace('_',' ')
+
+    header=[]
     if start_ts:
-        desc.append(f'**TIME:** <t:{start_ts}:F> — <t:{end_ts}:t>')
-    desc.append(f"**HOST:** <@{event.get('host_discord_user_id')}>" if event.get('host_discord_user_id') else '**HOST:** Battalion Training Staff')
-    desc.append(f"**FORMATION:** {str(event.get('audience') or 'OPEN').replace('_',' ')}")
-    if event.get('notes'): desc.append(f"**ORDERS:** {event.get('notes')}")
-    desc.append(f"**STATUS:** {status.replace('_',' ')}")
-    if state_note: desc.append(state_note)
-    embed=discord.Embed(title=f'1/5 CAV — {title}', description='\n'.join(desc))
+        header.append(f'**<t:{start_ts}:F>**  •  <t:{start_ts}:R>')
+        if end_ts:
+            header.append(f'Ends <t:{end_ts}:t>')
+    host=(f"<@{event.get('host_discord_user_id')}>" if event.get('host_discord_user_id') else 'Battalion Training Staff')
+    formation=str(event.get('audience') or 'OPEN').replace('_',' ').title()
+    header.append(f'**Host:** {host}  •  **Formation:** {formation}')
+    if event.get('notes'):
+        header.append(f"**Orders:** {str(event.get('notes'))[:700]}")
+    if state_note:
+        header.append(state_note)
+
+    embed=discord.Embed(title=f'1/5 CAV — TRAINING ORDER | {title}', description='\n'.join(header))
     groups={'ATTENDING':[],'MAYBE':[],'UNABLE':[]}
     for row in rsvps or []:
         response=str(row.get('response') or '').upper()
         if response not in groups: continue
         name=str(row.get('roster_name') or row.get('display_name') or '').strip()
         uid=row.get('discord_user_id')
-        if (not name or name==str(uid)) and uid: name=f'<@{uid}>'
-        minutes=int(row.get('credited_minutes') or 0)
-        suffix=f' — {minutes} min verified' if minutes>0 else ''
-        groups[response].append(f'{name}{suffix}')
-    labels=[('ATTENDING','ATTENDING'),('MAYBE','MAYBE'),('UNABLE','NOT ABLE')]
+        if (not name or name==str(uid)) and uid:
+            name=f'<@{uid}>'
+        # Keep the public RSVP board clean. Verified minutes belong in host roster/close tools.
+        groups[response].append(name or 'Unknown')
+
+    labels=[('ATTENDING','✅ ATTENDING'),('MAYBE','❔ MAYBE'),('UNABLE','✖ NOT ABLE')]
     for key,label in labels:
         values=groups[key]
-        text='\n'.join(values[:18]) if values else '—'
-        if len(values)>18: text += f'\n+ {len(values)-18} more'
-        embed.add_field(name=f'{label} — {len(values)}',value=text[:1024],inline=False)
-    embed.set_footer(text='RSVP below. Automatic training credit uses verified 1/5 Cav HLL server time during the scheduled window.')
+        text='\n'.join(values[:12]) if values else '—'
+        if len(values)>12:
+            text += f'\n+{len(values)-12} more'
+        embed.add_field(name=f'{label}  ·  {len(values)}',value=text[:1024],inline=True)
+
+    embed.add_field(name='STATUS',value=status,inline=False)
+    embed.set_footer(text='Choose one RSVP below. You can change your response at any time before training.')
     return embed
 
 async def _fetch_training_event(event_id: str):
@@ -2241,12 +2310,21 @@ class TrainingRSVPView(discord.ui.View):
     async def _rsvp(self, interaction: discord.Interaction, response: str):
         if not interaction.guild or not interaction.message:
             await interaction.response.send_message('Training RSVP is unavailable here.',ephemeral=True); return
-        # Event lookup by Discord message id keeps the persistent buttons restart-safe.
-        data=await web.request('GET','/internal/clerk/training-events',params={'guild_id':interaction.guild_id})
-        event=next((e for e in (data.get('events') or []) if str(e.get('discord_message_id') or '')==str(interaction.message.id)),None)
-        if not event:
-            await interaction.response.send_message('This training roster is no longer linked to an active event record.',ephemeral=True); return
+        # Acknowledge the button immediately so Discord never appears frozen while the API is queried.
         await interaction.response.defer(ephemeral=True)
+        # Fast path: scheduled/observed messages are cached by message id. Fall back to API after restarts.
+        cache_key=(interaction.guild_id,interaction.message.id)
+        event_id=training_event_message_cache.get(cache_key)
+        event=None
+        if event_id:
+            event=await _fetch_training_event(str(event_id))
+        if not event:
+            data=await web.request('GET','/internal/clerk/training-events',params={'guild_id':interaction.guild_id})
+            event=next((e for e in (data.get('events') or []) if str(e.get('discord_message_id') or '')==str(interaction.message.id)),None)
+            if event and event.get('id'):
+                training_event_message_cache[cache_key]=str(event['id'])
+        if not event:
+            await interaction.followup.send('This training roster is no longer linked to an active event record.',ephemeral=True); return
         result=await web.request('POST',f"/internal/clerk/training-events/{event['id']}/rsvp",json={
             'discord_user_id':interaction.user.id,'display_name':interaction.user.display_name,'response':response})
         if not result.get('ok',True):
@@ -2287,6 +2365,7 @@ async def schedule_training(interaction:discord.Interaction,title:str,date:str,t
     event=result.get('event') or {}; event['host_discord_user_id']=interaction.user.id; event['audience']=audience.value; event['notes']=notes or ''
     msg=await post_channel.send(embed=_training_event_embed(event,[],guild=interaction.guild),view=TrainingRSVPView())
     await web.request('PATCH',f"/internal/clerk/training-events/{result['event_id']}/message",json={'channel_id':post_channel.id,'message_id':msg.id})
+    training_event_message_cache[(interaction.guild_id,msg.id)]=str(result['event_id'])
     await interaction.followup.send(f'**TRAINING SCHEDULED** — {post_channel.mention}\nEvent ID: `{result["event_id"]}`',ephemeral=True)
 
 @bot.tree.command(name='training-events',description='Show upcoming 1/5 Cav training events and RSVP counts.')
@@ -2349,6 +2428,9 @@ async def training_scheduler_watch():
             for notice in data.get('notices') or []:
                 kind=notice.get('kind'); event=notice.get('event') or {}; roster=notice.get('rsvps') or []
                 cid=event.get('discord_channel_id'); mid=event.get('discord_message_id')
+                if mid and event.get('id'):
+                    try: training_event_message_cache[(guild.id,int(mid))]=str(event['id'])
+                    except Exception: pass
                 channel=guild.get_channel(int(cid)) if cid else None
                 if channel is None and cid:
                     try: channel=await guild.fetch_channel(int(cid))
@@ -2357,12 +2439,27 @@ async def training_scheduler_watch():
                 if channel and mid:
                     try: msg=await channel.fetch_message(int(mid))
                     except Exception: msg=None
-                note={'REMINDER_60':'**TRAINING IN 60 MINUTES**','REMINDER_15':'**TRAINING IN 15 MINUTES**','START':'**TRAINING WINDOW IS NOW OPEN — HLL ATTENDANCE TRACKING ACTIVE**','END':'**TRAINING WINDOW CLOSED — HOST REVIEW REQUIRED**'}.get(kind)
-                if msg:
+                # V65: one low-noise reminder only. 60-minute/start/end notices never create channel messages.
+                note={'REMINDER_15':'**TRAINING IN 15 MINUTES**','START':'**TRAINING WINDOW OPEN**','END':'**TRAINING COMPLETE**'}.get(kind)
+                if msg and kind in {'REMINDER_15','START','END'}:
                     await msg.edit(embed=_training_event_embed(event,roster,guild=guild,state_note=note),view=TrainingRSVPView())
-                if channel and kind in {'REMINDER_60','REMINDER_15','START','END'}:
-                    mention=f"<@{event.get('host_discord_user_id')}> " if kind=='END' and event.get('host_discord_user_id') else ''
-                    await channel.send(f"{mention}**{event.get('title')}** — {note}",allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+                if channel and kind=='REMINDER_15':
+                    attending=[]
+                    seen=set()
+                    for row in roster:
+                        if str(row.get('response') or '').upper()!='ATTENDING':
+                            continue
+                        uid=str(row.get('discord_user_id') or '').strip()
+                        if uid.isdigit() and uid not in seen:
+                            seen.add(uid); attending.append(f'<@{uid}>')
+                    pings=' '.join(attending)
+                    body=(
+                        f"**1/5 CAV — TRAINING BEGINS IN 15 MINUTES**\n"
+                        f"**{event.get('title') or 'Training'}**\n"
+                        + (f"{pings}\n" if pings else '')
+                        + 'Report to the 1/5 server and your assigned comms.'
+                    )
+                    await channel.send(body[:2000],allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
         except Exception:
             log.exception('[TRAINING SCHEDULER WATCH FAILED] guild=%s',guild.id)
 
@@ -3055,6 +3152,36 @@ async def personnel_orders_status(interaction: discord.Interaction):
         ch=interaction.guild.get_channel(cid)
         lines.append(f'**{kind.replace("_"," ").title()}** — {ch.mention if ch else f"#{cid}"}')
     await interaction.response.send_message('**PERSONNEL ORDER ROUTING**\n'+"\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name='repair-publication-routing', description='Restore the standard 1/5 Cav public channels for awards, promotions, and Headquarters orders.')
+async def repair_publication_routing(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    if await discord_routing_is_paused(interaction.guild_id):
+        await interaction.response.send_message(
+            'Discord routing is currently **PAUSED**. Run `/discord-routing-resume confirm:RESUME DISCORD ROUTING` first; this repair will not bypass the safety switch.',
+            ephemeral=True,
+        )
+        return
+    honors=_canonical_publication_channel(interaction.guild,'AWARD')
+    orders=_canonical_publication_channel(interaction.guild,'ASSIGNMENT')
+    if not isinstance(honors,discord.TextChannel) or not isinstance(orders,discord.TextChannel):
+        missing=[]
+        if not isinstance(honors,discord.TextChannel): missing.append(HONORS_PROMOTIONS_CHANNEL_NAME)
+        if not isinstance(orders,discord.TextChannel): missing.append(HEADQUARTERS_ORDERS_CHANNEL_NAME)
+        await interaction.response.send_message('Could not resolve required channel(s): **'+', '.join(missing)+'**. No routing changes were filed.',ephemeral=True)
+        return
+    await set_order_route(interaction.guild_id,'AWARD',honors.id)
+    await set_order_route(interaction.guild_id,'PROMOTION',honors.id)
+    await set_orders_channel(interaction.guild_id,orders.id)
+    # Keep major personnel paperwork on the Headquarters order route unless Command
+    # already chooses a more specific route later.
+    for kind in ('REPLACEMENT','ASSIGNMENT','APPOINTMENT','LEAVE','RETURN','SEPARATION','TOUR EXTENSION','TRAINING','QUALIFICATION'):
+        await set_order_route(interaction.guild_id,kind,orders.id)
+    await interaction.response.send_message(
+        f'**PUBLICATION ROUTING REPAIRED**\nAwards + promotions → {honors.mention}\nHeadquarters/personnel orders → {orders.mention}\n\nCustom per-type routes can still be changed afterward with `/personnel-orders-channel`.',
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(name='personnel-orders-clear', description='Stop sending one type of personnel order to Discord.')
 @app_commands.choices(order_type=[app_commands.Choice(name=x.title().replace('_',' '), value=x) for x in ORDER_ROUTE_TYPES])
@@ -3958,6 +4085,8 @@ async def on_ready():
         dormant_formation_cleanup_watch.start()
     if not member_record_reminder_watch.is_running():
         member_record_reminder_watch.start()
+    if not match_formation_watch.is_running():
+        match_formation_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -4018,6 +4147,250 @@ async def on_ready():
             recovered_count,
         )
 
+
+
+# ---------------------------------------------------------------------------
+# LIVE MATCH FORMATION / BETWEEN-ROUND RANDOMIZER (V67)
+# ---------------------------------------------------------------------------
+MATCH_FORMATION_MIN_PLAYERS = 5
+MATCH_FORMATION_TANK_MIN_PLAYERS = 9
+MATCH_FORMATION_PILOT_MIN_PLAYERS = 13
+
+async def ensure_match_formation_schema():
+    await collector.start()
+    await collector.db.execute("""
+        CREATE TABLE IF NOT EXISTS clerk_match_formation_config(
+            guild_id BIGINT PRIMARY KEY,
+            voice_channel_id BIGINT,
+            text_channel_id BIGINT,
+            side_mode TEXT NOT NULL DEFAULT 'US',
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            last_processed_match_id BIGINT,
+            last_posted_at TIMESTAMPTZ,
+            last_message_id BIGINT,
+            updated_by BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    await collector.db.execute("""
+        CREATE TABLE IF NOT EXISTS clerk_match_formation_history(
+            id BIGSERIAL PRIMARY KEY,
+            guild_id BIGINT NOT NULL,
+            match_id BIGINT,
+            posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            voice_channel_id BIGINT,
+            text_channel_id BIGINT,
+            side_mode TEXT,
+            player_count INTEGER NOT NULL,
+            roster_json JSONB NOT NULL
+        )
+    """)
+
+async def _latest_completed_hll_match_id():
+    try:
+        row = await collector.db.fetchrow("SELECT id FROM hll_match_sessions WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+        return int(row['id']) if row else None
+    except Exception:
+        return None
+
+async def _active_or_latest_match_label(match_id: int | None):
+    if not match_id:
+        return None
+    try:
+        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,ended_at
+            FROM hll_match_sessions WHERE id=$1""", int(match_id))
+        if not row:
+            return None
+        return dict(row)
+    except Exception:
+        return None
+
+def _formation_members(channel):
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        return []
+    return [m for m in channel.members if not m.bot]
+
+def _split_evenly(players, max_size=6):
+    if not players:
+        return []
+    squad_count = max(1, (len(players) + max_size - 1) // max_size)
+    base, extra = divmod(len(players), squad_count)
+    out=[]; idx=0
+    for i in range(squad_count):
+        size = base + (1 if i < extra else 0)
+        out.append(players[idx:idx+size]); idx += size
+    return out
+
+def _build_random_match_formation(members, side_mode='US'):
+    pool=list(members)
+    random.SystemRandom().shuffle(pool)
+    roster={'armor':None,'pilot':None,'infantry':[],'side_mode':side_mode,'player_count':len(pool)}
+
+    # Preserve infantry viability: armor does not open until a full six-player
+    # rifle squad can remain. Pilot opens only at 13+, after armor + a full rifle squad.
+    if len(pool) >= MATCH_FORMATION_TANK_MIN_PLAYERS:
+        armor=[pool.pop() for _ in range(3)]
+        commander=random.SystemRandom().choice(armor)
+        roster['armor']={'commander':commander,'crew':[m for m in armor if m.id != commander.id]}
+
+    if str(side_mode).upper() == 'US' and len(members) >= MATCH_FORMATION_PILOT_MIN_PLAYERS and pool:
+        roster['pilot']=pool.pop()
+
+    random.SystemRandom().shuffle(pool)
+    for idx, squad in enumerate(_split_evenly(pool,6), start=1):
+        if not squad:
+            continue
+        sl=random.SystemRandom().choice(squad)
+        roster['infantry'].append({'number':idx,'leader':sl,'members':[m for m in squad if m.id != sl.id]})
+    return roster
+
+def _formation_to_json(roster):
+    def mem(m): return {'discord_user_id':str(m.id),'display_name':m.display_name}
+    out={'side_mode':roster['side_mode'],'player_count':roster['player_count'],'armor':None,'pilot':None,'infantry':[]}
+    if roster.get('armor'):
+        out['armor']={'commander':mem(roster['armor']['commander']),'crew':[mem(x) for x in roster['armor']['crew']]}
+    if roster.get('pilot'): out['pilot']=mem(roster['pilot'])
+    for s in roster['infantry']:
+        out['infantry'].append({'number':s['number'],'leader':mem(s['leader']),'members':[mem(x) for x in s['members']]})
+    return out
+
+def _formation_embed(roster, voice_channel, match_row=None, automatic=True):
+    title='1/5 CAV — NEXT MATCH FORMATION'
+    desc=(f"**{roster['player_count']} personnel mustered** in {voice_channel.mention}.\n"
+          f"Fresh random formation for the next round. Permanent website assignments do **not** affect this roster.")
+    e=discord.Embed(title=title,description=desc,timestamp=utc_now())
+    if match_row:
+        label=match_row.get('map_name') or match_row.get('map_id') or f"Match {match_row.get('id')}"
+        mode=match_row.get('game_mode') or 'Unknown mode'
+        e.add_field(name='ROUND COMPLETE',value=f"{label} • {mode}",inline=False)
+    if roster.get('armor'):
+        a=roster['armor']
+        value=f"**TC — {a['commander'].mention}**\n"+'\n'.join(f"Crew — {m.mention}" for m in a['crew'])
+        e.add_field(name='SABER — ARMOR (3)',value=value,inline=False)
+    if roster.get('pilot'):
+        e.add_field(name='AIR CAV — PILOT (U.S.)',value=f"Pilot — {roster['pilot'].mention}",inline=False)
+    for sq in roster['infantry']:
+        lines=[f"**SL — {sq['leader'].mention}**"]+[m.mention for m in sq['members']]
+        e.add_field(name=f"RIFLE SQUAD {sq['number']} — {1+len(sq['members'])}",value='\n'.join(lines),inline=False)
+    e.set_footer(text=('Automatic between-round shuffle' if automatic else 'Manual live shuffle')+' • New roster every round')
+    return e
+
+async def _publish_match_formation(guild, cfg, match_id=None, automatic=True):
+    voice=guild.get_channel(int(cfg['voice_channel_id'] or 0))
+    text=guild.get_channel(int(cfg['text_channel_id'] or 0))
+    if not isinstance(voice,(discord.VoiceChannel,discord.StageChannel)):
+        return {'ok':False,'error':'Configured voice channel is missing or invalid.'}
+    if not isinstance(text,discord.TextChannel):
+        return {'ok':False,'error':'Configured text channel is missing or invalid.'}
+    members=_formation_members(voice)
+    if len(members) < MATCH_FORMATION_MIN_PLAYERS:
+        return {'ok':False,'error':f'Only {len(members)} player(s) are in {voice.name}; 5 are required.','player_count':len(members)}
+    roster=_build_random_match_formation(members,str(cfg.get('side_mode') or 'US').upper())
+    match_row=await _active_or_latest_match_label(match_id)
+    msg=await text.send(embed=_formation_embed(roster,voice,match_row,automatic=automatic))
+    packed=_formation_to_json(roster)
+    await collector.db.execute("""INSERT INTO clerk_match_formation_history
+        (guild_id,match_id,voice_channel_id,text_channel_id,side_mode,player_count,roster_json)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)""",
+        guild.id,match_id,voice.id,text.id,str(cfg.get('side_mode') or 'US').upper(),len(members),json.dumps(packed))
+    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_posted_at=NOW(),last_message_id=$2,updated_at=NOW()
+        WHERE guild_id=$1""",guild.id,msg.id)
+    return {'ok':True,'message':msg,'player_count':len(members),'roster':roster}
+
+@tasks.loop(seconds=15)
+async def match_formation_watch():
+    if not bot.is_ready():
+        return
+    try:
+        await ensure_match_formation_schema()
+        rows=await collector.db.fetch("SELECT * FROM clerk_match_formation_config WHERE enabled=TRUE AND voice_channel_id IS NOT NULL AND text_channel_id IS NOT NULL")
+        for row in rows:
+            guild_id=int(row['guild_id'])
+            if guild_id in match_formation_busy:
+                continue
+            guild=bot.get_guild(guild_id)
+            if not guild:
+                continue
+            latest=await _latest_completed_hll_match_id()
+            if latest is None:
+                continue
+            last=int(row['last_processed_match_id'] or 0)
+            if latest <= last:
+                continue
+            match_formation_busy.add(guild_id)
+            try:
+                # Mark the completed round processed first. A failed/low-pop round
+                # will not be replayed later as a stale between-round roster.
+                await collector.db.execute("UPDATE clerk_match_formation_config SET last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1",guild_id,latest)
+                voice=guild.get_channel(int(row['voice_channel_id'] or 0))
+                count=len(_formation_members(voice)) if voice else 0
+                if count < MATCH_FORMATION_MIN_PLAYERS:
+                    log.info('[MATCH FORMATION SKIP] guild=%s match=%s players=%s (<5)',guild_id,latest,count)
+                    continue
+                result=await _publish_match_formation(guild,dict(row),match_id=latest,automatic=True)
+                if not result.get('ok'):
+                    log.warning('[MATCH FORMATION POST FAILED] guild=%s match=%s error=%s',guild_id,latest,result.get('error'))
+                else:
+                    log.info('[MATCH FORMATION POSTED] guild=%s match=%s players=%s',guild_id,latest,result.get('player_count'))
+            except Exception:
+                log.exception('[MATCH FORMATION WATCH FAILED] guild=%s match=%s',guild_id,latest)
+            finally:
+                match_formation_busy.discard(guild_id)
+    except Exception:
+        log.exception('[MATCH FORMATION WATCH ERROR]')
+
+@bot.tree.command(name='match-formation-setup', description='Choose the voice muster and text roster channels for automatic between-round shuffles.')
+@app_commands.describe(voice_channel='Voice channel Battalion Clerk watches',text_channel='Text channel where the next-match roster is posted',side='Use US to include a pilot when attendance supports it')
+@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='Non-U.S. side',value='NON_US')])
+async def match_formation_setup(interaction:discord.Interaction, voice_channel:discord.VoiceChannel, text_channel:discord.TextChannel, side:app_commands.Choice[str]):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    await ensure_match_formation_schema()
+    latest=await _latest_completed_hll_match_id()
+    await collector.db.execute("""INSERT INTO clerk_match_formation_config(guild_id,voice_channel_id,text_channel_id,side_mode,enabled,last_processed_match_id,updated_by)
+        VALUES($1,$2,$3,$4,TRUE,$5,$6)
+        ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=EXCLUDED.voice_channel_id,text_channel_id=EXCLUDED.text_channel_id,
+          side_mode=EXCLUDED.side_mode,enabled=TRUE,last_processed_match_id=EXCLUDED.last_processed_match_id,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
+        interaction.guild_id,voice_channel.id,text_channel.id,side.value,latest,interaction.user.id)
+    await interaction.followup.send(
+        f"**MATCH FORMATION AUTOMATION ENABLED**\nMuster voice: {voice_channel.mention}\nRoster channel: {text_channel.mention}\nSide: **{side.name}**\n"
+        f"Trigger: **5+ players in voice when an HLL round ends**. Battalion Clerk will generate and post a fresh random roster after every completed game.",ephemeral=True)
+
+@bot.tree.command(name='match-formation-status', description='Show the automatic next-match formation configuration and current live muster count.')
+async def match_formation_status(interaction:discord.Interaction):
+    await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.response.send_message('Match Formation is not configured. Use `/match-formation-setup`.',ephemeral=True); return
+    voice=interaction.guild.get_channel(int(row['voice_channel_id'] or 0)); text=interaction.guild.get_channel(int(row['text_channel_id'] or 0))
+    count=len(_formation_members(voice)) if voice else 0
+    await interaction.response.send_message(
+        f"**MATCH FORMATION STATUS**\nEnabled: **{'YES' if row['enabled'] else 'NO'}**\nVoice: {voice.mention if voice else 'Missing'}\n"
+        f"Roster channel: {text.mention if text else 'Missing'}\nSide: **{row['side_mode']}**\nLive muster: **{count}** / 5 minimum\n"
+        f"Last processed HLL match: **{row['last_processed_match_id'] or 'None'}**",ephemeral=True)
+
+@bot.tree.command(name='match-formation-publish', description='Immediately randomize the live voice-channel muster and publish the next-match roster.')
+async def match_formation_publish(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.followup.send('Run `/match-formation-setup` first.',ephemeral=True); return
+    result=await _publish_match_formation(interaction.guild,dict(row),match_id=None,automatic=False)
+    if not result.get('ok'):
+        await interaction.followup.send(result.get('error','Unable to publish formation.'),ephemeral=True); return
+    await interaction.followup.send(f"Fresh roster posted with **{result['player_count']}** players.",ephemeral=True)
+
+@bot.tree.command(name='match-formation-disable', description='Disable automatic between-round match formation posts.')
+async def match_formation_disable(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await ensure_match_formation_schema()
+    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=FALSE,updated_by=$2,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,interaction.user.id)
+    await interaction.response.send_message('**MATCH FORMATION AUTOMATION DISABLED**',ephemeral=True)
 
 
 
@@ -4099,7 +4472,7 @@ class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1
                 'age':age,'timezone_name':str(self.timezone_name.value).strip(),'game_platform':platform,
                 'game_identity':identity,'hll_experience':str(self.hll_experience.value).strip()
             })
-            await interaction.response.send_message('**PART 1 FILED.** Continue with duty preferences.',view=RecruitPart2View())
+            await interaction.response.send_message('**PART 1 FILED.** Continue with duty preferences.',view=RecruitPart2View(),ephemeral=_recruit_ephemeral(interaction))
         except Exception as exc:
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
@@ -4121,7 +4494,7 @@ class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — P
                 'play_style':str(self.play_style.value).strip(),'follows_chain':'YES' if chain in {'YES','Y'} else 'NO',
                 'participation':str(self.participation.value).strip()
             })
-            await interaction.response.send_message('**PART 2 FILED.** One final section remains.',view=RecruitPart3View())
+            await interaction.response.send_message('**PART 2 FILED.** One final section remains.',view=RecruitPart3View(),ephemeral=_recruit_ephemeral(interaction))
         except Exception as exc:
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
@@ -4660,25 +5033,48 @@ async def manual_recruit_intake_watch():
                         member=maybe
                         break
 
-            if not member or not guild:
-                err=f'Discord member {user_id} could not be resolved in the battalion server'
+            # A verified Discord user ID is the authoritative delivery target.
+            # Prefer a guild Member so server membership can be confirmed, but do not
+            # let cache/member-resolution problems strand a valid Command request.
+            # Discord User.send() still observes the recruit's DM/privacy settings.
+            dm_target=member
+            if not dm_target:
+                try:
+                    dm_target=bot.get_user(user_id) or await bot.fetch_user(user_id)
+                    if dm_target:
+                        log.info('[MANUAL RECRUIT INTAKE USER FALLBACK] case=%s user=%s',case.get('case_number'),user_id)
+                except Exception:
+                    dm_target=None
+
+            if not dm_target:
+                err=f'Discord user {user_id} could not be resolved for intake delivery'
                 await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
-                log.warning('[MANUAL RECRUIT INTAKE MEMBER NOT FOUND] case=%s user=%s',case.get('case_number'),user_id)
+                log.warning('[MANUAL RECRUIT INTAKE USER NOT FOUND] case=%s user=%s',case.get('case_number'),user_id)
                 continue
 
             message=_manual_recruit_intake_message(case.get('case_number'))
             try:
-                await member.send(message,view=RecruitIntakePromptView())
-                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':True,'guild_id':guild.id})
-                log.info('[MANUAL RECRUIT INTAKE SENT] case=%s member=%s guild=%s',case.get('case_number'),member.id,guild.id)
+                # Do not acknowledge SENT to the Website until Discord has accepted
+                # the actual DM containing the persistent intake button.
+                sent_message=await dm_target.send(message,view=RecruitIntakePromptView())
+                if not getattr(sent_message,'id',None):
+                    raise RuntimeError('Discord did not return a message id for the intake DM')
+                await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={
+                    'sent':True,
+                    'guild_id':guild.id if guild else None,
+                    'discord_message_id':sent_message.id,
+                    'discord_channel_id':getattr(getattr(sent_message,'channel',None),'id',None),
+                })
+                log.info('[MANUAL RECRUIT INTAKE SENT] case=%s user=%s guild=%s message=%s',
+                         case.get('case_number'),user_id,getattr(guild,'id',None),sent_message.id)
             except discord.Forbidden:
                 err='Discord direct messages are disabled or blocked for this recruit'
                 await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
-                log.warning('[MANUAL RECRUIT INTAKE DM BLOCKED] case=%s member=%s',case.get('case_number'),member.id)
+                log.warning('[MANUAL RECRUIT INTAKE DM BLOCKED] case=%s user=%s',case.get('case_number'),user_id)
             except Exception as exc:
                 err=f'{type(exc).__name__}: {exc}'[:500]
                 await web.request('POST',f"/internal/clerk/recruiting/{case_id}/intake-request-status",json={'sent':False,'error':err})
-                log.exception('[MANUAL RECRUIT INTAKE DM FAILED] case=%s member=%s',case.get('case_number'),member.id)
+                log.exception('[MANUAL RECRUIT INTAKE DM FAILED] case=%s user=%s',case.get('case_number'),user_id)
     except Exception as exc:
         log.exception('[MANUAL RECRUIT INTAKE WATCH FAILED] error=%s',exc)
 

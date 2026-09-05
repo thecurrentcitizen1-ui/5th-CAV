@@ -1,9 +1,0 @@
-1/5 CAV — UNIFIED OPERATIONS + M16 REVIEW
-
-Website-authoritative Operation scheduling: PASS
-Discord /schedule guidance-only: PASS
-60-second website duty binding refresh: RETAINED
-5-minute live duty presence flush: RETAINED
-Hourly M16 inactivity refresh request: PASS
-Python compile: PASS
-Duplicate slash command audit: PASS

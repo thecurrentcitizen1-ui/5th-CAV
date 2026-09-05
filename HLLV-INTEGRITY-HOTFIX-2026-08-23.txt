@@ -1,5 +1,0 @@
-HLLV INTEGRITY HOTFIX — 23 AUG 2026
-
-- Formation billet reconciliation now handles personnel without a fire_team value safely.
-- Welcome Packet Clerk notification join explicitly compares website_member_links.personnel_id text to notification UUID text, eliminating PostgreSQL text=uuid failures.
-- No personnel, award, operation, M16, or telemetry features removed.

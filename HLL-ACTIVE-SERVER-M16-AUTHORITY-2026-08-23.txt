@@ -1,9 +1,0 @@
-1/5 CAV — ACTIVE SERVER M16 AUTHORITY REPAIR — 2026-08-23
-
-- Verified HLL: Vietnam active-server time is now authoritative issued-M16 field service for linked Soldiers.
-- No M16/XM16 loadout-string match is required for round accrual or fouling.
-- Every completed 5 minutes of verified linked server service files an idempotent 25-round estimate (300 rounds/hour) against the rifle issued at the observed time.
-- Round events continue to drive total rounds, rounds since cleaning, last fired time, and weapon fouling/condition.
-- M16 service statistics now use verified connected server time and movement distance for linked Soldiers with an issued rifle.
-- Operation-carried history now requires verified HLL server presence overlapping the scheduled operation plus an active issue of the displayed rifle for the operation date.
-- Exact M16 kills and Blue-on-Blue remain weapon-event evidence and are not inferred from presence.
