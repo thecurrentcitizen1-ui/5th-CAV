@@ -1090,7 +1090,8 @@ async def reset_discord_routing(guild_id:int):
     return {'paused':True,'duty_channels_cleared':cleared_duty}
 
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
-SEEDING_SLOTS = ((19, 0), (19, 30), (20, 0), (20, 30))
+SEEDING_EVENING_SLOTS = ((19, 0), (19, 30), (20, 0), (20, 30))
+SEEDING_WEEKEND_SLOTS = ((14, 0), (14, 30), (15, 0), (15, 30), (16, 0), (16, 30))
 SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_STOP_PLAYERS', '50') or 50))
 SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Member', 'Replacement')
 SEEDING_MESSAGE = (
@@ -3954,6 +3955,82 @@ async def operation_lifecycle_review_watch():
 async def before_operation_lifecycle_review_watch():
     await bot.wait_until_ready()
 
+
+@bot.tree.command(name='weekly-battalion-report-channel', description='Set the channel for the automatic weekly battalion manpower/accountability report.')
+async def weekly_battalion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
+    await interaction.response.send_message(
+        f'Weekly Battalion Reports will be posted to {channel.mention} on Sunday evening (battalion time).',
+        ephemeral=True
+    )
+
+
+@tasks.loop(hours=1)
+async def weekly_battalion_report_watch():
+    """Post one concise weekly leadership report each Sunday evening.
+
+    The Website remains authoritative for strength/readiness/action figures.  A
+    notice key prevents duplicate reports across bot restarts and multiple hourly
+    checks inside the Sunday evening window.
+    """
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    try:
+        tz=ZoneInfo(BATTALION_TIMEZONE)
+    except Exception:
+        tz=ZoneInfo('America/New_York')
+    now=datetime.now(tz)
+    if now.weekday()!=6 or now.hour!=19:
+        return
+    report_key=f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+    for guild in bot.guilds:
+        try:
+            ch=await get_report_channel(guild,'WEEKLY_BATTALION_REPORT')
+            if not ch:
+                continue
+            if not await _notice_once(guild.id,'BATTALION','WEEKLY_BATTALION_REPORT',report_key):
+                continue
+            data=await web.request('GET','/internal/clerk/reports/weekly-battalion')
+            m=data.get('metrics') or {}
+            companies=data.get('companies') or []
+            company_lines=[]
+            for c in companies[:6]:
+                company_lines.append(
+                    f"• **{c.get('name') or c.get('code') or 'Company'}** — "
+                    f"STR {c.get('strength',0)} | 7D {c.get('active7',0)} | "
+                    f"RDY {c.get('readiness',0)}% | WATCH {c.get('inactive14',0)}"
+                )
+            body=(
+                f"**1/5 CAV — WEEKLY BATTALION REPORT**\n"
+                f"Week: **{report_key}**\n\n"
+                f"**Strength:** {m.get('strength',0)}\n"
+                f"**Verified HLL activity (7D):** {m.get('active7',0)}\n"
+                f"**14+ day inactivity watch:** {m.get('inactive14',0)}\n"
+                f"**30+ day Command review:** {m.get('inactive30',0)}\n"
+                f"**Average readiness:** {m.get('readiness',0)}%\n"
+                f"**Unlinked game IDs:** {m.get('unlinked_game',0)}\n"
+                f"**Ready for assignment:** {m.get('ready_assignment',0)}\n"
+                f"**Open staff actions:** {m.get('open_actions',0)} "
+                f"({m.get('overdue_actions',0)} overdue)\n"
+                f"**Discord/personnel sync errors:** {m.get('sync_errors',0)}\n"
+                f"**Recruiting cases opened in 30D:** {m.get('recruits30',0)}\n"
+            )
+            if company_lines:
+                body += "\n**Company Health**\n" + "\n".join(company_lines)
+            dashboard=data.get('dashboard_url')
+            if dashboard:
+                body += f"\n\n**Command Dashboard:** {dashboard}"
+            await ch.send(body[:1950])
+        except Exception as exc:
+            log.warning('[WEEKLY BATTALION REPORT FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@weekly_battalion_report_watch.before_loop
+async def before_weekly_battalion_report_watch():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     try:
@@ -4077,6 +4154,8 @@ async def on_ready():
         promotion_eligibility_watch.start()
     if not personnel_suspense_watch.is_running():
         personnel_suspense_watch.start()
+    if not weekly_battalion_report_watch.is_running():
+        weekly_battalion_report_watch.start()
     if not canonical_role_sync_watch.is_running():
         canonical_role_sync_watch.start()
     if not clerk_heartbeat_watch.is_running():
@@ -4150,11 +4229,18 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
-# LIVE MATCH FORMATION / BETWEEN-ROUND RANDOMIZER (V67)
+# LIVE COMBAT ROSTER + AUTOMATIC VOICE ROUTING (V73)
 # ---------------------------------------------------------------------------
-MATCH_FORMATION_MIN_PLAYERS = 5
-MATCH_FORMATION_TANK_MIN_PLAYERS = 9
-MATCH_FORMATION_PILOT_MIN_PLAYERS = 13
+# Administrative website formations remain authoritative for personnel records.
+# This system creates a temporary combat roster from the Ready Room only.
+MATCH_FORMATION_MIN_PLAYERS = 6
+MATCH_FORMATION_TANK_THRESHOLDS = (9, 18, 27)
+MATCH_FORMATION_HELI_THRESHOLDS = (13, 25, 37)
+COMBAT_ELEMENT_KEYS = tuple(
+    [f'INFANTRY_{i}' for i in range(1,4)] +
+    [f'TANK_{i}' for i in range(1,4)] +
+    [f'HELICOPTER_{i}' for i in range(1,4)]
+)
 
 async def ensure_match_formation_schema():
     await collector.start()
@@ -4172,6 +4258,13 @@ async def ensure_match_formation_schema():
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    # Additive migration from the original V67 configuration.
+    for ddl in (
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS combat_channels_json JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_started_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_returned_match_id BIGINT",
+    ):
+        await collector.db.execute(ddl)
     await collector.db.execute("""
         CREATE TABLE IF NOT EXISTS clerk_match_formation_history(
             id BIGSERIAL PRIMARY KEY,
@@ -4193,15 +4286,22 @@ async def _latest_completed_hll_match_id():
     except Exception:
         return None
 
+async def _latest_active_hll_match_id():
+    try:
+        row=await collector.db.fetchrow("""SELECT id FROM hll_match_sessions
+            WHERE ended_at IS NULL AND last_seen_at >= NOW() - INTERVAL '3 minutes'
+            ORDER BY id DESC LIMIT 1""")
+        return int(row['id']) if row else None
+    except Exception:
+        return None
+
 async def _active_or_latest_match_label(match_id: int | None):
     if not match_id:
         return None
     try:
         row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,ended_at
             FROM hll_match_sessions WHERE id=$1""", int(match_id))
-        if not row:
-            return None
-        return dict(row)
+        return dict(row) if row else None
     except Exception:
         return None
 
@@ -4210,189 +4310,341 @@ def _formation_members(channel):
         return []
     return [m for m in channel.members if not m.bot]
 
-def _split_evenly(players, max_size=6):
-    if not players:
-        return []
-    squad_count = max(1, (len(players) + max_size - 1) // max_size)
-    base, extra = divmod(len(players), squad_count)
-    out=[]; idx=0
-    for i in range(squad_count):
-        size = base + (1 if i < extra else 0)
-        out.append(players[idx:idx+size]); idx += size
-    return out
+def _combat_bindings(cfg):
+    raw=cfg.get('combat_channels_json') if isinstance(cfg,dict) else cfg['combat_channels_json']
+    if isinstance(raw,str):
+        try: raw=json.loads(raw)
+        except Exception: raw={}
+    return {str(k).upper():int(v) for k,v in dict(raw or {}).items() if str(v).isdigit() or isinstance(v,int)}
 
 def _build_random_match_formation(members, side_mode='US'):
-    pool=list(members)
-    random.SystemRandom().shuffle(pool)
-    roster={'armor':None,'pilot':None,'infantry':[],'side_mode':side_mode,'player_count':len(pool)}
+    """Build up to 3 infantry, 3 armor and 3 helicopter elements.
 
-    # Preserve infantry viability: armor does not open until a full six-player
-    # rifle squad can remain. Pilot opens only at 13+, after armor + a full rifle squad.
-    if len(pool) >= MATCH_FORMATION_TANK_MIN_PLAYERS:
-        armor=[pool.pop() for _ in range(3)]
-        commander=random.SystemRandom().choice(armor)
-        roster['armor']={'commander':commander,'crew':[m for m in armor if m.id != commander.id]}
+    Specialty thresholds intentionally scale so a small muster is not stripped of
+    infantry. Helicopters are a hard U.S.-side-only rule. Any attendance beyond
+    the configured 9 voice-net capacity remains in the Ready Room as standby
+    rather than silently overfilling an HLL squad.
+    """
+    side=str(side_mode or 'US').upper()
+    original=list(members)
+    pool=list(original)
+    rng=random.SystemRandom(); rng.shuffle(pool)
+    roster={'armor':[],'helicopter':[],'infantry':[],'standby':[],
+            'side_mode':side,'player_count':len(original)}
 
-    if str(side_mode).upper() == 'US' and len(members) >= MATCH_FORMATION_PILOT_MIN_PLAYERS and pool:
-        roster['pilot']=pool.pop()
+    tank_count=sum(1 for t in MATCH_FORMATION_TANK_THRESHOLDS if len(original)>=t)
+    heli_count=sum(1 for t in MATCH_FORMATION_HELI_THRESHOLDS if len(original)>=t) if side=='US' else 0
 
-    random.SystemRandom().shuffle(pool)
-    for idx, squad in enumerate(_split_evenly(pool,6), start=1):
-        if not squad:
-            continue
-        sl=random.SystemRandom().choice(squad)
-        roster['infantry'].append({'number':idx,'leader':sl,'members':[m for m in squad if m.id != sl.id]})
+    # Reserve specialty seats first, then fill infantry. Keep no more than the
+    # three fixed channels for each element type.
+    for idx in range(1,tank_count+1):
+        if len(pool) < 3: break
+        crew=[pool.pop() for _ in range(3)]
+        commander=rng.choice(crew)
+        roster['armor'].append({'number':idx,'commander':commander,'crew':[m for m in crew if m.id!=commander.id]})
+    for idx in range(1,heli_count+1):
+        if not pool: break
+        roster['helicopter'].append({'number':idx,'pilot':pool.pop()})
+
+    rng.shuffle(pool)
+    # Fixed HLL infantry capacity: 3 squads x 6.
+    for idx in range(1,4):
+        if not pool: break
+        squad=pool[:6]; del pool[:len(squad)]
+        sl=rng.choice(squad)
+        roster['infantry'].append({'number':idx,'leader':sl,'members':[m for m in squad if m.id!=sl.id]})
+    roster['standby']=pool
     return roster
 
 def _formation_to_json(roster):
     def mem(m): return {'discord_user_id':str(m.id),'display_name':m.display_name}
-    out={'side_mode':roster['side_mode'],'player_count':roster['player_count'],'armor':None,'pilot':None,'infantry':[]}
-    if roster.get('armor'):
-        out['armor']={'commander':mem(roster['armor']['commander']),'crew':[mem(x) for x in roster['armor']['crew']]}
-    if roster.get('pilot'): out['pilot']=mem(roster['pilot'])
-    for s in roster['infantry']:
-        out['infantry'].append({'number':s['number'],'leader':mem(s['leader']),'members':[mem(x) for x in s['members']]})
+    out={'side_mode':roster['side_mode'],'player_count':roster['player_count'],'armor':[],
+         'helicopter':[],'infantry':[],'standby':[mem(x) for x in roster.get('standby',[])]}
+    for a in roster.get('armor',[]):
+        out['armor'].append({'number':a['number'],'commander':mem(a['commander']),'crew':[mem(x) for x in a['crew']]})
+    for h in roster.get('helicopter',[]):
+        out['helicopter'].append({'number':h['number'],'pilot':mem(h['pilot'])})
+    for q in roster.get('infantry',[]):
+        out['infantry'].append({'number':q['number'],'leader':mem(q['leader']),'members':[mem(x) for x in q['members']]})
     return out
 
-def _formation_embed(roster, voice_channel, match_row=None, automatic=True):
-    title='1/5 CAV — NEXT MATCH FORMATION'
-    desc=(f"**{roster['player_count']} personnel mustered** in {voice_channel.mention}.\n"
-          f"Fresh random formation for the next round. Permanent website assignments do **not** affect this roster.")
+def _formation_embed(roster, ready_room, match_row=None, automatic=True):
+    title='1/5 CAV — COMBAT ROSTER'
+    desc=(f"**{roster['player_count']} personnel mustered** in {ready_room.mention}.\n"
+          "Temporary combat formation only — permanent website assignments do **not** change.")
     e=discord.Embed(title=title,description=desc,timestamp=utc_now())
     if match_row:
         label=match_row.get('map_name') or match_row.get('map_id') or f"Match {match_row.get('id')}"
-        mode=match_row.get('game_mode') or 'Unknown mode'
-        e.add_field(name='ROUND COMPLETE',value=f"{label} • {mode}",inline=False)
-    if roster.get('armor'):
-        a=roster['armor']
-        value=f"**TC — {a['commander'].mention}**\n"+'\n'.join(f"Crew — {m.mention}" for m in a['crew'])
-        e.add_field(name='SABER — ARMOR (3)',value=value,inline=False)
-    if roster.get('pilot'):
-        e.add_field(name='AIR CAV — PILOT (U.S.)',value=f"Pilot — {roster['pilot'].mention}",inline=False)
-    for sq in roster['infantry']:
+        e.add_field(name='LIVE ROUND',value=f"{label} • {match_row.get('game_mode') or 'Unknown mode'}",inline=False)
+    for sq in roster.get('infantry',[]):
         lines=[f"**SL — {sq['leader'].mention}**"]+[m.mention for m in sq['members']]
-        e.add_field(name=f"RIFLE SQUAD {sq['number']} — {1+len(sq['members'])}",value='\n'.join(lines),inline=False)
-    e.set_footer(text=('Automatic between-round shuffle' if automatic else 'Manual live shuffle')+' • New roster every round')
+        e.add_field(name=f"INFANTRY {sq['number']} — {1+len(sq['members'])}/6",value='\n'.join(lines),inline=False)
+    for a in roster.get('armor',[]):
+        value=f"**TC — {a['commander'].mention}**\n"+'\n'.join(f"Crew — {m.mention}" for m in a['crew'])
+        e.add_field(name=f"TANK {a['number']} — 3/3",value=value,inline=False)
+    if roster['side_mode']=='US':
+        for h in roster.get('helicopter',[]):
+            e.add_field(name=f"HELICOPTER {h['number']} — U.S.",value=f"Pilot — {h['pilot'].mention}",inline=False)
+    else:
+        e.add_field(name='HELICOPTERS',value='U.S. SIDE ONLY — no helicopter elements this match.',inline=False)
+    if roster.get('standby'):
+        e.add_field(name='READY ROOM / STANDBY',value=' '.join(m.mention for m in roster['standby']),inline=False)
+    e.set_footer(text=('Automatic match-start routing' if automatic else 'Manual combat-roster routing')+' • Fresh roster every round')
     return e
 
-async def _publish_match_formation(guild, cfg, match_id=None, automatic=True):
-    voice=guild.get_channel(int(cfg['voice_channel_id'] or 0))
-    text=guild.get_channel(int(cfg['text_channel_id'] or 0))
-    if not isinstance(voice,(discord.VoiceChannel,discord.StageChannel)):
-        return {'ok':False,'error':'Configured voice channel is missing or invalid.'}
+async def _move_member(member, destination, reason):
+    try:
+        await member.move_to(destination,reason=reason)
+        return None
+    except Exception as exc:
+        return f'{member.display_name}: {type(exc).__name__}'
+
+async def _route_combat_roster(guild, cfg, roster):
+    bindings=_combat_bindings(cfg)
+    failures=[]; moved=0; missing=[]
+    assignments=[]
+    for sq in roster.get('infantry',[]):
+        assignments.append((f"INFANTRY_{sq['number']}",[sq['leader'],*sq['members']]))
+    for a in roster.get('armor',[]):
+        assignments.append((f"TANK_{a['number']}",[a['commander'],*a['crew']]))
+    for h in roster.get('helicopter',[]):
+        assignments.append((f"HELICOPTER_{h['number']}",[h['pilot']]))
+    for key,members in assignments:
+        cid=bindings.get(key)
+        channel=guild.get_channel(int(cid or 0)) if cid else None
+        if not isinstance(channel,discord.VoiceChannel):
+            missing.append(key.replace('_',' ').title())
+            continue
+        for member in members:
+            err=await _move_member(member,channel,'Battalion Clerk — randomized combat roster')
+            if err: failures.append(err)
+            else: moved+=1
+    return {'moved':moved,'failures':failures,'missing':missing}
+
+async def _return_combat_members(guild,cfg):
+    ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0))
+    if not isinstance(ready,discord.VoiceChannel):
+        return {'moved':0,'failures':['Ready Room is missing.']}
+    bindings=_combat_bindings(cfg)
+    members=[]; seen=set()
+    for cid in bindings.values():
+        ch=guild.get_channel(int(cid))
+        if not isinstance(ch,(discord.VoiceChannel,discord.StageChannel)): continue
+        for member in _formation_members(ch):
+            if member.id not in seen:
+                seen.add(member.id); members.append(member)
+    failures=[]; moved=0
+    for member in members:
+        err=await _move_member(member,ready,'Battalion Clerk — match complete, return to Ready Room')
+        if err: failures.append(err)
+        else: moved+=1
+    return {'moved':moved,'failures':failures}
+
+async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
+    ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0))
+    text=guild.get_channel(int(cfg.get('text_channel_id') or 0))
+    if not isinstance(ready,(discord.VoiceChannel,discord.StageChannel)):
+        return {'ok':False,'error':'Configured Ready Room is missing or invalid.'}
     if not isinstance(text,discord.TextChannel):
-        return {'ok':False,'error':'Configured text channel is missing or invalid.'}
-    members=_formation_members(voice)
+        return {'ok':False,'error':'Configured Combat Roster text channel is missing or invalid.'}
+    members=_formation_members(ready)
     if len(members) < MATCH_FORMATION_MIN_PLAYERS:
-        return {'ok':False,'error':f'Only {len(members)} player(s) are in {voice.name}; 5 are required.','player_count':len(members)}
+        return {'ok':False,'error':f'Only {len(members)} player(s) are in {ready.name}; 6 are required.','player_count':len(members)}
     roster=_build_random_match_formation(members,str(cfg.get('side_mode') or 'US').upper())
     match_row=await _active_or_latest_match_label(match_id)
-    msg=await text.send(embed=_formation_embed(roster,voice,match_row,automatic=automatic))
+    msg=await text.send(embed=_formation_embed(roster,ready,match_row,automatic=automatic))
+    routing=await _route_combat_roster(guild,cfg,roster)
+    if routing['missing'] or routing['failures']:
+        note=[]
+        if routing['missing']: note.append('Unbound voice nets: '+', '.join(routing['missing']))
+        if routing['failures']: note.append('Move failures: '+', '.join(routing['failures'][:8]))
+        await text.send('**COMBAT VOICE ROUTING NOTICE**\n'+'\n'.join(note))
     packed=_formation_to_json(roster)
     await collector.db.execute("""INSERT INTO clerk_match_formation_history
         (guild_id,match_id,voice_channel_id,text_channel_id,side_mode,player_count,roster_json)
         VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)""",
-        guild.id,match_id,voice.id,text.id,str(cfg.get('side_mode') or 'US').upper(),len(members),json.dumps(packed))
+        guild.id,match_id,ready.id,text.id,str(cfg.get('side_mode') or 'US').upper(),len(members),json.dumps(packed))
     await collector.db.execute("""UPDATE clerk_match_formation_config SET last_posted_at=NOW(),last_message_id=$2,updated_at=NOW()
         WHERE guild_id=$1""",guild.id,msg.id)
-    return {'ok':True,'message':msg,'player_count':len(members),'roster':roster}
+    return {'ok':True,'message':msg,'player_count':len(members),'roster':roster,'routing':routing}
 
 @tasks.loop(seconds=15)
 async def match_formation_watch():
-    if not bot.is_ready():
-        return
+    """Return combat nets at round end; create/move a fresh roster at new round start."""
+    if not bot.is_ready(): return
     try:
         await ensure_match_formation_schema()
         rows=await collector.db.fetch("SELECT * FROM clerk_match_formation_config WHERE enabled=TRUE AND voice_channel_id IS NOT NULL AND text_channel_id IS NOT NULL")
-        for row in rows:
-            guild_id=int(row['guild_id'])
-            if guild_id in match_formation_busy:
-                continue
-            guild=bot.get_guild(guild_id)
-            if not guild:
-                continue
-            latest=await _latest_completed_hll_match_id()
-            if latest is None:
-                continue
-            last=int(row['last_processed_match_id'] or 0)
-            if latest <= last:
-                continue
-            match_formation_busy.add(guild_id)
+        latest_done=await _latest_completed_hll_match_id()
+        latest_active=await _latest_active_hll_match_id()
+        for row_obj in rows:
+            row=dict(row_obj); gid=int(row['guild_id'])
+            if gid in match_formation_busy: continue
+            guild=bot.get_guild(gid)
+            if not guild: continue
+            match_formation_busy.add(gid)
             try:
-                # Mark the completed round processed first. A failed/low-pop round
-                # will not be replayed later as a stale between-round roster.
-                await collector.db.execute("UPDATE clerk_match_formation_config SET last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1",guild_id,latest)
-                voice=guild.get_channel(int(row['voice_channel_id'] or 0))
-                count=len(_formation_members(voice)) if voice else 0
-                if count < MATCH_FORMATION_MIN_PLAYERS:
-                    log.info('[MATCH FORMATION SKIP] guild=%s match=%s players=%s (<5)',guild_id,latest,count)
-                    continue
-                result=await _publish_match_formation(guild,dict(row),match_id=latest,automatic=True)
-                if not result.get('ok'):
-                    log.warning('[MATCH FORMATION POST FAILED] guild=%s match=%s error=%s',guild_id,latest,result.get('error'))
-                else:
-                    log.info('[MATCH FORMATION POSTED] guild=%s match=%s players=%s',guild_id,latest,result.get('player_count'))
+                returned=int(row.get('last_returned_match_id') or 0)
+                if latest_done and latest_done>returned:
+                    result=await _return_combat_members(guild,row)
+                    await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
+                    log.info('[COMBAT RETURN] guild=%s match=%s moved=%s failures=%s',gid,latest_done,result['moved'],len(result['failures']))
+                    # Refresh the config after the return marker update.
+                    row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
+                started=int(row.get('last_started_match_id') or 0)
+                if latest_active and latest_active>started:
+                    # Mark first to prevent duplicate randomizations if Discord moves are slow.
+                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,
+                        last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
+                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0))
+                    count=len(_formation_members(ready)) if ready else 0
+                    if count < MATCH_FORMATION_MIN_PLAYERS:
+                        log.info('[COMBAT ROSTER SKIP] guild=%s match=%s players=%s (<6)',gid,latest_active,count)
+                    else:
+                        result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
+                        if result.get('ok'):
+                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s players=%s moved=%s',gid,latest_active,result['player_count'],result['routing']['moved'])
+                        else:
+                            log.warning('[COMBAT ROSTER FAILED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
             except Exception:
-                log.exception('[MATCH FORMATION WATCH FAILED] guild=%s match=%s',guild_id,latest)
+                log.exception('[COMBAT ROSTER WATCH FAILED] guild=%s',gid)
             finally:
-                match_formation_busy.discard(guild_id)
+                match_formation_busy.discard(gid)
     except Exception:
-        log.exception('[MATCH FORMATION WATCH ERROR]')
+        log.exception('[COMBAT ROSTER WATCH ERROR]')
 
-@bot.tree.command(name='match-formation-setup', description='Choose the voice muster and text roster channels for automatic between-round shuffles.')
-@app_commands.describe(voice_channel='Voice channel Battalion Clerk watches',text_channel='Text channel where the next-match roster is posted',side='Use US to include a pilot when attendance supports it')
-@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='Non-U.S. side',value='NON_US')])
-async def match_formation_setup(interaction:discord.Interaction, voice_channel:discord.VoiceChannel, text_channel:discord.TextChannel, side:app_commands.Choice[str]):
+@bot.tree.command(name='combat-setup', description='Set the Ready Room and text channel used by the automatic combat roster.')
+@app_commands.describe(ready_room='Main voice channel where players muster',roster_channel='Text channel where combat rosters are posted')
+async def combat_setup(interaction:discord.Interaction,ready_room:discord.VoiceChannel,roster_channel:discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    await ensure_match_formation_schema()
-    latest=await _latest_completed_hll_match_id()
-    await collector.db.execute("""INSERT INTO clerk_match_formation_config(guild_id,voice_channel_id,text_channel_id,side_mode,enabled,last_processed_match_id,updated_by)
-        VALUES($1,$2,$3,$4,TRUE,$5,$6)
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
+    active=await _latest_active_hll_match_id(); done=await _latest_completed_hll_match_id()
+    await collector.db.execute("""INSERT INTO clerk_match_formation_config(guild_id,voice_channel_id,text_channel_id,side_mode,enabled,last_started_match_id,last_returned_match_id,updated_by)
+        VALUES($1,$2,$3,'US',TRUE,$4,$5,$6)
         ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=EXCLUDED.voice_channel_id,text_channel_id=EXCLUDED.text_channel_id,
-          side_mode=EXCLUDED.side_mode,enabled=TRUE,last_processed_match_id=EXCLUDED.last_processed_match_id,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
-        interaction.guild_id,voice_channel.id,text_channel.id,side.value,latest,interaction.user.id)
-    await interaction.followup.send(
-        f"**MATCH FORMATION AUTOMATION ENABLED**\nMuster voice: {voice_channel.mention}\nRoster channel: {text_channel.mention}\nSide: **{side.name}**\n"
-        f"Trigger: **5+ players in voice when an HLL round ends**. Battalion Clerk will generate and post a fresh random roster after every completed game.",ephemeral=True)
+          enabled=TRUE,last_started_match_id=COALESCE(clerk_match_formation_config.last_started_match_id,EXCLUDED.last_started_match_id),
+          last_returned_match_id=COALESCE(clerk_match_formation_config.last_returned_match_id,EXCLUDED.last_returned_match_id),
+          updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
+        interaction.guild_id,ready_room.id,roster_channel.id,active,done,interaction.user.id)
+    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum muster: **6**\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
 
-@bot.tree.command(name='match-formation-status', description='Show the automatic next-match formation configuration and current live muster count.')
-async def match_formation_status(interaction:discord.Interaction):
-    await ensure_match_formation_schema()
-    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
-    if not row:
-        await interaction.response.send_message('Match Formation is not configured. Use `/match-formation-setup`.',ephemeral=True); return
-    voice=interaction.guild.get_channel(int(row['voice_channel_id'] or 0)); text=interaction.guild.get_channel(int(row['text_channel_id'] or 0))
-    count=len(_formation_members(voice)) if voice else 0
-    await interaction.response.send_message(
-        f"**MATCH FORMATION STATUS**\nEnabled: **{'YES' if row['enabled'] else 'NO'}**\nVoice: {voice.mention if voice else 'Missing'}\n"
-        f"Roster channel: {text.mention if text else 'Missing'}\nSide: **{row['side_mode']}**\nLive muster: **{count}** / 5 minimum\n"
-        f"Last processed HLL match: **{row['last_processed_match_id'] or 'None'}**",ephemeral=True)
-
-@bot.tree.command(name='match-formation-publish', description='Immediately randomize the live voice-channel muster and publish the next-match roster.')
-async def match_formation_publish(interaction:discord.Interaction):
+COMBAT_ELEMENT_CHOICES=[app_commands.Choice(name=k.replace('_',' ').title(),value=k) for k in COMBAT_ELEMENT_KEYS]
+@bot.tree.command(name='combat-channel', description='Bind one randomized combat element to its Discord voice channel.')
+@app_commands.describe(element='Combat element to bind',channel='Voice channel Battalion Clerk should move that element into')
+@app_commands.choices(element=COMBAT_ELEMENT_CHOICES)
+async def combat_channel(interaction:discord.Interaction,element:app_commands.Choice[str],channel:discord.VoiceChannel):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
     await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT combat_channels_json FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
+    bindings=_combat_bindings(dict(row)); bindings[element.value]=channel.id
+    await collector.db.execute("UPDATE clerk_match_formation_config SET combat_channels_json=$2::jsonb,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,json.dumps(bindings),interaction.user.id)
+    await interaction.response.send_message(f'**{element.name.upper()}** → {channel.mention}\nVoice routing saved.',ephemeral=True)
+
+@bot.tree.command(name='combat-toggle', description='Turn automatic combat-roster generation and voice movement on or off.')
+@app_commands.describe(state='Enable or disable automatic combat roster voice routing')
+@app_commands.choices(state=[app_commands.Choice(name='ON',value='ON'),app_commands.Choice(name='OFF',value='OFF')])
+async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choice[str]):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT guild_id FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
+    enabled = state.value == 'ON'
+    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
+    if enabled:
+        msg=('**COMBAT ROSTER AUTOMATION: ON**\n'
+             'New HLL rounds can automatically generate the randomized Combat Roster and move Ready Room members into their assigned combat voice channels.\n'
+             'Match completion can automatically return routed members to the Ready Room.')
+    else:
+        msg=('**COMBAT ROSTER AUTOMATION: OFF**\n'
+             'Battalion Clerk will not automatically generate rosters or move members when HLL rounds start/end.\n'
+             'Existing channel bindings and settings are preserved. `/combat-return` remains available if you need to bring everyone back manually.')
+    await interaction.response.send_message(msg,ephemeral=True)
+
+@bot.tree.command(name='combat-side', description='Set which faction 1/5 Cav is playing this round. Helicopters are U.S.-side only.')
+@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='NVA side',value='NVA')])
+async def combat_side(interaction:discord.Interaction,side:app_commands.Choice[str]):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await ensure_match_formation_schema()
+    await collector.db.execute("UPDATE clerk_match_formation_config SET side_mode=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,side.value,interaction.user.id)
+    extra='Helicopter 1–3 are eligible when attendance thresholds are met.' if side.value=='US' else 'Helicopter 1–3 are HARD DISABLED for NVA.'
+    await interaction.response.send_message(f'Combat side set to **{side.name}**.\n{extra}',ephemeral=True)
+
+@bot.tree.command(name='combat-status', description='Show Ready Room, roster channel, side, and all combat voice bindings.')
+async def combat_status(interaction:discord.Interaction):
+    await ensure_match_formation_schema(); row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.response.send_message('Combat roster is not configured. Use `/combat-setup`.',ephemeral=True); return
+    cfg=dict(row); ready=interaction.guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=interaction.guild.get_channel(int(cfg.get('text_channel_id') or 0)); bindings=_combat_bindings(cfg)
+    lines=[]
+    for key in COMBAT_ELEMENT_KEYS:
+        ch=interaction.guild.get_channel(int(bindings.get(key) or 0))
+        lines.append(f"• **{key.replace('_',' ').title()}** → {ch.mention if ch else 'NOT ASSIGNED'}")
+    count=len(_formation_members(ready)) if ready else 0
+    await interaction.response.send_message(
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nSide: **{cfg.get('side_mode') or 'US'}**\nLive Ready Room muster: **{count}**\n\n"+'\n'.join(lines),ephemeral=True)
+
+@bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
+async def combat_generate(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.followup.send('Run `/match-formation-setup` first.',ephemeral=True); return
-    result=await _publish_match_formation(interaction.guild,dict(row),match_id=None,automatic=False)
+        await interaction.followup.send('Run `/combat-setup` first.',ephemeral=True); return
+    result=await _publish_match_formation(interaction.guild,dict(row),match_id=await _latest_active_hll_match_id(),automatic=False)
     if not result.get('ok'):
-        await interaction.followup.send(result.get('error','Unable to publish formation.'),ephemeral=True); return
-    await interaction.followup.send(f"Fresh roster posted with **{result['player_count']}** players.",ephemeral=True)
+        await interaction.followup.send(result.get('error','Unable to build combat roster.'),ephemeral=True); return
+    await interaction.followup.send(f"Combat roster generated: **{result['player_count']}** mustered, **{result['routing']['moved']}** moved.",ephemeral=True)
 
-@bot.tree.command(name='match-formation-disable', description='Disable automatic between-round match formation posts.')
+@bot.tree.command(name='combat-return', description='Immediately return everyone in configured combat voice channels to the Ready Room.')
+async def combat_return(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.followup.send('Run `/combat-setup` first.',ephemeral=True); return
+    result=await _return_combat_members(interaction.guild,dict(row))
+    await interaction.followup.send(f"Returned **{result['moved']}** member(s) to the Ready Room."+(f" Failures: {', '.join(result['failures'][:5])}" if result['failures'] else ''),ephemeral=True)
+
+# Backward-compatible command aliases from the original randomizer.
+@bot.tree.command(name='match-formation-setup', description='Legacy alias: configure Ready Room, roster channel, and side.')
+@app_commands.describe(voice_channel='Ready Room',text_channel='Combat roster text channel',side='Current faction')
+@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='NVA side',value='NVA')])
+async def match_formation_setup(interaction:discord.Interaction,voice_channel:discord.VoiceChannel,text_channel:discord.TextChannel,side:app_commands.Choice[str]):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
+    active=await _latest_active_hll_match_id(); done=await _latest_completed_hll_match_id()
+    await collector.db.execute("""INSERT INTO clerk_match_formation_config(guild_id,voice_channel_id,text_channel_id,side_mode,enabled,last_started_match_id,last_returned_match_id,updated_by)
+        VALUES($1,$2,$3,$4,TRUE,$5,$6,$7)
+        ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=EXCLUDED.voice_channel_id,text_channel_id=EXCLUDED.text_channel_id,
+          side_mode=EXCLUDED.side_mode,enabled=TRUE,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
+        interaction.guild_id,voice_channel.id,text_channel.id,side.value,active,done,interaction.user.id)
+    await interaction.followup.send('Combat roster base configuration saved. Use `/combat-channel` for Infantry 1–3, Tank 1–3, and Helicopter 1–3.',ephemeral=True)
+
+@bot.tree.command(name='match-formation-status', description='Legacy alias for /combat-status.')
+async def match_formation_status(interaction:discord.Interaction):
+    await combat_status.callback(interaction)
+
+@bot.tree.command(name='match-formation-publish', description='Legacy alias for /combat-generate.')
+async def match_formation_publish(interaction:discord.Interaction):
+    await combat_generate.callback(interaction)
+
+@bot.tree.command(name='match-formation-disable', description='Legacy alias: turn combat-roster automation off.')
 async def match_formation_disable(interaction:discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
     await ensure_match_formation_schema()
     await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=FALSE,updated_by=$2,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,interaction.user.id)
-    await interaction.response.send_message('**MATCH FORMATION AUTOMATION DISABLED**',ephemeral=True)
-
-
+    await interaction.response.send_message('**COMBAT ROSTER AUTOMATION: OFF**\nUse `/combat-toggle state:ON` to turn it back on. Existing channel bindings were preserved.',ephemeral=True)
 
 @bot.tree.command(name='activity-channel-add', description='Allow a voice channel to count toward Soldier activity.')
 @app_commands.describe(channel='Voice channel to count as activity')
@@ -4504,9 +4756,11 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
     community_ack=discord.ui.TextInput(label='Respectful teamwork expected — agree?',max_length=8,placeholder='YES')
     applicant_notes=discord.ui.TextInput(label='Anything else HQ should know?',required=False,style=discord.TextStyle.paragraph,max_length=1000,placeholder='Optional')
 
-    def __init__(self, recruited_by: str='NONE'):
+    def __init__(self, recruited_by: str='NONE', recruiter_personnel_id: str | None=None, recruiter_discord_user_id: int | None=None):
         super().__init__()
         self.recruited_by=recruited_by
+        self.recruiter_personnel_id=recruiter_personnel_id
+        self.recruiter_discord_user_id=recruiter_discord_user_id
 
     async def on_submit(self, interaction:discord.Interaction):
         ack=str(self.community_ack.value).strip().upper()
@@ -4516,6 +4770,11 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
         try:
             await _recruit_save(interaction.user,4,{
                 'recruited_by':self.recruited_by,
+                # V72: preserve the authoritative Soldier UUID returned by the Website
+                # validator. A Discord mention is display metadata only and must never
+                # be the sole source used for ribbon/campaign recruiting credit.
+                'recruited_by_personnel_id':self.recruiter_personnel_id,
+                'recruited_by_discord_user_id':self.recruiter_discord_user_id,
                 'heard_about':str(self.heard_about.value).strip(),
                 'community_ack':'YES',
                 'applicant_notes':str(self.applicant_notes.value).strip()
@@ -4533,6 +4792,8 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
                 text=(f"**1/5 CAV — APPLICATION FILED**\nRecruiting Case **{case.get('case_number')}** has been forwarded to Battalion Headquarters.\n"
                       f"Status: **AWAITING COMMAND REVIEW**\n\nYou do **not** need to submit another application on the website.")
                 if result.get('status_url'): text+=f"\nCase status: {result['status_url']}"
+            if self.recruiter_personnel_id:
+                text += f"\nRecruiter attribution: **FILED FOR {self.recruited_by}** — credit becomes verified when you reach Enlisted status."
             await interaction.followup.send(text,ephemeral=_recruit_ephemeral(interaction))
             try:
                 guild=bot.get_guild(gid); member=guild.get_member(interaction.user.id) if guild else None
@@ -4554,7 +4815,14 @@ class RecruiterMemberSelect(discord.ui.UserSelect):
             result=await web.request('POST','/internal/clerk/recruiting/recruiter/validate',json={'guild_id':gid,'discord_user_id':selected.id})
             if not result.get('ok'):
                 raise RuntimeError(result.get('error') or 'Selected user is not an active 1/5 Cav member')
-            await interaction.response.send_modal(RecruitFinalDetailsModal(recruited_by=f'<@{selected.id}>'))
+            recruiter_pid=str(result.get('personnel_id') or '').strip() or None
+            if not recruiter_pid:
+                raise RuntimeError('The selected member could not be tied to an official Soldier Record.')
+            await interaction.response.send_modal(RecruitFinalDetailsModal(
+                recruited_by=f'<@{selected.id}>',
+                recruiter_personnel_id=recruiter_pid,
+                recruiter_discord_user_id=selected.id,
+            ))
         except Exception as exc:
             await interaction.response.send_message(f'**RECRUITER NOT ACCEPTED**\n{str(exc)[:300]}\nSelect an active 1/5 Cav member.',ephemeral=True)
 
@@ -6699,17 +6967,22 @@ async def hll_link_soldier(interaction:discord.Interaction, member:discord.Membe
 
 @tasks.loop(minutes=1)
 async def seeding_message_watch():
-    """Post the controlled nightly seeding call at 19:00, 19:30, 20:00 and 20:30 Eastern.
+    """Post scheduled seeding calls during active Eastern-time credit windows.
 
-    A slot is only sent once, only when RCON has a current population sample, and only
-    while the server population is below the live/stop threshold. Starting the bot a few
-    minutes after a slot safely catches up that slot without duplicating earlier notices.
+    Every day: 19:00–21:00 Eastern. Saturday/Sunday additionally: 14:00–17:00
+    Eastern. Calls remain on the established 30-minute cadence and are suppressed
+    at the populated threshold.
     """
     now_et=datetime.now(SEEDING_TIMEZONE)
-    if now_et.hour < 19 or now_et.hour >= 21:
+    weekend=now_et.weekday() >= 5
+    if weekend and 14 <= now_et.hour < 17:
+        active_slots=SEEDING_WEEKEND_SLOTS
+    elif 19 <= now_et.hour < 21:
+        active_slots=SEEDING_EVENING_SLOTS
+    else:
         return
     elapsed=now_et.hour*60+now_et.minute
-    eligible=[(h,m) for h,m in SEEDING_SLOTS if h*60+m <= elapsed]
+    eligible=[(h,m) for h,m in active_slots if h*60+m <= elapsed]
     if not eligible: return
     # Only consider the most recent elapsed slot; older missed slots are not spammed on restart.
     hour,minute=eligible[-1]
@@ -6721,13 +6994,11 @@ async def seeding_message_watch():
         if await seeding_notice_already_sent(guild.id,now_et.date(),slot): continue
         try:
             st=await hllv.status()
-            # Never announce based on stale/unavailable telemetry.
             if not st.get('configured') or not st.get('connected'):
                 log.warning('[SEEDING] skipped slot=%s guild=%s because HLL RCON is not current',slot,guild.id)
                 continue
             population=int(st.get('player_count') or 0)
             if population >= SEEDING_STOP_POPULATION:
-                # Mark the slot settled so a later population drop does not restart alerts that night.
                 await record_seeding_notice(guild.id,now_et.date(),slot,channel_id,population)
                 log.info('[SEEDING] no message slot=%s guild=%s population=%s threshold=%s',slot,guild.id,population,SEEDING_STOP_POPULATION)
                 continue
@@ -6738,9 +7009,6 @@ async def seeding_message_watch():
             if not isinstance(channel,discord.TextChannel):
                 log.warning('[SEEDING] configured channel unavailable guild=%s channel=%s',guild.id,channel_id)
                 continue
-            # Seeding calls are only sent while the server is below the configured
-            # populated/ready threshold. Tag both established battalion personnel and
-            # Prospective Replacements without pinging @everyone or individual users.
             mention_roles=[]
             missing_roles=[]
             for role_name in SEEDING_MENTION_ROLE_NAMES:
@@ -6759,22 +7027,22 @@ async def seeding_message_watch():
             await record_seeding_notice(guild.id,now_et.date(),slot,channel.id,population)
             log.info('[SEEDING] sent slot=%s guild=%s channel=%s population=%s',slot,guild.id,channel.id,population)
         except Exception:
-            log.exception('[SEEDING] nightly message failed guild=%s slot=%s',guild.id,slot)
+            log.exception('[SEEDING] scheduled message failed guild=%s slot=%s',guild.id,slot)
 
 @seeding_message_watch.before_loop
 async def before_seeding_message_watch():
     await bot.wait_until_ready()
 
-@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic nightly HLL server seeding calls.')
-@app_commands.describe(channel='Text channel for the nightly 1/5 Cav server seeding call')
+@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
+@app_commands.describe(channel='Text channel for the 1/5 Cav server seeding calls')
 async def set_seeding_channel_command(interaction:discord.Interaction,channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
     await set_seeding_channel(interaction.guild_id,channel.id)
     await interaction.response.send_message(
-        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **7:00, 7:30, 8:00, and 8:30 PM Eastern**. '
+        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**; **Saturday/Sunday also 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
-@bot.tree.command(name='seeding-status', description='Show the nightly seeding channel, schedule, and current HLL population.')
+@bot.tree.command(name='seeding-status', description='Show the seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     channel_id=await get_seeding_channel_id(interaction.guild_id)
@@ -6782,17 +7050,18 @@ async def seeding_status(interaction:discord.Interaction):
     await interaction.response.send_message(
         '**1/5 CAV SEEDING AUTOMATION**\n'
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
-        '**Schedule:** 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
+        '**Daily:** 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
+        '**Weekend extra:** 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern\n'
         f'**Populated threshold:** {SEEDING_STOP_POPULATION}+ players — seeding calls suppressed\n'
         f'**Mention roles:** {" / ".join(SEEDING_MENTION_ROLE_NAMES)}\n'
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
-@bot.tree.command(name='clear-seeding-channel', description='Disable automatic nightly seeding messages by clearing the configured channel.')
+@bot.tree.command(name='clear-seeding-channel', description='Disable automatic seeding messages by clearing the configured channel.')
 async def clear_seeding_channel_command(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await clear_seeding_channel(interaction.guild_id)
-    await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic nightly seeding messages are disabled until a channel is assigned.',ephemeral=True)
+    await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic seeding messages are disabled until a channel is assigned.',ephemeral=True)
 
 @bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
 @app_commands.describe(message='Message to display in game (180 characters maximum)')

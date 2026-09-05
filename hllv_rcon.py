@@ -768,14 +768,17 @@ class HLLVTelemetryCollector:
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
 
     def _is_seeding_credit_window(self, player_count: int) -> bool:
-        """Credit 19:00–21:00 Eastern only while live server population is below 50."""
+        """Credit scheduled Eastern windows while population remains below 50."""
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         minutes=now_et.hour*60+now_et.minute
-        return 19*60 <= minutes < 21*60 and int(player_count or 0) < SEEDING_STOP_PLAYERS
+        daily_window=19*60 <= minutes < 21*60
+        weekend_window=now_et.weekday() >= 5 and 14*60 <= minutes < 17*60
+        return (daily_window or weekend_window) and int(player_count or 0) < SEEDING_STOP_PLAYERS
 
     async def _file_seeding_credit(self, credits: list[tuple[str,int]]):
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         service_date=now_et.date()
+        daily_cap=18000 if now_et.weekday() >= 5 else 7200
         combined={}
         for pid,seconds in credits:
             if pid and seconds>0:
@@ -785,9 +788,9 @@ class HLLVTelemetryCollector:
                 INSERT INTO hll_seeding_service(personnel_id,service_date,credited_seconds,first_seen_at,last_seen_at)
                 VALUES($1::uuid,$2,$3,NOW(),NOW())
                 ON CONFLICT(personnel_id,service_date) DO UPDATE SET
-                  credited_seconds=LEAST(7200,hll_seeding_service.credited_seconds+EXCLUDED.credited_seconds),
+                  credited_seconds=LEAST($4,hll_seeding_service.credited_seconds+EXCLUDED.credited_seconds),
                   last_seen_at=NOW()
-            """,pid,service_date,seconds)
+            """,pid,service_date,seconds,daily_cap)
 
     def _round_elapsed_seconds(self, server: dict) -> int:
         """Best-effort elapsed round time for the 30-minute broadcast clock."""
