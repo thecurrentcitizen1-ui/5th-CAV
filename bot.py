@@ -4237,6 +4237,7 @@ MATCH_FORMATION_MIN_PLAYERS = 6
 MATCH_FORMATION_TANK_THRESHOLDS = (9, 18, 27)
 MATCH_FORMATION_HELI_THRESHOLDS = (13, 25, 37)
 COMBAT_ROSTER_MOVE_DELAY_SECONDS = 60
+COMBAT_AUTO_MOVE_MIN_PLAYERS = 7  # 6 or fewer stay together in the Ready Room
 COMBAT_ELEMENT_KEYS = tuple(
     [f'INFANTRY_{i}' for i in range(1,4)] +
     [f'TANK_{i}' for i in range(1,4)] +
@@ -4576,21 +4577,28 @@ async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
 
     roster=_build_random_match_formation(members,side)
     msg=await text.send(embed=_formation_embed(roster,ready,match_row,automatic=automatic))
-    await text.send(f'**COMBAT ROSTER FILED** — automatic voice routing in **{COMBAT_ROSTER_MOVE_DELAY_SECONDS} seconds**.')
 
-    # V77 staging delay: publish the randomized roster first, then give the unit
-    # a full minute to read assignments before Discord moves begin. Side/faction
-    # selection is still taken from verified live HLL telemetry above.
-    await asyncio.sleep(COMBAT_ROSTER_MOVE_DELAY_SECONDS)
-
-    # Automatic runs are match-boundary guarded. If the live HLL match changed
-    # during the 60-second staging window, do not move anybody against a stale
-    # roster. The watcher will handle the next genuine match boundary.
-    if automatic and match_id and await _latest_active_hll_match_id() != match_id:
-        await text.send('**COMBAT VOICE ROUTING CANCELLED** — the live HLL match changed during the 60-second staging window. No one was moved.')
-        routing={'moved':0,'failures':[],'missing':[],'cancelled':True}
+    # V78 small-muster guard: six players can remain together in the Ready Room.
+    # Automatic voice splitting only begins at seven or more eligible players.
+    # Manual /combat-generate remains an explicit staff override.
+    if automatic and len(members) < COMBAT_AUTO_MOVE_MIN_PLAYERS:
+        await text.send('**COMBAT ROSTER FILED — READY ROOM HOLD** — **6 or fewer** eligible personnel are mustered. Automatic voice-channel movement begins only at **7+**. No one was moved.')
+        routing={'moved':0,'failures':[],'missing':[],'small_muster_hold':True}
     else:
-        routing=await _route_combat_roster(guild,cfg,roster)
+        await text.send(f'**COMBAT ROSTER FILED** — automatic voice routing in **{COMBAT_ROSTER_MOVE_DELAY_SECONDS} seconds**.')
+
+        # Publish the randomized roster first, then give the unit a full minute
+        # to read assignments before Discord moves begin. Side/faction selection
+        # is still taken from verified live HLL telemetry above.
+        await asyncio.sleep(COMBAT_ROSTER_MOVE_DELAY_SECONDS)
+
+        # Automatic runs are match-boundary guarded. If the live HLL match changed
+        # during the staging window, do not move anybody against a stale roster.
+        if automatic and match_id and await _latest_active_hll_match_id() != match_id:
+            await text.send('**COMBAT VOICE ROUTING CANCELLED** — the live HLL match changed during the 60-second staging window. No one was moved.')
+            routing={'moved':0,'failures':[],'missing':[],'cancelled':True}
+        else:
+            routing=await _route_combat_roster(guild,cfg,roster)
     notices=[]
     if skipped: notices.append('Opposite-side players left in Ready Room: '+', '.join(m.mention for m in skipped))
     if not_linked: notices.append('Ready Room — game identity not linked: '+', '.join(m.mention for m in not_linked))
@@ -4688,7 +4696,7 @@ async def combat_setup(interaction:discord.Interaction,ready_room:discord.VoiceC
           updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
         interaction.guild_id,ready_room.id,roster_channel.id,active,done,interaction.user.id)
     await collector.db.execute("UPDATE clerk_match_formation_config SET auto_side=TRUE,activation_baseline_match_id=NULL,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id)
-    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum muster: **6**\nParticipation gate: **READY ROOM + LIVE HLL SERVER**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
+    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum roster muster: **6**\nAutomatic voice movement: **7+ eligible players**\nParticipation gate: **READY ROOM + LIVE HLL SERVER**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
 
 COMBAT_ELEMENT_CHOICES=[app_commands.Choice(name=k.replace('_',' ').title(),value=k) for k in COMBAT_ELEMENT_KEYS]
 @bot.tree.command(name='combat-channel', description='Bind one randomized combat element to its Discord voice channel.')
@@ -4755,7 +4763,7 @@ async def combat_status(interaction:discord.Interaction):
     count=len(_formation_members(ready)) if ready else 0
     queued=len(_late_join_queue(cfg))
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
 
 @bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
 async def combat_generate(interaction:discord.Interaction):
