@@ -4062,6 +4062,96 @@ async def before_weekly_battalion_report_watch():
     await bot.wait_until_ready()
 
 
+
+
+# ---------------------------------------------------------------------------
+# V83 — growth accountability + system-health failure alerts
+# ---------------------------------------------------------------------------
+@bot.tree.command(name='system-health-channel', description='Assign the Command channel for Battalion Clerk/system failure alerts.')
+async def system_health_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'SYSTEM_HEALTH',channel.id)
+    await interaction.response.send_message(f'Battalion system failure/recovery alerts will be posted to {channel.mention}.',ephemeral=True)
+
+
+@tasks.loop(minutes=60)
+async def growth_accountability_watch():
+    """Ask the Website to create/escalate authoritative staff work from inactivity/onboarding/link exceptions."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('POST','/internal/clerk/automation/growth-accountability',json={'guild_id':guild.id})
+            created=len(data.get('created') or []); escalated=len(data.get('escalated') or [])
+            if not (created or escalated): continue
+            ch=await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+            if ch:
+                await ch.send(f'**BATTALION ACCOUNTABILITY WORK QUEUE UPDATED**\nNew action(s): **{created}** • Escalated overdue action(s): **{escalated}**\nOpen the Website Staff Work Queue for action.')
+        except Exception as exc:
+            log.warning('[GROWTH ACCOUNTABILITY WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@growth_accountability_watch.before_loop
+async def before_growth_accountability_watch():
+    await bot.wait_until_ready()
+
+
+async def _system_health_state_get(guild_id):
+    await collector.start(); db=collector.db
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_system_health_state(
+        guild_id TEXT PRIMARY KEY,last_state TEXT,last_payload JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    return await db.fetchrow('SELECT * FROM clerk_system_health_state WHERE guild_id=$1',str(guild_id))
+
+
+async def _system_health_state_set(guild_id,state,payload):
+    await collector.start(); db=collector.db
+    await db.execute("""INSERT INTO clerk_system_health_state(guild_id,last_state,last_payload,updated_at)
+        VALUES($1,$2,$3::jsonb,NOW()) ON CONFLICT(guild_id) DO UPDATE SET last_state=EXCLUDED.last_state,last_payload=EXCLUDED.last_payload,updated_at=NOW()""",
+        str(guild_id),str(state),json.dumps(payload or {}))
+
+
+@tasks.loop(minutes=5)
+async def system_health_alert_watch():
+    """Alert Command on meaningful health transitions; do not spam every polling cycle."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/system-health',params={'guild_id':guild.id})
+            state=str(data.get('overall') or 'UNKNOWN').upper()
+            previous=await _system_health_state_get(guild.id)
+            old=str(previous.get('last_state') or '') if previous else ''
+            if state!=old:
+                ch=await get_report_channel(guild,'SYSTEM_HEALTH') or await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+                if ch:
+                    if state=='OK' and old in {'WARN','FAIL'}:
+                        await ch.send('**BATTALION SYSTEMS RECOVERED**\nBattalion Clerk, recruiting delivery, Discord sync, and official-server telemetry have returned to a healthy state.')
+                    elif state in {'WARN','FAIL'}:
+                        problems=[]
+                        for c in data.get('checks') or []:
+                            if str(c.get('status') or '').upper() in {'WARN','FAIL'}:
+                                problems.append(f"• **{c.get('name')}** — {c.get('status')}: {c.get('detail')}")
+                        body='\n'.join(problems[:8]) or 'A system health exception was detected.'
+                        await ch.send(f'**BATTALION SYSTEM HEALTH — {state}**\n{body}\n\nCommand should review the Website System Health page.')
+            await _system_health_state_set(guild.id,state,data)
+        except Exception as exc:
+            log.warning('[SYSTEM HEALTH ALERT WATCH FAILED] guild=%s error=%s',guild.id,exc)
+            try:
+                previous=await _system_health_state_get(guild.id)
+                old=str(previous.get('last_state') or '') if previous else ''
+                if old!='FAIL':
+                    ch=await get_report_channel(guild,'SYSTEM_HEALTH') or await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+                    if ch:
+                        await ch.send('**BATTALION SYSTEM HEALTH — FAIL**\nThe Website health endpoint is unreachable. Battalion Clerk cannot verify recruiting, progression, or HLL telemetry health until the Website responds again.')
+                await _system_health_state_set(guild.id,'FAIL',{'error':str(exc)[:300],'source':'WEBSITE HEALTH ENDPOINT'})
+            except Exception as alert_exc:
+                log.warning('[SYSTEM HEALTH FAILSAFE ALERT FAILED] guild=%s error=%s',guild.id,alert_exc)
+
+
+@system_health_alert_watch.before_loop
+async def before_system_health_alert_watch():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     try:
@@ -4201,6 +4291,10 @@ async def on_ready():
         member_record_reminder_watch.start()
     if not match_formation_watch.is_running():
         match_formation_watch.start()
+    if not growth_accountability_watch.is_running():
+        growth_accountability_watch.start()
+    if not system_health_alert_watch.is_running():
+        system_health_alert_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -4907,9 +5001,12 @@ def _recruit_guild_id(user: discord.abc.User) -> int:
 async def _recruit_save(user, step:int, answers:dict):
     gid=_recruit_guild_id(user)
     if not gid: raise RuntimeError('Battalion Discord guild is unavailable')
-    return await web.request('POST','/internal/clerk/recruiting/intake/save',json={
+    result=await web.request('POST','/internal/clerk/recruiting/intake/save',json={
         'guild_id':gid,'discord_user_id':user.id,'current_step':step,'answers':answers
     })
+    if not result or not result.get('ok',False):
+        raise RuntimeError((result or {}).get('error') or 'Website did not confirm the application section was saved')
+    return result
 
 
 class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
@@ -5213,6 +5310,60 @@ async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
 
 
+@bot.tree.command(name='application-system-check',description='Run a read-only health check of the Discord recruiting application pipeline.')
+async def application_system_check(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    checks=[]
+    checks.append(('WEBSITE_BASE_URL', bool(WEBSITE_BASE_URL), WEBSITE_BASE_URL or 'NOT CONFIGURED'))
+    checks.append(('CLERK_SYNC_KEY', bool(CLERK_SYNC_KEY), 'CONFIGURED' if CLERK_SYNC_KEY else 'NOT CONFIGURED'))
+    guild=interaction.guild
+    checks.append(('BATTALION GUILD', bool(guild), f'{guild.name} ({guild.id})' if guild else 'NOT AVAILABLE'))
+    me=guild.me if guild else None
+    if me:
+        perms=me.guild_permissions
+        can_post=bool(perms.view_channel and perms.send_messages)
+        checks.append(('BOT SERVER ACCESS', can_post, 'VIEW + SEND OK' if can_post else 'MISSING VIEW/SEND PERMISSION'))
+    else:
+        checks.append(('BOT SERVER ACCESS', False, 'BOT MEMBER NOT AVAILABLE IN GUILD'))
+
+    try:
+        queue=await web.request('GET','/internal/clerk/recruiting/intake-requests')
+        ok=bool(queue and queue.get('ok', False))
+        detail=(f"REACHABLE • {len(queue.get('cases',[]) or [])} MANUAL REQUEST(S)" if ok
+                else str((queue or {}).get('error') or 'FAILED'))
+        checks.append(('WEBSITE INTAKE QUEUE',ok,detail))
+    except Exception as exc:
+        checks.append(('WEBSITE INTAKE QUEUE',False,f'{type(exc).__name__}: {str(exc)[:180]}'))
+
+    try:
+        status=await web.request(
+            'GET','/internal/clerk/recruiting/intake/status',
+            params={'guild_id':interaction.guild_id,'discord_user_id':interaction.user.id}
+        )
+        ok=bool(status and status.get('ok', False))
+        checks.append(('DRAFT / STATUS API',ok,'REACHABLE' if ok else str((status or {}).get('error') or 'FAILED')))
+    except Exception as exc:
+        checks.append(('DRAFT / STATUS API',False,f'{type(exc).__name__}: {str(exc)[:180]}'))
+
+    persistent_ok=all(v is not None for v in (
+        RecruitApplicationStartView, RecruitIntakePromptView,
+        RecruitPart1View, RecruitPart2View, RecruitPart3View
+    ))
+    checks.append(('PERSISTENT APPLICATION UI',persistent_ok,
+                   'REGISTERED IN BOT BUILD' if persistent_ok else 'MISSING VIEW CLASS'))
+
+    failed=[c for c in checks if not c[1]]
+    lines=[f"{'✅' if ok else '❌'} **{name}** — {detail}" for name,ok,detail in checks]
+    if failed:
+        footer=f"\n\n**RESULT: ATTENTION REQUIRED** — {len(failed)} check(s) failed. Review Railway variables/logs before asking recruits to apply."
+    else:
+        footer="\n\n**RESULT: PASS** — the Discord application transport and Website endpoints are available."
+    await interaction.followup.send(
+        '**1/5 CAV — DISCORD APPLICATION SYSTEM CHECK**\n' + '\n'.join(lines) + footer,
+        ephemeral=True
+    )
 
 
 async def _retroactive_accession_member(member: discord.Member, *, send_message: bool=True) -> dict:
