@@ -63,7 +63,12 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
-hllv = HLLVTelemetryCollector(collector)
+hllv = HLLVTelemetryCollector(collector, server_slot=1)
+# Server #2 is telemetry-only: career stats flow into the same PostgreSQL
+# personnel tables, while VIP/manual RCON administration remains anchored to
+# Server #1. The secondary collector activates automatically when the _2
+# Railway variables are present.
+hllv2 = HLLVTelemetryCollector(collector, server_slot=2, telemetry_only=True)
 collector_started = False
 commands_synced = False
 
@@ -3966,6 +3971,17 @@ async def weekly_battalion_report_channel(interaction:discord.Interaction, chann
     )
 
 
+
+@bot.tree.command(name='nco-accountability-channel', description='Set the channel for the weekly NCO/company member-attention rollup.')
+async def nco_accountability_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'NCO_ACCOUNTABILITY',channel.id)
+    await interaction.response.send_message(
+        f'NCO / Company accountability rollups will be posted to {channel.mention} with the Sunday Battalion Report.',
+        ephemeral=True
+    )
+
+
 @tasks.loop(hours=1)
 async def weekly_battalion_report_watch():
     """Post one concise weekly leadership report each Sunday evening.
@@ -3994,6 +4010,8 @@ async def weekly_battalion_report_watch():
             data=await web.request('GET','/internal/clerk/reports/weekly-battalion')
             m=data.get('metrics') or {}
             companies=data.get('companies') or []
+            onboarding=data.get('onboarding') or {}
+            cohort=data.get('cohort30') or {}
             company_lines=[]
             for c in companies[:6]:
                 company_lines.append(
@@ -4002,19 +4020,16 @@ async def weekly_battalion_report_watch():
                     f"RDY {c.get('readiness',0)}% | WATCH {c.get('inactive14',0)}"
                 )
             body=(
-                f"**1/5 CAV — WEEKLY BATTALION REPORT**\n"
+                f"**1/5 CAV — WEEKLY BATTALION HEALTH REPORT**\n"
                 f"Week: **{report_key}**\n\n"
-                f"**Strength:** {m.get('strength',0)}\n"
-                f"**Verified HLL activity (7D):** {m.get('active7',0)}\n"
-                f"**14+ day inactivity watch:** {m.get('inactive14',0)}\n"
-                f"**30+ day Command review:** {m.get('inactive30',0)}\n"
-                f"**Average readiness:** {m.get('readiness',0)}%\n"
-                f"**Unlinked game IDs:** {m.get('unlinked_game',0)}\n"
-                f"**Ready for assignment:** {m.get('ready_assignment',0)}\n"
-                f"**Open staff actions:** {m.get('open_actions',0)} "
-                f"({m.get('overdue_actions',0)} overdue)\n"
-                f"**Discord/personnel sync errors:** {m.get('sync_errors',0)}\n"
-                f"**Recruiting cases opened in 30D:** {m.get('recruits30',0)}\n"
+                f"**Personnel:** {m.get('strength',0)} total | {m.get('reserve',0)} reserve | {m.get('replacements',0)} replacement\n"
+                f"**Verified HLL activity:** {m.get('active7',0)} active 7D | {m.get('active30',0)} active 30D ({m.get('active30_rate',0)}%)\n"
+                f"**Inactivity:** {m.get('inactive14',0)} at 14+ days | {m.get('inactive30',0)} at 30+ days\n"
+                f"**Readiness:** {m.get('readiness',0)}% average | {m.get('unlinked_game',0)} game IDs missing\n"
+                f"**Staff workload:** {m.get('open_actions',0)} open | {m.get('overdue_actions',0)} overdue | {m.get('s1_cases',0)} S-1 cases\n"
+                f"**Leadership vacancies:** {m.get('leadership_vacancies',0)} | **Promotion reviews:** {m.get('promotion_reviews',0)}\n"
+                f"**Onboarding:** {onboarding.get('packets_open',0)} open | {onboarding.get('first_session_pending',0)} first-session holds | {onboarding.get('credential_holds',0)} login holds\n"
+                f"**30D cohort:** {cohort.get('joined30',0)} joined | {cohort.get('game_linked',0)} linked | {cohort.get('played',0)} played | {cohort.get('active7',0)} active this week\n"
             )
             if company_lines:
                 body += "\n**Company Health**\n" + "\n".join(company_lines)
@@ -4022,6 +4037,22 @@ async def weekly_battalion_report_watch():
             if dashboard:
                 body += f"\n\n**Command Dashboard:** {dashboard}"
             await ch.send(body[:1950])
+
+            # Optional leader-facing rollup.  It deliberately contains only exceptions
+            # so NCOs do not have to scan the entire battalion roster every week.
+            nco_ch=await get_report_channel(guild,'NCO_ACCOUNTABILITY')
+            if nco_ch and await _notice_once(guild.id,'BATTALION','NCO_ACCOUNTABILITY',report_key):
+                attention=data.get('leader_attention') or []
+                lines=[]
+                for item in attention[:15]:
+                    issues=', '.join(item.get('issues') or []) or item.get('activity') or 'REVIEW'
+                    lines.append(f"• **{item.get('name') or 'Soldier'}** — {item.get('unit') or 'UNASSIGNED'} — {item.get('health','AMBER')} — {issues}")
+                nco_body=(f"**1/5 CAV — NCO / COMPANY ACCOUNTABILITY**\nWeek: **{report_key}**\n"
+                          f"Work the exceptions below; routine active Soldiers are intentionally omitted.\n\n")
+                nco_body += "\n".join(lines) if lines else 'No member-health exceptions are currently surfaced.'
+                health_url=data.get('member_health_url')
+                if health_url: nco_body += f"\n\n**Member Health Workbench:** {health_url}"
+                await nco_ch.send(nco_body[:1950])
         except Exception as exc:
             log.warning('[WEEKLY BATTALION REPORT FAILED] guild=%s error=%s',guild.id,exc)
 
@@ -4100,6 +4131,10 @@ async def on_ready():
         await hllv.start()
     except Exception:
         log.exception('[HLLV RCON STARTUP FAILED]')
+    try:
+        await hllv2.start()
+    except Exception:
+        log.exception('[HLLV RCON SERVER 2 STARTUP FAILED]')
     if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
         hll_vip_sync_watch.start()
 
@@ -6721,15 +6756,19 @@ async def progression_audit(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
     try:
-        result=await web.request('POST','/internal/clerk/progression/recheck',json={})
+        result=await web.request('POST','/internal/clerk/progression/recheck',json={'extended_audit':True})
         errors=int(result.get('error_count') or 0)
         await interaction.followup.send(
-            '**HLL PROGRESSION AUDIT**\n'
+            '**HLL / CAREER TRACKING AUDIT**\n'
             f"Soldiers checked: **{result.get('checked',0)}**\n"
+            f"Game identities linked: **{result.get('game_identity_linked',0)}** | Unlinked: **{result.get('game_identity_unlinked',0)}**\n"
+            f"Approved-member access ready: **{result.get('member_access_ready',0)} / {result.get('approved_personnel',0)}** | Missing: **{result.get('member_access_missing',0)}**\n"
             f"Readiness reconciled: **{result.get('readiness_rechecked',0)}**\n"
             f"MOS proficiency reconciled: **{result.get('mos_rechecked',0)}**\n"
             f"Ribbon records checked: **{result.get('ribbons_rechecked',0)}**\n"
             f"New automatic ribbons filed: **{result.get('ribbons_awarded',0)}**\n"
+            f"Jungle Trophy calculations checked: **{result.get('jungle_trophies_checked',0)}**\n"
+            f"Campaign Medal calculations checked: **{result.get('campaign_medals_checked',0)}**\n"
             f"Promotion worksheets checked: **{result.get('promotion_paths_rechecked',0)}**\n"
             f"Errors: **{errors}**",
             ephemeral=True)
