@@ -4263,6 +4263,9 @@ async def ensure_match_formation_schema():
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS combat_channels_json JSONB NOT NULL DEFAULT '{}'::jsonb",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_started_match_id BIGINT",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_returned_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS auto_side BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS activation_baseline_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_deferred_match_id BIGINT",
     ):
         await collector.db.execute(ddl)
     await collector.db.execute("""
@@ -4299,7 +4302,7 @@ async def _active_or_latest_match_label(match_id: int | None):
     if not match_id:
         return None
     try:
-        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,ended_at
+        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at
             FROM hll_match_sessions WHERE id=$1""", int(match_id))
         return dict(row) if row else None
     except Exception:
@@ -4309,6 +4312,55 @@ def _formation_members(channel):
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return []
     return [m for m in channel.members if not m.bot]
+
+def _normalize_hll_side(team_id, match_row):
+    raw=str(team_id or '').strip()
+    if not raw:
+        return None
+    key=re.sub(r'[^a-z0-9]+','',raw.lower())
+    allied_faction=re.sub(r'[^a-z0-9]+','',str((match_row or {}).get('allied_faction_id') or '').lower())
+    axis_faction=re.sub(r'[^a-z0-9]+','',str((match_row or {}).get('axis_faction_id') or '').lower())
+    if key in {'allied','allies','us','usa','unitedstates','unitedstatesarmy','american'}:
+        return 'US'
+    if key in {'axis','nva','northvietnam','northvietnamese','peoplesarmyofvietnam'}:
+        return 'NVA'
+    if allied_faction and key == allied_faction:
+        return 'US'
+    if axis_faction and key == axis_faction:
+        return 'NVA'
+    if allied_faction == '2' and axis_faction == '1':
+        if key == '2': return 'US'
+        if key == '1': return 'NVA'
+    return None
+
+async def _live_ready_room_side_muster(match_id, members):
+    match_row=await _active_or_latest_match_label(match_id)
+    if not match_row:
+        return {'US':[],'NVA':[],'UNKNOWN':list(members),'match_row':None}
+    wanted={str(m.id):m for m in members}
+    rows=await collector.db.fetch("""
+        SELECT DISTINCT ON (l.discord_user_id) l.discord_user_id,s.team_id,s.last_seen_at
+        FROM hll_player_match_stats s
+        JOIN hll_personnel_links l ON l.personnel_id=s.personnel_id AND l.verified=TRUE
+        WHERE s.match_id=$1 AND l.discord_user_id IS NOT NULL
+          AND s.last_seen_at >= NOW() - INTERVAL '90 seconds'
+        ORDER BY l.discord_user_id,s.last_seen_at DESC
+    """,int(match_id))
+    result={'US':[],'NVA':[],'UNKNOWN':[],'match_row':match_row}; seen=set()
+    for row in rows:
+        member=wanted.get(str(row.get('discord_user_id') or '').strip())
+        if not member: continue
+        side=_normalize_hll_side(row.get('team_id'),match_row)
+        if side in ('US','NVA'):
+            result[side].append(member); seen.add(member.id)
+    result['UNKNOWN']=[m for m in members if m.id not in seen]
+    return result
+
+def _select_unit_combat_side(muster):
+    us=len(muster.get('US',[])); nva=len(muster.get('NVA',[]))
+    if us == nva:
+        return None
+    return 'US' if us > nva else 'NVA'
 
 def _combat_bindings(cfg):
     raw=cfg.get('combat_channels_json') if isinstance(cfg,dict) else cfg['combat_channels_json']
@@ -4447,36 +4499,61 @@ async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
         return {'ok':False,'error':'Configured Ready Room is missing or invalid.'}
     if not isinstance(text,discord.TextChannel):
         return {'ok':False,'error':'Configured Combat Roster text channel is missing or invalid.'}
-    members=_formation_members(ready)
-    if len(members) < MATCH_FORMATION_MIN_PLAYERS:
-        return {'ok':False,'error':f'Only {len(members)} player(s) are in {ready.name}; 6 are required.','player_count':len(members)}
-    roster=_build_random_match_formation(members,str(cfg.get('side_mode') or 'US').upper())
+    ready_members=_formation_members(ready)
+    if len(ready_members) < MATCH_FORMATION_MIN_PLAYERS:
+        return {'ok':False,'error':f'Only {len(ready_members)} player(s) are in {ready.name}; 6 are required.','player_count':len(ready_members)}
+
     match_row=await _active_or_latest_match_label(match_id)
+    auto_side=bool(cfg.get('auto_side',True))
+    skipped=[]; unknown=[]
+    if auto_side:
+        if not match_id:
+            return {'ok':False,'error':'Automatic side detection needs a live HLL match.'}
+        muster=await _live_ready_room_side_muster(match_id,ready_members)
+        side=_select_unit_combat_side(muster)
+        if not side:
+            return {'ok':False,'error':f"Unable to determine one 1/5 Cav combat side from live HLL telemetry (U.S. {len(muster['US'])} / NVA {len(muster['NVA'])}). No one was moved."}
+        members=list(muster[side])
+        skipped=list(muster['NVA' if side=='US' else 'US'])
+        unknown=list(muster['UNKNOWN'])
+        if len(members) < MATCH_FORMATION_MIN_PLAYERS:
+            return {'ok':False,'error':f"Live HLL telemetry found only {len(members)} linked Ready Room member(s) on the {side} side; 6 on the same side are required. No one was moved.",'player_count':len(members)}
+    else:
+        side=str(cfg.get('side_mode') or 'US').upper(); members=ready_members
+
+    roster=_build_random_match_formation(members,side)
     msg=await text.send(embed=_formation_embed(roster,ready,match_row,automatic=automatic))
     routing=await _route_combat_roster(guild,cfg,roster)
-    if routing['missing'] or routing['failures']:
-        note=[]
-        if routing['missing']: note.append('Unbound voice nets: '+', '.join(routing['missing']))
-        if routing['failures']: note.append('Move failures: '+', '.join(routing['failures'][:8]))
-        await text.send('**COMBAT VOICE ROUTING NOTICE**\n'+'\n'.join(note))
+    notices=[]
+    if skipped: notices.append('Opposite-side players left in Ready Room: '+', '.join(m.mention for m in skipped))
+    if unknown: notices.append('Not matched to live HLL telemetry: '+', '.join(m.mention for m in unknown))
+    if routing['missing']: notices.append('Unbound voice nets: '+', '.join(routing['missing']))
+    if routing['failures']: notices.append('Move failures: '+', '.join(routing['failures'][:8]))
+    if notices:
+        await text.send('**COMBAT VOICE ROUTING NOTICE**\n'+'\n'.join(notices))
     packed=_formation_to_json(roster)
+    packed['opposite_side_skipped']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in skipped]
+    packed['telemetry_unmatched']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in unknown]
     await collector.db.execute("""INSERT INTO clerk_match_formation_history
         (guild_id,match_id,voice_channel_id,text_channel_id,side_mode,player_count,roster_json)
         VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)""",
-        guild.id,match_id,ready.id,text.id,str(cfg.get('side_mode') or 'US').upper(),len(members),json.dumps(packed))
+        guild.id,match_id,ready.id,text.id,side,len(members),json.dumps(packed))
     await collector.db.execute("""UPDATE clerk_match_formation_config SET last_posted_at=NOW(),last_message_id=$2,updated_at=NOW()
         WHERE guild_id=$1""",guild.id,msg.id)
-    return {'ok':True,'message':msg,'player_count':len(members),'roster':roster,'routing':routing}
+    return {'ok':True,'message':msg,'player_count':len(members),'side':side,'roster':roster,'routing':routing,'skipped':skipped,'unknown':unknown}
 
 @tasks.loop(seconds=15)
 async def match_formation_watch():
-    """Return combat nets at round end; create/move a fresh roster at new round start."""
+    """Return at round end and route only at a newly observed match boundary.
+
+    If V75 is enabled/deployed while a round is already active, that round is
+    baselined and never routed mid-game. The next round is eligible.
+    """
     if not bot.is_ready(): return
     try:
         await ensure_match_formation_schema()
         rows=await collector.db.fetch("SELECT * FROM clerk_match_formation_config WHERE enabled=TRUE AND voice_channel_id IS NOT NULL AND text_channel_id IS NOT NULL")
-        latest_done=await _latest_completed_hll_match_id()
-        latest_active=await _latest_active_hll_match_id()
+        latest_done=await _latest_completed_hll_match_id(); latest_active=await _latest_active_hll_match_id()
         for row_obj in rows:
             row=dict(row_obj); gid=int(row['guild_id'])
             if gid in match_formation_busy: continue
@@ -4484,28 +4561,39 @@ async def match_formation_watch():
             if not guild: continue
             match_formation_busy.add(gid)
             try:
+                if row.get('activation_baseline_match_id') is None:
+                    baseline=int(latest_active or latest_done or 0)
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET activation_baseline_match_id=$2,
+                            last_started_match_id=CASE WHEN $3::bigint IS NOT NULL THEN GREATEST(COALESCE(last_started_match_id,0),$3) ELSE last_started_match_id END,
+                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,updated_at=NOW()
+                        WHERE guild_id=$1""",gid,baseline,latest_active)
+                    if latest_active:
+                        log.info('[COMBAT ROSTER DEFERRED] guild=%s active_match=%s reason=activated during live round',gid,latest_active)
+                    continue
+
                 returned=int(row.get('last_returned_match_id') or 0)
                 if latest_done and latest_done>returned:
                     result=await _return_combat_members(guild,row)
                     await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
                     log.info('[COMBAT RETURN] guild=%s match=%s moved=%s failures=%s',gid,latest_done,result['moved'],len(result['failures']))
-                    # Refresh the config after the return marker update.
                     row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
+
                 started=int(row.get('last_started_match_id') or 0)
                 if latest_active and latest_active>started:
-                    # Mark first to prevent duplicate randomizations if Discord moves are slow.
-                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,
-                        last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
-                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0))
-                    count=len(_formation_members(ready)) if ready else 0
+                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
+                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0)); count=len(_formation_members(ready)) if ready else 0
                     if count < MATCH_FORMATION_MIN_PLAYERS:
                         log.info('[COMBAT ROSTER SKIP] guild=%s match=%s players=%s (<6)',gid,latest_active,count)
                     else:
+                        await asyncio.sleep(12)
+                        if await _latest_active_hll_match_id() != latest_active:
+                            log.info('[COMBAT ROSTER ABORT] guild=%s match changed during telemetry settle',gid); continue
                         result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
                         if result.get('ok'):
-                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s players=%s moved=%s',gid,latest_active,result['player_count'],result['routing']['moved'])
+                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
                         else:
-                            log.warning('[COMBAT ROSTER FAILED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
+                            log.warning('[COMBAT ROSTER NOT ROUTED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
             except Exception:
                 log.exception('[COMBAT ROSTER WATCH FAILED] guild=%s',gid)
             finally:
@@ -4527,7 +4615,8 @@ async def combat_setup(interaction:discord.Interaction,ready_room:discord.VoiceC
           last_returned_match_id=COALESCE(clerk_match_formation_config.last_returned_match_id,EXCLUDED.last_returned_match_id),
           updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
         interaction.guild_id,ready_room.id,roster_channel.id,active,done,interaction.user.id)
-    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum muster: **6**\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
+    await collector.db.execute("UPDATE clerk_match_formation_config SET auto_side=TRUE,activation_baseline_match_id=NULL,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id)
+    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum muster: **6**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
 
 COMBAT_ELEMENT_CHOICES=[app_commands.Choice(name=k.replace('_',' ').title(),value=k) for k in COMBAT_ELEMENT_KEYS]
 @bot.tree.command(name='combat-channel', description='Bind one randomized combat element to its Discord voice channel.')
@@ -4555,7 +4644,7 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
     if not row:
         await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
     enabled = state.value == 'ON'
-    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
+    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,activation_baseline_match_id=CASE WHEN $2 THEN NULL ELSE activation_baseline_match_id END,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
     if enabled:
         msg=('**COMBAT ROSTER AUTOMATION: ON**\n'
              'New HLL rounds can automatically generate the randomized Combat Roster and move Ready Room members into their assigned combat voice channels.\n'
@@ -4566,15 +4655,20 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
              'Existing channel bindings and settings are preserved. `/combat-return` remains available if you need to bring everyone back manually.')
     await interaction.response.send_message(msg,ephemeral=True)
 
-@bot.tree.command(name='combat-side', description='Set which faction 1/5 Cav is playing this round. Helicopters are U.S.-side only.')
-@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='NVA side',value='NVA')])
+@bot.tree.command(name='combat-side', description='Choose automatic HLL side detection or a manual fallback.')
+@app_commands.choices(side=[app_commands.Choice(name='Automatic — detect from HLL server',value='AUTO'),app_commands.Choice(name='U.S. side — manual fallback',value='US'),app_commands.Choice(name='NVA side — manual fallback',value='NVA')])
 async def combat_side(interaction:discord.Interaction,side:app_commands.Choice[str]):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
     await ensure_match_formation_schema()
-    await collector.db.execute("UPDATE clerk_match_formation_config SET side_mode=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,side.value,interaction.user.id)
-    extra='Helicopter 1–3 are eligible when attendance thresholds are met.' if side.value=='US' else 'Helicopter 1–3 are HARD DISABLED for NVA.'
-    await interaction.response.send_message(f'Combat side set to **{side.name}**.\n{extra}',ephemeral=True)
+    auto=side.value=='AUTO'; stored='US' if auto else side.value
+    await collector.db.execute("UPDATE clerk_match_formation_config SET side_mode=$2,auto_side=$3,updated_by=$4,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,stored,auto,interaction.user.id)
+    if auto:
+        msg='Combat side detection set to **AUTOMATIC**. Battalion Clerk will use linked game identities and live HLL telemetry at the next match start.'
+    else:
+        extra='Helicopter 1–3 are eligible.' if side.value=='US' else 'Helicopter 1–3 are HARD DISABLED.'
+        msg=f'Combat side manual fallback set to **{side.name}**. {extra}'
+    await interaction.response.send_message(msg,ephemeral=True)
 
 @bot.tree.command(name='combat-status', description='Show Ready Room, roster channel, side, and all combat voice bindings.')
 async def combat_status(interaction:discord.Interaction):
@@ -4588,7 +4682,7 @@ async def combat_status(interaction:discord.Interaction):
         lines.append(f"• **{key.replace('_',' ').title()}** → {ch.mention if ch else 'NOT ASSIGNED'}")
     count=len(_formation_members(ready)) if ready else 0
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nSide: **{cfg.get('side_mode') or 'US'}**\nLive Ready Room muster: **{count}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nLive Ready Room muster: **{count}**\n\n"+'\n'.join(lines),ephemeral=True)
 
 @bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
 async def combat_generate(interaction:discord.Interaction):
