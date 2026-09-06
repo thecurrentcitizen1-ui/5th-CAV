@@ -63,7 +63,12 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
-hllv = HLLVTelemetryCollector(collector)
+hllv = HLLVTelemetryCollector(collector, server_slot=1)
+# Server #2 is telemetry-only: career stats flow into the same PostgreSQL
+# personnel tables, while VIP/manual RCON administration remains anchored to
+# Server #1. The secondary collector activates automatically when the _2
+# Railway variables are present.
+hllv2 = HLLVTelemetryCollector(collector, server_slot=2, telemetry_only=True)
 collector_started = False
 commands_synced = False
 
@@ -3966,6 +3971,17 @@ async def weekly_battalion_report_channel(interaction:discord.Interaction, chann
     )
 
 
+
+@bot.tree.command(name='nco-accountability-channel', description='Set the channel for the weekly NCO/company member-attention rollup.')
+async def nco_accountability_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'NCO_ACCOUNTABILITY',channel.id)
+    await interaction.response.send_message(
+        f'NCO / Company accountability rollups will be posted to {channel.mention} with the Sunday Battalion Report.',
+        ephemeral=True
+    )
+
+
 @tasks.loop(hours=1)
 async def weekly_battalion_report_watch():
     """Post one concise weekly leadership report each Sunday evening.
@@ -3994,6 +4010,8 @@ async def weekly_battalion_report_watch():
             data=await web.request('GET','/internal/clerk/reports/weekly-battalion')
             m=data.get('metrics') or {}
             companies=data.get('companies') or []
+            onboarding=data.get('onboarding') or {}
+            cohort=data.get('cohort30') or {}
             company_lines=[]
             for c in companies[:6]:
                 company_lines.append(
@@ -4002,19 +4020,16 @@ async def weekly_battalion_report_watch():
                     f"RDY {c.get('readiness',0)}% | WATCH {c.get('inactive14',0)}"
                 )
             body=(
-                f"**1/5 CAV — WEEKLY BATTALION REPORT**\n"
+                f"**1/5 CAV — WEEKLY BATTALION HEALTH REPORT**\n"
                 f"Week: **{report_key}**\n\n"
-                f"**Strength:** {m.get('strength',0)}\n"
-                f"**Verified HLL activity (7D):** {m.get('active7',0)}\n"
-                f"**14+ day inactivity watch:** {m.get('inactive14',0)}\n"
-                f"**30+ day Command review:** {m.get('inactive30',0)}\n"
-                f"**Average readiness:** {m.get('readiness',0)}%\n"
-                f"**Unlinked game IDs:** {m.get('unlinked_game',0)}\n"
-                f"**Ready for assignment:** {m.get('ready_assignment',0)}\n"
-                f"**Open staff actions:** {m.get('open_actions',0)} "
-                f"({m.get('overdue_actions',0)} overdue)\n"
-                f"**Discord/personnel sync errors:** {m.get('sync_errors',0)}\n"
-                f"**Recruiting cases opened in 30D:** {m.get('recruits30',0)}\n"
+                f"**Personnel:** {m.get('strength',0)} total | {m.get('reserve',0)} reserve | {m.get('replacements',0)} replacement\n"
+                f"**Verified HLL activity:** {m.get('active7',0)} active 7D | {m.get('active30',0)} active 30D ({m.get('active30_rate',0)}%)\n"
+                f"**Inactivity:** {m.get('inactive14',0)} at 14+ days | {m.get('inactive30',0)} at 30+ days\n"
+                f"**Readiness:** {m.get('readiness',0)}% average | {m.get('unlinked_game',0)} game IDs missing\n"
+                f"**Staff workload:** {m.get('open_actions',0)} open | {m.get('overdue_actions',0)} overdue | {m.get('s1_cases',0)} S-1 cases\n"
+                f"**Leadership vacancies:** {m.get('leadership_vacancies',0)} | **Promotion reviews:** {m.get('promotion_reviews',0)}\n"
+                f"**Onboarding:** {onboarding.get('packets_open',0)} open | {onboarding.get('first_session_pending',0)} first-session holds | {onboarding.get('credential_holds',0)} login holds\n"
+                f"**30D cohort:** {cohort.get('joined30',0)} joined | {cohort.get('game_linked',0)} linked | {cohort.get('played',0)} played | {cohort.get('active7',0)} active this week\n"
             )
             if company_lines:
                 body += "\n**Company Health**\n" + "\n".join(company_lines)
@@ -4022,6 +4037,22 @@ async def weekly_battalion_report_watch():
             if dashboard:
                 body += f"\n\n**Command Dashboard:** {dashboard}"
             await ch.send(body[:1950])
+
+            # Optional leader-facing rollup.  It deliberately contains only exceptions
+            # so NCOs do not have to scan the entire battalion roster every week.
+            nco_ch=await get_report_channel(guild,'NCO_ACCOUNTABILITY')
+            if nco_ch and await _notice_once(guild.id,'BATTALION','NCO_ACCOUNTABILITY',report_key):
+                attention=data.get('leader_attention') or []
+                lines=[]
+                for item in attention[:15]:
+                    issues=', '.join(item.get('issues') or []) or item.get('activity') or 'REVIEW'
+                    lines.append(f"• **{item.get('name') or 'Soldier'}** — {item.get('unit') or 'UNASSIGNED'} — {item.get('health','AMBER')} — {issues}")
+                nco_body=(f"**1/5 CAV — NCO / COMPANY ACCOUNTABILITY**\nWeek: **{report_key}**\n"
+                          f"Work the exceptions below; routine active Soldiers are intentionally omitted.\n\n")
+                nco_body += "\n".join(lines) if lines else 'No member-health exceptions are currently surfaced.'
+                health_url=data.get('member_health_url')
+                if health_url: nco_body += f"\n\n**Member Health Workbench:** {health_url}"
+                await nco_ch.send(nco_body[:1950])
         except Exception as exc:
             log.warning('[WEEKLY BATTALION REPORT FAILED] guild=%s error=%s',guild.id,exc)
 
@@ -4030,6 +4061,96 @@ async def weekly_battalion_report_watch():
 async def before_weekly_battalion_report_watch():
     await bot.wait_until_ready()
 
+
+
+
+# ---------------------------------------------------------------------------
+# V83 — growth accountability + system-health failure alerts
+# ---------------------------------------------------------------------------
+@bot.tree.command(name='system-health-channel', description='Assign the Command channel for Battalion Clerk/system failure alerts.')
+async def system_health_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'SYSTEM_HEALTH',channel.id)
+    await interaction.response.send_message(f'Battalion system failure/recovery alerts will be posted to {channel.mention}.',ephemeral=True)
+
+
+@tasks.loop(minutes=60)
+async def growth_accountability_watch():
+    """Ask the Website to create/escalate authoritative staff work from inactivity/onboarding/link exceptions."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('POST','/internal/clerk/automation/growth-accountability',json={'guild_id':guild.id})
+            created=len(data.get('created') or []); escalated=len(data.get('escalated') or [])
+            if not (created or escalated): continue
+            ch=await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+            if ch:
+                await ch.send(f'**BATTALION ACCOUNTABILITY WORK QUEUE UPDATED**\nNew action(s): **{created}** • Escalated overdue action(s): **{escalated}**\nOpen the Website Staff Work Queue for action.')
+        except Exception as exc:
+            log.warning('[GROWTH ACCOUNTABILITY WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@growth_accountability_watch.before_loop
+async def before_growth_accountability_watch():
+    await bot.wait_until_ready()
+
+
+async def _system_health_state_get(guild_id):
+    await collector.start(); db=collector.db
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_system_health_state(
+        guild_id TEXT PRIMARY KEY,last_state TEXT,last_payload JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    return await db.fetchrow('SELECT * FROM clerk_system_health_state WHERE guild_id=$1',str(guild_id))
+
+
+async def _system_health_state_set(guild_id,state,payload):
+    await collector.start(); db=collector.db
+    await db.execute("""INSERT INTO clerk_system_health_state(guild_id,last_state,last_payload,updated_at)
+        VALUES($1,$2,$3::jsonb,NOW()) ON CONFLICT(guild_id) DO UPDATE SET last_state=EXCLUDED.last_state,last_payload=EXCLUDED.last_payload,updated_at=NOW()""",
+        str(guild_id),str(state),json.dumps(payload or {}))
+
+
+@tasks.loop(minutes=5)
+async def system_health_alert_watch():
+    """Alert Command on meaningful health transitions; do not spam every polling cycle."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/system-health',params={'guild_id':guild.id})
+            state=str(data.get('overall') or 'UNKNOWN').upper()
+            previous=await _system_health_state_get(guild.id)
+            old=str(previous.get('last_state') or '') if previous else ''
+            if state!=old:
+                ch=await get_report_channel(guild,'SYSTEM_HEALTH') or await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+                if ch:
+                    if state=='OK' and old in {'WARN','FAIL'}:
+                        await ch.send('**BATTALION SYSTEMS RECOVERED**\nBattalion Clerk, recruiting delivery, Discord sync, and official-server telemetry have returned to a healthy state.')
+                    elif state in {'WARN','FAIL'}:
+                        problems=[]
+                        for c in data.get('checks') or []:
+                            if str(c.get('status') or '').upper() in {'WARN','FAIL'}:
+                                problems.append(f"• **{c.get('name')}** — {c.get('status')}: {c.get('detail')}")
+                        body='\n'.join(problems[:8]) or 'A system health exception was detected.'
+                        await ch.send(f'**BATTALION SYSTEM HEALTH — {state}**\n{body}\n\nCommand should review the Website System Health page.')
+            await _system_health_state_set(guild.id,state,data)
+        except Exception as exc:
+            log.warning('[SYSTEM HEALTH ALERT WATCH FAILED] guild=%s error=%s',guild.id,exc)
+            try:
+                previous=await _system_health_state_get(guild.id)
+                old=str(previous.get('last_state') or '') if previous else ''
+                if old!='FAIL':
+                    ch=await get_report_channel(guild,'SYSTEM_HEALTH') or await get_report_channel(guild,'PERSONNEL_SUSPENSE')
+                    if ch:
+                        await ch.send('**BATTALION SYSTEM HEALTH — FAIL**\nThe Website health endpoint is unreachable. Battalion Clerk cannot verify recruiting, progression, or HLL telemetry health until the Website responds again.')
+                await _system_health_state_set(guild.id,'FAIL',{'error':str(exc)[:300],'source':'WEBSITE HEALTH ENDPOINT'})
+            except Exception as alert_exc:
+                log.warning('[SYSTEM HEALTH FAILSAFE ALERT FAILED] guild=%s error=%s',guild.id,alert_exc)
+
+
+@system_health_alert_watch.before_loop
+async def before_system_health_alert_watch():
+    await bot.wait_until_ready()
 
 @bot.event
 async def on_ready():
@@ -4100,6 +4221,10 @@ async def on_ready():
         await hllv.start()
     except Exception:
         log.exception('[HLLV RCON STARTUP FAILED]')
+    try:
+        await hllv2.start()
+    except Exception:
+        log.exception('[HLLV RCON SERVER 2 STARTUP FAILED]')
     if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
         hll_vip_sync_watch.start()
 
@@ -4166,6 +4291,10 @@ async def on_ready():
         member_record_reminder_watch.start()
     if not match_formation_watch.is_running():
         match_formation_watch.start()
+    if not growth_accountability_watch.is_running():
+        growth_accountability_watch.start()
+    if not system_health_alert_watch.is_running():
+        system_health_alert_watch.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -4229,13 +4358,15 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
-# LIVE COMBAT ROSTER + AUTOMATIC VOICE ROUTING (V73)
+# LIVE COMBAT ROSTER + AUTOMATIC VOICE/HLL PARTICIPATION ROUTING (V77)
 # ---------------------------------------------------------------------------
 # Administrative website formations remain authoritative for personnel records.
 # This system creates a temporary combat roster from the Ready Room only.
 MATCH_FORMATION_MIN_PLAYERS = 6
 MATCH_FORMATION_TANK_THRESHOLDS = (9, 18, 27)
 MATCH_FORMATION_HELI_THRESHOLDS = (13, 25, 37)
+COMBAT_ROSTER_MOVE_DELAY_SECONDS = 60
+COMBAT_AUTO_MOVE_MIN_PLAYERS = 7  # 6 or fewer stay together in the Ready Room
 COMBAT_ELEMENT_KEYS = tuple(
     [f'INFANTRY_{i}' for i in range(1,4)] +
     [f'TANK_{i}' for i in range(1,4)] +
@@ -4263,6 +4394,11 @@ async def ensure_match_formation_schema():
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS combat_channels_json JSONB NOT NULL DEFAULT '{}'::jsonb",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_started_match_id BIGINT",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_returned_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS auto_side BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS activation_baseline_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_deferred_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS voice_presence_required BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS late_join_queue_json JSONB NOT NULL DEFAULT '[]'::jsonb",
     ):
         await collector.db.execute(ddl)
     await collector.db.execute("""
@@ -4299,7 +4435,7 @@ async def _active_or_latest_match_label(match_id: int | None):
     if not match_id:
         return None
     try:
-        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,ended_at
+        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at
             FROM hll_match_sessions WHERE id=$1""", int(match_id))
         return dict(row) if row else None
     except Exception:
@@ -4309,6 +4445,102 @@ def _formation_members(channel):
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return []
     return [m for m in channel.members if not m.bot]
+
+def _normalize_hll_side(team_id, match_row):
+    raw=str(team_id or '').strip()
+    if not raw:
+        return None
+    key=re.sub(r'[^a-z0-9]+','',raw.lower())
+    allied_faction=re.sub(r'[^a-z0-9]+','',str((match_row or {}).get('allied_faction_id') or '').lower())
+    axis_faction=re.sub(r'[^a-z0-9]+','',str((match_row or {}).get('axis_faction_id') or '').lower())
+    if key in {'allied','allies','us','usa','unitedstates','unitedstatesarmy','american'}:
+        return 'US'
+    if key in {'axis','nva','northvietnam','northvietnamese','peoplesarmyofvietnam'}:
+        return 'NVA'
+    if allied_faction and key == allied_faction:
+        return 'US'
+    if axis_faction and key == axis_faction:
+        return 'NVA'
+    if allied_faction == '2' and axis_faction == '1':
+        if key == '2': return 'US'
+        if key == '1': return 'NVA'
+    return None
+
+async def _live_ready_room_side_muster(match_id, members):
+    """Combine Discord Ready Room presence with verified live HLL telemetry.
+
+    Discord answers *who opted into tonight's combat roster*. HLL answers
+    *whether that opted-in member is actually in the live round and which side
+    they are on*. No identity guesses are made.
+    """
+    match_row=await _active_or_latest_match_label(match_id)
+    if not match_row:
+        return {'US':[],'NVA':[],'NOT_LINKED':list(members),'NOT_IN_SERVER':[],
+                'UNKNOWN_SIDE':[],'UNKNOWN':list(members),'match_row':None}
+    wanted={str(m.id):m for m in members}
+    discord_ids=[str(m.id) for m in members]
+    linked_rows=await collector.db.fetch("""
+        SELECT DISTINCT discord_user_id
+        FROM hll_personnel_links
+        WHERE verified=TRUE AND discord_user_id = ANY($1::text[])
+    """,discord_ids) if discord_ids else []
+    linked_ids={str(r.get('discord_user_id') or '').strip() for r in linked_rows}
+
+    rows=await collector.db.fetch("""
+        SELECT DISTINCT ON (l.discord_user_id) l.discord_user_id,s.team_id,s.last_seen_at
+        FROM hll_player_match_stats s
+        JOIN hll_personnel_links l ON l.personnel_id=s.personnel_id AND l.verified=TRUE
+        WHERE s.match_id=$1 AND l.discord_user_id IS NOT NULL
+          AND s.last_seen_at >= NOW() - INTERVAL '90 seconds'
+        ORDER BY l.discord_user_id,s.last_seen_at DESC
+    """,int(match_id))
+    result={'US':[],'NVA':[],'NOT_LINKED':[],'NOT_IN_SERVER':[],
+            'UNKNOWN_SIDE':[],'UNKNOWN':[],'match_row':match_row}
+    live_seen=set()
+    for row in rows:
+        did=str(row.get('discord_user_id') or '').strip()
+        member=wanted.get(did)
+        if not member: continue
+        live_seen.add(member.id)
+        side=_normalize_hll_side(row.get('team_id'),match_row)
+        if side in ('US','NVA'):
+            result[side].append(member)
+        else:
+            result['UNKNOWN_SIDE'].append(member)
+    for member in members:
+        did=str(member.id)
+        if did not in linked_ids:
+            result['NOT_LINKED'].append(member)
+        elif member.id not in live_seen:
+            result['NOT_IN_SERVER'].append(member)
+    result['UNKNOWN']=[*result['NOT_LINKED'],*result['NOT_IN_SERVER'],*result['UNKNOWN_SIDE']]
+    return result
+
+def _late_join_queue(cfg):
+    raw=cfg.get('late_join_queue_json') if isinstance(cfg,dict) else cfg['late_join_queue_json']
+    if isinstance(raw,str):
+        try: raw=json.loads(raw)
+        except Exception: raw=[]
+    out=[]
+    for value in list(raw or []):
+        try: out.append(int(value))
+        except Exception: pass
+    return list(dict.fromkeys(out))
+
+async def _set_late_join_queue(guild_id:int, member_id:int, present:bool):
+    await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT late_join_queue_json FROM clerk_match_formation_config WHERE guild_id=$1",guild_id)
+    if not row: return
+    q=_late_join_queue(dict(row))
+    if present and member_id not in q: q.append(member_id)
+    if not present: q=[x for x in q if x != member_id]
+    await collector.db.execute("UPDATE clerk_match_formation_config SET late_join_queue_json=$2::jsonb,updated_at=NOW() WHERE guild_id=$1",guild_id,json.dumps(q))
+
+def _select_unit_combat_side(muster):
+    us=len(muster.get('US',[])); nva=len(muster.get('NVA',[]))
+    if us == nva:
+        return None
+    return 'US' if us > nva else 'NVA'
 
 def _combat_bindings(cfg):
     raw=cfg.get('combat_channels_json') if isinstance(cfg,dict) else cfg['combat_channels_json']
@@ -4447,36 +4679,90 @@ async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
         return {'ok':False,'error':'Configured Ready Room is missing or invalid.'}
     if not isinstance(text,discord.TextChannel):
         return {'ok':False,'error':'Configured Combat Roster text channel is missing or invalid.'}
-    members=_formation_members(ready)
-    if len(members) < MATCH_FORMATION_MIN_PLAYERS:
-        return {'ok':False,'error':f'Only {len(members)} player(s) are in {ready.name}; 6 are required.','player_count':len(members)}
-    roster=_build_random_match_formation(members,str(cfg.get('side_mode') or 'US').upper())
+    ready_members=_formation_members(ready)
+    if len(ready_members) < MATCH_FORMATION_MIN_PLAYERS:
+        return {'ok':False,'error':f'Only {len(ready_members)} player(s) are in {ready.name}; 6 are required.','player_count':len(ready_members)}
+
     match_row=await _active_or_latest_match_label(match_id)
+    auto_side=bool(cfg.get('auto_side',True))
+    skipped=[]; unknown=[]; not_linked=[]; not_in_server=[]; unknown_side=[]
+    if auto_side:
+        if not match_id:
+            return {'ok':False,'error':'Automatic side detection needs a live HLL match.'}
+        muster=await _live_ready_room_side_muster(match_id,ready_members)
+        side=_select_unit_combat_side(muster)
+        if not side:
+            return {'ok':False,'error':f"Unable to determine one 1/5 Cav combat side from live HLL telemetry (U.S. {len(muster['US'])} / NVA {len(muster['NVA'])}). No one was moved."}
+        members=list(muster[side])
+        skipped=list(muster['NVA' if side=='US' else 'US'])
+        unknown=list(muster['UNKNOWN'])
+        not_linked=list(muster.get('NOT_LINKED',[]))
+        not_in_server=list(muster.get('NOT_IN_SERVER',[]))
+        unknown_side=list(muster.get('UNKNOWN_SIDE',[]))
+        if len(members) < MATCH_FORMATION_MIN_PLAYERS:
+            return {'ok':False,'error':f"Live HLL telemetry found only {len(members)} linked Ready Room member(s) on the {side} side; 6 on the same side are required. No one was moved.",'player_count':len(members)}
+    else:
+        side=str(cfg.get('side_mode') or 'US').upper(); members=ready_members
+
+    roster=_build_random_match_formation(members,side)
     msg=await text.send(embed=_formation_embed(roster,ready,match_row,automatic=automatic))
-    routing=await _route_combat_roster(guild,cfg,roster)
-    if routing['missing'] or routing['failures']:
-        note=[]
-        if routing['missing']: note.append('Unbound voice nets: '+', '.join(routing['missing']))
-        if routing['failures']: note.append('Move failures: '+', '.join(routing['failures'][:8]))
-        await text.send('**COMBAT VOICE ROUTING NOTICE**\n'+'\n'.join(note))
+
+    # V78 small-muster guard: six players can remain together in the Ready Room.
+    # Automatic voice splitting only begins at seven or more eligible players.
+    # Manual /combat-generate remains an explicit staff override.
+    if automatic and len(members) < COMBAT_AUTO_MOVE_MIN_PLAYERS:
+        await text.send('**COMBAT ROSTER FILED — READY ROOM HOLD** — **6 or fewer** eligible personnel are mustered. Automatic voice-channel movement begins only at **7+**. No one was moved.')
+        routing={'moved':0,'failures':[],'missing':[],'small_muster_hold':True}
+    else:
+        await text.send(f'**COMBAT ROSTER FILED** — automatic voice routing in **{COMBAT_ROSTER_MOVE_DELAY_SECONDS} seconds**.')
+
+        # Publish the randomized roster first, then give the unit a full minute
+        # to read assignments before Discord moves begin. Side/faction selection
+        # is still taken from verified live HLL telemetry above.
+        await asyncio.sleep(COMBAT_ROSTER_MOVE_DELAY_SECONDS)
+
+        # Automatic runs are match-boundary guarded. If the live HLL match changed
+        # during the staging window, do not move anybody against a stale roster.
+        if automatic and match_id and await _latest_active_hll_match_id() != match_id:
+            await text.send('**COMBAT VOICE ROUTING CANCELLED** — the live HLL match changed during the 60-second staging window. No one was moved.')
+            routing={'moved':0,'failures':[],'missing':[],'cancelled':True}
+        else:
+            routing=await _route_combat_roster(guild,cfg,roster)
+    notices=[]
+    if skipped: notices.append('Opposite-side players left in Ready Room: '+', '.join(m.mention for m in skipped))
+    if not_linked: notices.append('Ready Room — game identity not linked: '+', '.join(m.mention for m in not_linked))
+    if not_in_server: notices.append('Ready Room — linked but not detected in the live HLL round: '+', '.join(m.mention for m in not_in_server))
+    if unknown_side: notices.append('Ready Room — live HLL player found but side is not resolved yet: '+', '.join(m.mention for m in unknown_side))
+    if routing['missing']: notices.append('Unbound voice nets: '+', '.join(routing['missing']))
+    if routing['failures']: notices.append('Move failures: '+', '.join(routing['failures'][:8]))
+    if notices:
+        await text.send('**COMBAT VOICE ROUTING NOTICE**\n'+'\n'.join(notices))
     packed=_formation_to_json(roster)
+    packed['opposite_side_skipped']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in skipped]
+    packed['telemetry_unmatched']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in unknown]
+    packed['not_linked']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in not_linked]
+    packed['linked_not_in_server']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in not_in_server]
+    packed['unknown_side']=[{'discord_user_id':str(m.id),'display_name':m.display_name} for m in unknown_side]
     await collector.db.execute("""INSERT INTO clerk_match_formation_history
         (guild_id,match_id,voice_channel_id,text_channel_id,side_mode,player_count,roster_json)
         VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)""",
-        guild.id,match_id,ready.id,text.id,str(cfg.get('side_mode') or 'US').upper(),len(members),json.dumps(packed))
+        guild.id,match_id,ready.id,text.id,side,len(members),json.dumps(packed))
     await collector.db.execute("""UPDATE clerk_match_formation_config SET last_posted_at=NOW(),last_message_id=$2,updated_at=NOW()
         WHERE guild_id=$1""",guild.id,msg.id)
-    return {'ok':True,'message':msg,'player_count':len(members),'roster':roster,'routing':routing}
+    return {'ok':True,'message':msg,'player_count':len(members),'side':side,'roster':roster,'routing':routing,'skipped':skipped,'unknown':unknown}
 
 @tasks.loop(seconds=15)
 async def match_formation_watch():
-    """Return combat nets at round end; create/move a fresh roster at new round start."""
+    """Return at round end and route only at a newly observed match boundary.
+
+    If V75 is enabled/deployed while a round is already active, that round is
+    baselined and never routed mid-game. The next round is eligible.
+    """
     if not bot.is_ready(): return
     try:
         await ensure_match_formation_schema()
         rows=await collector.db.fetch("SELECT * FROM clerk_match_formation_config WHERE enabled=TRUE AND voice_channel_id IS NOT NULL AND text_channel_id IS NOT NULL")
-        latest_done=await _latest_completed_hll_match_id()
-        latest_active=await _latest_active_hll_match_id()
+        latest_done=await _latest_completed_hll_match_id(); latest_active=await _latest_active_hll_match_id()
         for row_obj in rows:
             row=dict(row_obj); gid=int(row['guild_id'])
             if gid in match_formation_busy: continue
@@ -4484,28 +4770,39 @@ async def match_formation_watch():
             if not guild: continue
             match_formation_busy.add(gid)
             try:
+                if row.get('activation_baseline_match_id') is None:
+                    baseline=int(latest_active or latest_done or 0)
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET activation_baseline_match_id=$2,
+                            last_started_match_id=CASE WHEN $3::bigint IS NOT NULL THEN GREATEST(COALESCE(last_started_match_id,0),$3) ELSE last_started_match_id END,
+                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,updated_at=NOW()
+                        WHERE guild_id=$1""",gid,baseline,latest_active)
+                    if latest_active:
+                        log.info('[COMBAT ROSTER DEFERRED] guild=%s active_match=%s reason=activated during live round',gid,latest_active)
+                    continue
+
                 returned=int(row.get('last_returned_match_id') or 0)
                 if latest_done and latest_done>returned:
                     result=await _return_combat_members(guild,row)
-                    await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
+                    await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,late_join_queue_json='[]'::jsonb,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
                     log.info('[COMBAT RETURN] guild=%s match=%s moved=%s failures=%s',gid,latest_done,result['moved'],len(result['failures']))
-                    # Refresh the config after the return marker update.
                     row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
+
                 started=int(row.get('last_started_match_id') or 0)
                 if latest_active and latest_active>started:
-                    # Mark first to prevent duplicate randomizations if Discord moves are slow.
-                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,
-                        last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
-                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0))
-                    count=len(_formation_members(ready)) if ready else 0
+                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
+                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0)); count=len(_formation_members(ready)) if ready else 0
                     if count < MATCH_FORMATION_MIN_PLAYERS:
                         log.info('[COMBAT ROSTER SKIP] guild=%s match=%s players=%s (<6)',gid,latest_active,count)
                     else:
+                        await asyncio.sleep(12)
+                        if await _latest_active_hll_match_id() != latest_active:
+                            log.info('[COMBAT ROSTER ABORT] guild=%s match changed during telemetry settle',gid); continue
                         result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
                         if result.get('ok'):
-                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s players=%s moved=%s',gid,latest_active,result['player_count'],result['routing']['moved'])
+                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
                         else:
-                            log.warning('[COMBAT ROSTER FAILED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
+                            log.warning('[COMBAT ROSTER NOT ROUTED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
             except Exception:
                 log.exception('[COMBAT ROSTER WATCH FAILED] guild=%s',gid)
             finally:
@@ -4527,7 +4824,8 @@ async def combat_setup(interaction:discord.Interaction,ready_room:discord.VoiceC
           last_returned_match_id=COALESCE(clerk_match_formation_config.last_returned_match_id,EXCLUDED.last_returned_match_id),
           updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
         interaction.guild_id,ready_room.id,roster_channel.id,active,done,interaction.user.id)
-    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum muster: **6**\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
+    await collector.db.execute("UPDATE clerk_match_formation_config SET auto_side=TRUE,activation_baseline_match_id=NULL,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id)
+    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum roster muster: **6**\nAutomatic voice movement: **7+ eligible players**\nParticipation gate: **READY ROOM + LIVE HLL SERVER**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
 
 COMBAT_ELEMENT_CHOICES=[app_commands.Choice(name=k.replace('_',' ').title(),value=k) for k in COMBAT_ELEMENT_KEYS]
 @bot.tree.command(name='combat-channel', description='Bind one randomized combat element to its Discord voice channel.')
@@ -4555,7 +4853,7 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
     if not row:
         await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
     enabled = state.value == 'ON'
-    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
+    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,activation_baseline_match_id=CASE WHEN $2 THEN NULL ELSE activation_baseline_match_id END,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
     if enabled:
         msg=('**COMBAT ROSTER AUTOMATION: ON**\n'
              'New HLL rounds can automatically generate the randomized Combat Roster and move Ready Room members into their assigned combat voice channels.\n'
@@ -4566,15 +4864,20 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
              'Existing channel bindings and settings are preserved. `/combat-return` remains available if you need to bring everyone back manually.')
     await interaction.response.send_message(msg,ephemeral=True)
 
-@bot.tree.command(name='combat-side', description='Set which faction 1/5 Cav is playing this round. Helicopters are U.S.-side only.')
-@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='NVA side',value='NVA')])
+@bot.tree.command(name='combat-side', description='Choose automatic HLL side detection or a manual fallback.')
+@app_commands.choices(side=[app_commands.Choice(name='Automatic — detect from HLL server',value='AUTO'),app_commands.Choice(name='U.S. side — manual fallback',value='US'),app_commands.Choice(name='NVA side — manual fallback',value='NVA')])
 async def combat_side(interaction:discord.Interaction,side:app_commands.Choice[str]):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
     await ensure_match_formation_schema()
-    await collector.db.execute("UPDATE clerk_match_formation_config SET side_mode=$2,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,side.value,interaction.user.id)
-    extra='Helicopter 1–3 are eligible when attendance thresholds are met.' if side.value=='US' else 'Helicopter 1–3 are HARD DISABLED for NVA.'
-    await interaction.response.send_message(f'Combat side set to **{side.name}**.\n{extra}',ephemeral=True)
+    auto=side.value=='AUTO'; stored='US' if auto else side.value
+    await collector.db.execute("UPDATE clerk_match_formation_config SET side_mode=$2,auto_side=$3,updated_by=$4,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,stored,auto,interaction.user.id)
+    if auto:
+        msg='Combat side detection set to **AUTOMATIC**. Battalion Clerk will use linked game identities and live HLL telemetry at the next match start.'
+    else:
+        extra='Helicopter 1–3 are eligible.' if side.value=='US' else 'Helicopter 1–3 are HARD DISABLED.'
+        msg=f'Combat side manual fallback set to **{side.name}**. {extra}'
+    await interaction.response.send_message(msg,ephemeral=True)
 
 @bot.tree.command(name='combat-status', description='Show Ready Room, roster channel, side, and all combat voice bindings.')
 async def combat_status(interaction:discord.Interaction):
@@ -4587,8 +4890,9 @@ async def combat_status(interaction:discord.Interaction):
         ch=interaction.guild.get_channel(int(bindings.get(key) or 0))
         lines.append(f"• **{key.replace('_',' ').title()}** → {ch.mention if ch else 'NOT ASSIGNED'}")
     count=len(_formation_members(ready)) if ready else 0
+    queued=len(_late_join_queue(cfg))
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nSide: **{cfg.get('side_mode') or 'US'}**\nLive Ready Room muster: **{count}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
 
 @bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
 async def combat_generate(interaction:discord.Interaction):
@@ -4601,7 +4905,7 @@ async def combat_generate(interaction:discord.Interaction):
     result=await _publish_match_formation(interaction.guild,dict(row),match_id=await _latest_active_hll_match_id(),automatic=False)
     if not result.get('ok'):
         await interaction.followup.send(result.get('error','Unable to build combat roster.'),ephemeral=True); return
-    await interaction.followup.send(f"Combat roster generated: **{result['player_count']}** mustered, **{result['routing']['moved']}** moved.",ephemeral=True)
+    await interaction.followup.send(f"Combat roster generated: **{result['player_count']}** mustered. Voice routing begins after the **60-second staging delay**; **{result['routing']['moved']}** moved.",ephemeral=True)
 
 @bot.tree.command(name='combat-return', description='Immediately return everyone in configured combat voice channels to the Ready Room.')
 async def combat_return(interaction:discord.Interaction):
@@ -4697,9 +5001,12 @@ def _recruit_guild_id(user: discord.abc.User) -> int:
 async def _recruit_save(user, step:int, answers:dict):
     gid=_recruit_guild_id(user)
     if not gid: raise RuntimeError('Battalion Discord guild is unavailable')
-    return await web.request('POST','/internal/clerk/recruiting/intake/save',json={
+    result=await web.request('POST','/internal/clerk/recruiting/intake/save',json={
         'guild_id':gid,'discord_user_id':user.id,'current_step':step,'answers':answers
     })
+    if not result or not result.get('ok',False):
+        raise RuntimeError((result or {}).get('error') or 'Website did not confirm the application section was saved')
+    return result
 
 
 class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
@@ -5003,6 +5310,60 @@ async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
 
 
+@bot.tree.command(name='application-system-check',description='Run a read-only health check of the Discord recruiting application pipeline.')
+async def application_system_check(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    checks=[]
+    checks.append(('WEBSITE_BASE_URL', bool(WEBSITE_BASE_URL), WEBSITE_BASE_URL or 'NOT CONFIGURED'))
+    checks.append(('CLERK_SYNC_KEY', bool(CLERK_SYNC_KEY), 'CONFIGURED' if CLERK_SYNC_KEY else 'NOT CONFIGURED'))
+    guild=interaction.guild
+    checks.append(('BATTALION GUILD', bool(guild), f'{guild.name} ({guild.id})' if guild else 'NOT AVAILABLE'))
+    me=guild.me if guild else None
+    if me:
+        perms=me.guild_permissions
+        can_post=bool(perms.view_channel and perms.send_messages)
+        checks.append(('BOT SERVER ACCESS', can_post, 'VIEW + SEND OK' if can_post else 'MISSING VIEW/SEND PERMISSION'))
+    else:
+        checks.append(('BOT SERVER ACCESS', False, 'BOT MEMBER NOT AVAILABLE IN GUILD'))
+
+    try:
+        queue=await web.request('GET','/internal/clerk/recruiting/intake-requests')
+        ok=bool(queue and queue.get('ok', False))
+        detail=(f"REACHABLE • {len(queue.get('cases',[]) or [])} MANUAL REQUEST(S)" if ok
+                else str((queue or {}).get('error') or 'FAILED'))
+        checks.append(('WEBSITE INTAKE QUEUE',ok,detail))
+    except Exception as exc:
+        checks.append(('WEBSITE INTAKE QUEUE',False,f'{type(exc).__name__}: {str(exc)[:180]}'))
+
+    try:
+        status=await web.request(
+            'GET','/internal/clerk/recruiting/intake/status',
+            params={'guild_id':interaction.guild_id,'discord_user_id':interaction.user.id}
+        )
+        ok=bool(status and status.get('ok', False))
+        checks.append(('DRAFT / STATUS API',ok,'REACHABLE' if ok else str((status or {}).get('error') or 'FAILED')))
+    except Exception as exc:
+        checks.append(('DRAFT / STATUS API',False,f'{type(exc).__name__}: {str(exc)[:180]}'))
+
+    persistent_ok=all(v is not None for v in (
+        RecruitApplicationStartView, RecruitIntakePromptView,
+        RecruitPart1View, RecruitPart2View, RecruitPart3View
+    ))
+    checks.append(('PERSISTENT APPLICATION UI',persistent_ok,
+                   'REGISTERED IN BOT BUILD' if persistent_ok else 'MISSING VIEW CLASS'))
+
+    failed=[c for c in checks if not c[1]]
+    lines=[f"{'✅' if ok else '❌'} **{name}** — {detail}" for name,ok,detail in checks]
+    if failed:
+        footer=f"\n\n**RESULT: ATTENTION REQUIRED** — {len(failed)} check(s) failed. Review Railway variables/logs before asking recruits to apply."
+    else:
+        footer="\n\n**RESULT: PASS** — the Discord application transport and Website endpoints are available."
+    await interaction.followup.send(
+        '**1/5 CAV — DISCORD APPLICATION SYSTEM CHECK**\n' + '\n'.join(lines) + footer,
+        ephemeral=True
+    )
 
 
 async def _retroactive_accession_member(member: discord.Member, *, send_message: bool=True) -> dict:
@@ -5843,6 +6204,25 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         'timestamp': iso(now),
     })
 
+    # V76 combat participation queue. Voice presence is the opt-in signal, but
+    # a live round is never disturbed. Members who enter the Ready Room after a
+    # round has started are simply queued for the next match boundary.
+    try:
+        cfg_row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1 AND enabled=TRUE",member.guild.id)
+        if cfg_row:
+            cfg=dict(cfg_row); ready_id=int(cfg.get('voice_channel_id') or 0)
+            if ready_id:
+                entered=(after.channel is not None and after.channel.id==ready_id and (before.channel is None or before.channel.id!=ready_id))
+                exited=(before.channel is not None and before.channel.id==ready_id and (after.channel is None or after.channel.id!=ready_id))
+                active=await _latest_active_hll_match_id()
+                if entered and active:
+                    await _set_late_join_queue(member.guild.id,member.id,True)
+                    log.info('[COMBAT QUEUED NEXT ROUND] guild=%s member=%s active_match=%s',member.guild.id,member.id,active)
+                elif exited:
+                    await _set_late_join_queue(member.guild.id,member.id,False)
+    except Exception:
+        log.exception('[COMBAT VOICE QUEUE FAILED] guild=%s member=%s',member.guild.id,member.id)
+
     # Official Training / Operation / Meeting duty-credit tracking.
     gid = member.guild.id
     if gid not in duty_channel_bindings:
@@ -6527,15 +6907,19 @@ async def progression_audit(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
     try:
-        result=await web.request('POST','/internal/clerk/progression/recheck',json={})
+        result=await web.request('POST','/internal/clerk/progression/recheck',json={'extended_audit':True})
         errors=int(result.get('error_count') or 0)
         await interaction.followup.send(
-            '**HLL PROGRESSION AUDIT**\n'
+            '**HLL / CAREER TRACKING AUDIT**\n'
             f"Soldiers checked: **{result.get('checked',0)}**\n"
+            f"Game identities linked: **{result.get('game_identity_linked',0)}** | Unlinked: **{result.get('game_identity_unlinked',0)}**\n"
+            f"Approved-member access ready: **{result.get('member_access_ready',0)} / {result.get('approved_personnel',0)}** | Missing: **{result.get('member_access_missing',0)}**\n"
             f"Readiness reconciled: **{result.get('readiness_rechecked',0)}**\n"
             f"MOS proficiency reconciled: **{result.get('mos_rechecked',0)}**\n"
             f"Ribbon records checked: **{result.get('ribbons_rechecked',0)}**\n"
             f"New automatic ribbons filed: **{result.get('ribbons_awarded',0)}**\n"
+            f"Jungle Trophy calculations checked: **{result.get('jungle_trophies_checked',0)}**\n"
+            f"Campaign Medal calculations checked: **{result.get('campaign_medals_checked',0)}**\n"
             f"Promotion worksheets checked: **{result.get('promotion_paths_rechecked',0)}**\n"
             f"Errors: **{errors}**",
             ephemeral=True)

@@ -319,8 +319,21 @@ def _role_label(role: Any, data: dict) -> str:
 
 
 class HLLVTelemetryCollector:
-    def __init__(self, data_collector):
+    def __init__(self, data_collector, *, server_slot: int = 1, telemetry_only: bool = False):
         self.collector = data_collector
+        self.server_slot = max(1, int(server_slot or 1))
+        self.telemetry_only = bool(telemetry_only)
+        suffix = "" if self.server_slot == 1 else f"_{self.server_slot}"
+        self.enabled = RCON_ENABLED if self.server_slot == 1 else _env_bool(f"HLL_RCON_ENABLED{suffix}", True)
+        self.host = os.getenv(f"HLL_RCON_HOST{suffix}", "").strip()
+        self.port = int(os.getenv(f"HLL_RCON_PORT{suffix}", str(RCON_PORT)) or RCON_PORT)
+        self.password = os.getenv(f"HLL_RCON_PASSWORD{suffix}", "")
+        # Server 1 keeps the established seeding behavior. Additional servers
+        # collect normal career telemetry by default without granting duplicate
+        # seeding credit unless explicitly enabled in Railway.
+        self.seeding_enabled = True if self.server_slot == 1 else _env_bool(f"HLL_RCON_SEEDING_ENABLED{suffix}", False)
+        self.server_key = f"server_{self.server_slot}"
+        self.health_id = self.server_slot
         self.db = data_collector.db
         self.rcon = None
         self.task: Optional[asyncio.Task] = None
@@ -338,7 +351,7 @@ class HLLVTelemetryCollector:
 
     @property
     def configured(self) -> bool:
-        return bool(RCON_ENABLED and RCON_HOST and RCON_PASSWORD and RCON_PORT)
+        return bool(self.enabled and self.host and self.password and self.port)
 
     async def ensure_schema(self):
         if not self.db.pool:
@@ -396,6 +409,8 @@ class HLLVTelemetryCollector:
             )
         """)
         await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_match_sessions_time ON hll_match_sessions(started_at DESC)")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS server_key TEXT")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_match_sessions_server_time ON hll_match_sessions(server_key,started_at DESC)")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS allied_faction_id TEXT")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS axis_faction_id TEXT")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS winner_side TEXT")
@@ -614,8 +629,33 @@ class HLLVTelemetryCollector:
         ):
             await self.db.execute(ddl)
         await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS hll_commander_match_ledger (
+                match_id BIGINT NOT NULL,
+                server_key TEXT NOT NULL DEFAULT 'server_1',
+                personnel_id TEXT NOT NULL,
+                commander_seconds INTEGER NOT NULL DEFAULT 0,
+                team_id TEXT,
+                team_side TEXT,
+                map_id TEXT,
+                map_name TEXT,
+                game_mode TEXT,
+                started_at TIMESTAMPTZ,
+                ended_at TIMESTAMPTZ,
+                allied_score INTEGER,
+                axis_score INTEGER,
+                winner_side TEXT,
+                result TEXT,
+                evidence_source TEXT,
+                verified_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(match_id,personnel_id)
+            )
+        """)
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_commander_ledger_personnel_time ON hll_commander_match_ledger(personnel_id,ended_at DESC)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_commander_ledger_server_match ON hll_commander_match_ledger(server_key,match_id)")
+        await self.db.execute("""
             CREATE TABLE IF NOT EXISTS hll_rcon_health (
-                id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id=1),
+                id INTEGER PRIMARY KEY DEFAULT 1,
                 enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 connected BOOLEAN NOT NULL DEFAULT FALSE,
                 host TEXT,
@@ -630,11 +670,15 @@ class HLLVTelemetryCollector:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # Legacy builds constrained this table to id=1. Remove that check so
+        # each official server can retain independent connection health.
+        await self.db.execute("ALTER TABLE hll_rcon_health DROP CONSTRAINT IF EXISTS hll_rcon_health_id_check")
+        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS server_key TEXT")
         await self.db.execute("""
-            INSERT INTO hll_rcon_health(id,enabled,connected,host,port)
-            VALUES(1,$1,FALSE,$2,$3)
-            ON CONFLICT(id) DO UPDATE SET enabled=EXCLUDED.enabled,host=EXCLUDED.host,port=EXCLUDED.port,updated_at=NOW()
-        """, bool(RCON_ENABLED), RCON_HOST or None, RCON_PORT)
+            INSERT INTO hll_rcon_health(id,enabled,connected,host,port,server_key)
+            VALUES($1,$2,FALSE,$3,$4,$5)
+            ON CONFLICT(id) DO UPDATE SET enabled=EXCLUDED.enabled,host=EXCLUDED.host,port=EXCLUDED.port,server_key=EXCLUDED.server_key,updated_at=NOW()
+        """, self.health_id, bool(self.enabled), self.host or None, self.port, self.server_key)
         log.info("[HLLV RCON SCHEMA READY]")
 
     async def start(self):
@@ -645,8 +689,13 @@ class HLLVTelemetryCollector:
             log.info("[HLL KILL ROUND BACKFILL] matches=%s players=%s rounds_applied=%s",credit.get("matches"),credit.get("players"),credit.get("rounds"))
         except Exception:
             log.exception("[HLL KILL ROUND BACKFILL FAILED]")
+        try:
+            commander=await self.reconcile_commander_match_ledger()
+            log.info("[HLL COMMANDER RETROACTIVE REPAIR] filed=%s verified=%s pending=%s",commander.get("filed"),commander.get("verified"),commander.get("pending"))
+        except Exception:
+            log.exception("[HLL COMMANDER RETROACTIVE REPAIR FAILED]")
         if not self.configured:
-            log.warning("[HLLV RCON DISABLED] enabled=%s host=%s password=%s", RCON_ENABLED, bool(RCON_HOST), bool(RCON_PASSWORD))
+            log.warning("[HLLV RCON DISABLED] slot=%s enabled=%s host=%s password=%s", self.server_slot, self.enabled, bool(self.host), bool(self.password))
             return False
         if self.task and not self.task.done():
             return True
@@ -658,10 +707,10 @@ class HLLVTelemetryCollector:
             log.exception("[HLLV RCON IMPORT FAILED]")
             await self._health(False, self.last_error)
             return False
-        self.rcon = HLLVRcon(host=RCON_HOST, port=RCON_PORT, password=RCON_PASSWORD)
+        self.rcon = HLLVRcon(host=self.host, port=self.port, password=self.password)
         self._stop.clear()
-        self.task = asyncio.create_task(self._run(), name="hllv-rcon-telemetry")
-        log.info("[HLLV RCON STARTED] host=%s port=%s interval=%ss", RCON_HOST, RCON_PORT, RCON_POLL_SECONDS)
+        self.task = asyncio.create_task(self._run(), name=f"hllv-rcon-telemetry-{self.server_slot}")
+        log.info("[HLLV RCON STARTED] slot=%s host=%s port=%s interval=%ss telemetry_only=%s", self.server_slot, self.host, self.port, RCON_POLL_SECONDS, self.telemetry_only)
         return True
 
     async def stop(self):
@@ -689,10 +738,10 @@ class HLLVTelemetryCollector:
                 last_error_at=CASE WHEN $1 THEN last_error_at ELSE $2 END,
                 last_error=CASE WHEN $1 THEN NULL ELSE $3 END,
                 last_server_name=$4,last_map_name=$5,last_game_mode=$6,last_player_count=$7,updated_at=NOW()
-            WHERE id=1
+            WHERE id=$8
         """, connected, now, error[:1000] if error else None,
              self.last_server.get("server_name"), self.last_server.get("map_name"),
-             self.last_server.get("game_mode"), int(self.last_players or 0))
+             self.last_server.get("game_mode"), int(self.last_players or 0), self.health_id)
 
     async def _run(self):
         while not self._stop.is_set():
@@ -741,10 +790,11 @@ class HLLVTelemetryCollector:
         match_id = await self._ensure_match(server)
         # Low-frequency recruiting broadcast is isolated from telemetry. A failed
         # message can never interrupt player stats, weapon logs, or service records.
-        try:
-            await self._run_recruiting_broadcast(match_id, server, players)
-        except Exception as exc:
-            log.warning("[HLLV RECRUITING BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
+        if not self.telemetry_only:
+            try:
+                await self._run_recruiting_broadcast(match_id, server, players)
+            except Exception as exc:
+                log.warning("[HLLV RECRUITING BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
         seeding_now = self._is_seeding_credit_window(len(players))
         seeding_credits=[]
         for player in players:
@@ -768,6 +818,8 @@ class HLLVTelemetryCollector:
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
 
     def _is_seeding_credit_window(self, player_count: int) -> bool:
+        if not self.seeding_enabled:
+            return False
         """Credit scheduled Eastern windows while population remains below 50."""
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         minutes=now_et.hour*60+now_et.minute
@@ -1072,6 +1124,82 @@ class HLLVTelemetryCollector:
         result["matches"]=len(seen)
         return result
 
+    @staticmethod
+    def _commander_side(value, allied_faction_id=None, axis_faction_id=None, map_id=None):
+        raw_value=str(value or '').strip()
+        if not raw_value:
+            return None
+        allied_id=str(allied_faction_id or '').strip(); axis_id=str(axis_faction_id or '').strip()
+        if allied_id and raw_value==allied_id: return 'ALLIED'
+        if axis_id and raw_value==axis_id: return 'AXIS'
+        raw=' '.join(raw_value.upper().replace('_',' ').replace('-',' ').split())
+        if raw in {'ALLIED','ALLIES','US','USA','US ARMY','UNITED STATES','SOUTHERN'} or 'US ARMY' in raw:
+            return 'ALLIED'
+        if raw in {'AXIS','NVA','VC','PAVN','NORTH VIETNAM','NORTHERN'} or 'NVA' in raw or 'NORTH VIETNAM' in raw:
+            return 'AXIS'
+        if str(map_id or '').upper().startswith('WDEV'):
+            if raw_value=='2': return 'ALLIED'
+            if raw_value=='1': return 'AXIS'
+        return None
+
+    async def reconcile_commander_match_ledger(self, match_id: int | None = None):
+        """File authoritative Commander appearances from retained Role 20 telemetry."""
+        params=[]; match_filter=''
+        if match_id is not None:
+            match_filter=' AND ms.id=$1'; params=[int(match_id)]
+        rows=await self.db.fetch("""SELECT ps.match_id,ps.personnel_id,ps.team_id,ps.role_seconds,
+                   ms.server_key,ms.map_id,ms.map_name,ms.game_mode,ms.started_at,ms.ended_at,
+                   ms.final_allied_score,ms.final_axis_score,ms.allied_faction_id,ms.axis_faction_id,ms.winner_side
+            FROM hll_player_match_stats ps JOIN hll_match_sessions ms ON ms.id=ps.match_id
+            WHERE ps.personnel_id IS NOT NULL AND ms.ended_at IS NOT NULL"""+match_filter+" ORDER BY ms.ended_at", *params)
+        result={'filed':0,'verified':0,'pending':0}
+        for r in rows:
+            role_seconds=_json_dict(r.get('role_seconds'))
+            commander_seconds=int(role_seconds.get('20',0) or 0)
+            if commander_seconds<=0:
+                continue
+            side=None; team_id=None; evidence='ROLE20_PLAYER_MATCH'
+            samples=await self.db.fetch("""SELECT team_id,COALESCE(SUM(connected_delta_seconds),0) seconds
+                FROM hll_research_samples WHERE match_id=$1 AND personnel_id=$2 AND role_id='20'
+                GROUP BY team_id ORDER BY seconds DESC""", int(r['match_id']), str(r['personnel_id']))
+            for sr in samples:
+                candidate=self._commander_side(sr.get('team_id'),r.get('allied_faction_id'),r.get('axis_faction_id'),r.get('map_id'))
+                if candidate:
+                    side=candidate; team_id=sr.get('team_id'); evidence='ROLE20_DOMINANT_SAMPLE'; break
+            if not side:
+                team_id=r.get('team_id')
+                side=self._commander_side(team_id,r.get('allied_faction_id'),r.get('axis_faction_id'),r.get('map_id'))
+            allied=int(r.get('final_allied_score') or 0); axis=int(r.get('final_axis_score') or 0)
+            winner=str(r.get('winner_side') or '').strip().upper()
+            if winner not in {'ALLIED','AXIS'} and allied!=axis and (allied>0 or axis>0):
+                winner='ALLIED' if allied>axis else 'AXIS'
+            res='UNVERIFIED'
+            if side in {'ALLIED','AXIS'} and winner in {'ALLIED','AXIS'}:
+                res='WIN' if side==winner else 'LOSS'
+            await self.db.execute("""INSERT INTO hll_commander_match_ledger(
+                match_id,server_key,personnel_id,commander_seconds,team_id,team_side,map_id,map_name,game_mode,
+                started_at,ended_at,allied_score,axis_score,winner_side,result,evidence_source,verified_at,updated_at)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                       CASE WHEN $15 IN ('WIN','LOSS') THEN NOW() ELSE NULL END,NOW())
+                ON CONFLICT(match_id,personnel_id) DO UPDATE SET
+                  server_key=EXCLUDED.server_key,commander_seconds=EXCLUDED.commander_seconds,
+                  team_id=COALESCE(EXCLUDED.team_id,hll_commander_match_ledger.team_id),
+                  team_side=COALESCE(EXCLUDED.team_side,hll_commander_match_ledger.team_side),
+                  map_id=EXCLUDED.map_id,map_name=EXCLUDED.map_name,game_mode=EXCLUDED.game_mode,
+                  started_at=EXCLUDED.started_at,ended_at=EXCLUDED.ended_at,
+                  allied_score=EXCLUDED.allied_score,axis_score=EXCLUDED.axis_score,
+                  winner_side=COALESCE(EXCLUDED.winner_side,hll_commander_match_ledger.winner_side),
+                  result=EXCLUDED.result,evidence_source=EXCLUDED.evidence_source,
+                  verified_at=CASE WHEN EXCLUDED.result IN ('WIN','LOSS') THEN COALESCE(hll_commander_match_ledger.verified_at,NOW()) ELSE hll_commander_match_ledger.verified_at END,
+                  updated_at=NOW()""",
+                int(r['match_id']),r.get('server_key') or self.server_key,str(r['personnel_id']),commander_seconds,
+                team_id,side,r.get('map_id'),r.get('map_name'),r.get('game_mode'),r.get('started_at'),r.get('ended_at'),
+                allied,axis,winner or None,res,evidence)
+            result['filed']+=1
+            if res in {'WIN','LOSS'}: result['verified']+=1
+            else: result['pending']+=1
+        return result
+
     def _server_payload(self, session: Any) -> dict:
         d = _dump_model(session)
         map_obj = getattr(session, "map", None)
@@ -1112,9 +1240,10 @@ class HLLVTelemetryCollector:
             resumed = await self.db.fetchrow("""SELECT id FROM hll_match_sessions
                 WHERE ended_at IS NULL AND COALESCE(map_id,'')=COALESCE($1,'')
                   AND COALESCE(game_mode,'')=COALESCE($2,'')
+                  AND COALESCE(server_key,'server_1')=$3
                   AND last_seen_at >= NOW() - INTERVAL '20 minutes'
                 ORDER BY last_seen_at DESC LIMIT 1""",
-                server.get('map_id'),server.get('game_mode'))
+                server.get('map_id'),server.get('game_mode'),self.server_key)
             if resumed:
                 self._active_match_id=int(resumed['id'])
                 self._active_match_signature=signature
@@ -1157,17 +1286,23 @@ class HLLVTelemetryCollector:
                 WHERE id=$1
             """, closed_match_id)
             try:
+                commander=await self.reconcile_commander_match_ledger(closed_match_id)
+                if commander.get("filed"):
+                    log.info("[HLL COMMANDER MATCH FILED] match=%s filed=%s verified=%s pending=%s",closed_match_id,commander.get("filed"),commander.get("verified"),commander.get("pending"))
+            except Exception:
+                log.exception("[HLL COMMANDER MATCH FILE FAILED] match=%s",closed_match_id)
+            try:
                 credit=await self.reconcile_kill_round_credits(closed_match_id)
                 if credit.get("rounds"):
                     log.info("[HLL KILL ROUND CREDIT] match=%s players=%s rounds=%s",closed_match_id,credit.get("players"),credit.get("rounds"))
             except Exception:
                 log.exception("[HLL KILL ROUND RECONCILE FAILED] match=%s",closed_match_id)
         row = await self.db.fetchrow("""
-            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id,final_allied_score,final_axis_score)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
+            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id,final_allied_score,final_axis_score,server_key)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id
         """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0),
              str(server.get('allied_faction_id') or '') or None,str(server.get('axis_faction_id') or '') or None,
-             int(server.get("allied_score") or 0),int(server.get("axis_score") or 0))
+             int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),self.server_key)
         self._active_match_id = int(row["id"])
         self._active_match_signature = signature
         log.info("[HLLV MATCH OPEN] id=%s map=%s mode=%s", self._active_match_id, server.get("map_name"), server.get("game_mode"))
@@ -1473,18 +1608,45 @@ class HLLVTelemetryCollector:
                 log.warning("[HLLV IDENTITY CLAIM] id=%s platform=%s error=%s", claim.get("id"), platform, exc)
                 await self.db.execute("UPDATE hll_identity_claims SET error=$1,updated_at=NOW() WHERE id=$2", str(exc)[:500], claim["id"])
 
+    async def _person_for_discord(self, guild_id: int, discord_user_id: int):
+        """Resolve an active Soldier for a Discord account and repair a missing member link when a Recruiting Case already proves the relationship."""
+        person = await self.db.fetchrow("""
+            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
+            FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text
+            WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2
+              AND p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE
+            LIMIT 1
+        """, str(guild_id), str(discord_user_id))
+        if person:
+            return person
+        recovered = await self.db.fetchrow("""
+            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
+            FROM recruiting_cases rc JOIN personnel p ON p.id::text=rc.personnel_id::text
+            WHERE rc.discord_user_id::text=$1
+              AND (rc.guild_id IS NULL OR rc.guild_id::text=$2)
+              AND p.separated_at IS NULL AND COALESCE(p.archived,FALSE)=FALSE
+            ORDER BY rc.updated_at DESC,rc.created_at DESC LIMIT 1
+        """, str(discord_user_id), str(guild_id))
+        if not recovered:
+            return None
+        try:
+            await self.db.execute("""
+                INSERT INTO website_member_links(guild_id,discord_user_id,personnel_id,linked_at)
+                VALUES($1,$2,$3,NOW())
+                ON CONFLICT(guild_id,discord_user_id) DO UPDATE
+                  SET personnel_id=EXCLUDED.personnel_id,linked_at=NOW()
+            """, str(guild_id), str(discord_user_id), str(recovered['personnel_id']))
+            log.warning('[DISCORD PERSONNEL LINK SELF-HEALED] guild=%s discord_user=%s personnel=%s',guild_id,discord_user_id,recovered['personnel_id'])
+        except Exception as exc:
+            log.warning('[DISCORD PERSONNEL LINK SELF-HEAL FAILED] guild=%s discord_user=%s error=%s',guild_id,discord_user_id,exc)
+        return recovered
+
     async def link_personnel(self, guild_id: int, discord_user_id: int, steam_id: str, linked_by: str) -> dict:
         await self.collector.start()
         steam_id = str(steam_id or "").strip()
         if not (steam_id.isdigit() and len(steam_id) == 17):
             return {"ok": False, "error": "SteamID64 must be exactly 17 digits."}
-        person = await self.db.fetchrow("""
-            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
-            FROM personnel p
-            JOIN website_member_links w ON w.personnel_id=p.id::text
-            WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2
-            LIMIT 1
-        """, str(guild_id), str(discord_user_id))
+        person = await self._person_for_discord(guild_id, discord_user_id)
         if not person:
             return {"ok": False, "error": "No active Soldier Record is linked to this Discord account."}
         try:
@@ -1517,11 +1679,7 @@ class HLLVTelemetryCollector:
             return {"ok": False, "error": "Platform must be Xbox or PlayStation 5."}
         if not gamertag:
             return {"ok": False, "error": "Enter the console gamertag / PSN Online ID."}
-        person = await self.db.fetchrow("""
-            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
-            FROM personnel p JOIN website_member_links w ON w.personnel_id=p.id::text
-            WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2 LIMIT 1
-        """, str(guild_id), str(discord_user_id))
+        person = await self._person_for_discord(guild_id, discord_user_id)
         if not person:
             return {"ok": False, "error": "No active Soldier Record is linked to that Discord account."}
         # HLLV platform labels vary slightly by RCON/client build. Match the
@@ -1595,13 +1753,7 @@ class HLLVTelemetryCollector:
         # The Soldier is valid but the console account has not appeared on the
         # server yet. File the same pending claim used by recruiting approval so
         # staff do not need to ask the member to run a command later.
-        person = await self.db.fetchrow("""
-            SELECT p.id::text AS personnel_id,p.rank_code,p.first_name,p.last_name
-            FROM personnel p
-            JOIN website_member_links w ON w.personnel_id=p.id::text
-            WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2
-            LIMIT 1
-        """, str(guild_id), str(discord_user_id))
+        person = await self._person_for_discord(guild_id, discord_user_id)
         if not person:
             return {"ok": False, "error": "No active Soldier Record is linked to that Discord account."}
 
