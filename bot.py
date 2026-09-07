@@ -4358,7 +4358,7 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
-# LIVE COMBAT ROSTER + AUTOMATIC VOICE/HLL PARTICIPATION ROUTING (V77)
+# LIVE COMBAT ROSTER + AUTOMATIC VOICE/HLL PARTICIPATION ROUTING (V86)
 # ---------------------------------------------------------------------------
 # Administrative website formations remain authoritative for personnel records.
 # This system creates a temporary combat roster from the Ready Room only.
@@ -4367,6 +4367,9 @@ MATCH_FORMATION_TANK_THRESHOLDS = (9, 18, 27)
 MATCH_FORMATION_HELI_THRESHOLDS = (13, 25, 37)
 COMBAT_ROSTER_MOVE_DELAY_SECONDS = 60
 COMBAT_AUTO_MOVE_MIN_PLAYERS = 7  # 6 or fewer stay together in the Ready Room
+# V86: Combat voice automation is intentionally anchored to one official server.
+# Server #2 continues feeding career telemetry but cannot start/end/cancel a Discord combat roster.
+COMBAT_ROSTER_SERVER_KEY = (os.getenv('COMBAT_ROSTER_SERVER_KEY', 'server_1').strip().lower() or 'server_1')
 COMBAT_ELEMENT_KEYS = tuple(
     [f'INFANTRY_{i}' for i in range(1,4)] +
     [f'TANK_{i}' for i in range(1,4)] +
@@ -4415,18 +4418,28 @@ async def ensure_match_formation_schema():
         )
     """)
 
-async def _latest_completed_hll_match_id():
+async def _latest_completed_hll_match_id(server_key: str = COMBAT_ROSTER_SERVER_KEY):
+    """Latest completed match on the combat-authoritative HLL server only.
+
+    V86 deliberately excludes Server #2 from Discord roster boundaries so a
+    secondary-server map change cannot return, cancel, or start voice routing.
+    """
     try:
-        row = await collector.db.fetchrow("SELECT id FROM hll_match_sessions WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+        row = await collector.db.fetchrow(
+            """SELECT id FROM hll_match_sessions
+               WHERE ended_at IS NOT NULL AND COALESCE(server_key,'server_1')=$1
+               ORDER BY id DESC LIMIT 1""", server_key)
         return int(row['id']) if row else None
     except Exception:
         return None
 
-async def _latest_active_hll_match_id():
+async def _latest_active_hll_match_id(server_key: str = COMBAT_ROSTER_SERVER_KEY):
+    """Latest live match on the combat-authoritative HLL server only."""
     try:
         row=await collector.db.fetchrow("""SELECT id FROM hll_match_sessions
             WHERE ended_at IS NULL AND last_seen_at >= NOW() - INTERVAL '3 minutes'
-            ORDER BY id DESC LIMIT 1""")
+              AND COALESCE(server_key,'server_1')=$1
+            ORDER BY id DESC LIMIT 1""", server_key)
         return int(row['id']) if row else None
     except Exception:
         return None
@@ -4435,8 +4448,8 @@ async def _active_or_latest_match_label(match_id: int | None):
     if not match_id:
         return None
     try:
-        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at
-            FROM hll_match_sessions WHERE id=$1""", int(match_id))
+        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at,server_key,server_name
+            FROM hll_match_sessions WHERE id=$1 AND COALESCE(server_key,'server_1')=$2""", int(match_id), COMBAT_ROSTER_SERVER_KEY)
         return dict(row) if row else None
     except Exception:
         return None
@@ -4892,7 +4905,70 @@ async def combat_status(interaction:discord.Interaction):
     count=len(_formation_members(ready)) if ready else 0
     queued=len(_late_join_queue(cfg))
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — '+COMBAT_ROSTER_SERVER_KEY.upper() if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+
+@bot.tree.command(name='combat-system-check', description='Diagnose why the automatic combat roster or voice routing is blocked.')
+async def combat_system_check(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.followup.send('**COMBAT SYSTEM CHECK — NOT CONFIGURED**\nRun `/combat-setup` first.',ephemeral=True); return
+    cfg=dict(row); guild=interaction.guild
+    ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=guild.get_channel(int(cfg.get('text_channel_id') or 0))
+    bindings=_combat_bindings(cfg)
+    bound=[]; missing=[]
+    for key in COMBAT_ELEMENT_KEYS:
+        ch=guild.get_channel(int(bindings.get(key) or 0))
+        (bound if isinstance(ch,(discord.VoiceChannel,discord.StageChannel)) else missing).append(key)
+    me=guild.me
+    guild_move=bool(me and me.guild_permissions.move_members)
+    ready_members=_formation_members(ready) if ready else []
+    active=await _latest_active_hll_match_id(); match_row=await _active_or_latest_match_label(active)
+    muster=None
+    if active and ready_members:
+        try: muster=await _live_ready_room_side_muster(active,ready_members)
+        except Exception: log.exception('[COMBAT SYSTEM CHECK MUSTER FAILED] guild=%s',guild.id)
+    us=len((muster or {}).get('US',[])); nva=len((muster or {}).get('NVA',[]))
+    linked_missing=len((muster or {}).get('NOT_LINKED',[])); not_live=len((muster or {}).get('NOT_IN_SERVER',[])); unknown_side=len((muster or {}).get('UNKNOWN_SIDE',[]))
+    eligible=max(us,nva)
+    side='US' if us>nva else ('NVA' if nva>us else None)
+    blockers=[]
+    if not cfg.get('enabled'): blockers.append('automation is OFF')
+    if not ready: blockers.append('Ready Room missing')
+    if not text: blockers.append('roster text channel missing')
+    if missing: blockers.append(f'{len(missing)} combat voice net(s) unbound')
+    if not guild_move: blockers.append('Battalion Clerk lacks Move Members permission')
+    if not active: blockers.append(f'no live match detected on {COMBAT_ROSTER_SERVER_KEY}')
+    if active and len(ready_members)<MATCH_FORMATION_MIN_PLAYERS: blockers.append(f'only {len(ready_members)} member(s) in Ready Room; 6 required')
+    if active and len(ready_members)>=MATCH_FORMATION_MIN_PLAYERS and eligible<MATCH_FORMATION_MIN_PLAYERS:
+        blockers.append(f'only {eligible} eligible linked member(s) on one HLL side; 6 required')
+    if active and us==nva and us>0: blockers.append(f'side is tied U.S. {us} / NVA {nva}; no majority side')
+    if eligible==6: blockers.append('6-player hold is active; roster can post but automatic voice movement starts at 7+')
+    state='READY' if not blockers else 'BLOCKED'
+    label='None'
+    if match_row:
+        label=f"{match_row.get('map_name') or match_row.get('map_id') or 'Unknown map'} • {match_row.get('game_mode') or 'Unknown mode'} • Match {active}"
+    details=(
+        f"**COMBAT SYSTEM CHECK — {state}**\n"
+        f"Combat server: **{COMBAT_ROSTER_SERVER_KEY.upper()}**\n"
+        f"Automation: **{'ON' if cfg.get('enabled') else 'OFF'}**\n"
+        f"Ready Room: {ready.mention if ready else '**MISSING**'}\n"
+        f"Roster channel: {text.mention if text else '**MISSING**'}\n"
+        f"Voice nets bound: **{len(bound)}/9**\n"
+        f"Move Members permission: **{'YES' if guild_move else 'NO'}**\n"
+        f"Active combat-server match: **{label}**\n"
+        f"Ready Room members: **{len(ready_members)}**\n"
+        f"Detected U.S.: **{us}** | NVA: **{nva}**\n"
+        f"Not game-linked: **{linked_missing}** | Linked but not live: **{not_live}** | Side unresolved: **{unknown_side}**\n"
+        f"Eligible majority side: **{side or 'NONE'} ({eligible})**\n"
+    )
+    if blockers:
+        details += '\n**WHY IT IS BLOCKED**\n' + '\n'.join(f'• {x}' for x in blockers[:10])
+    else:
+        details += f'\n**ROUTING READY** — next eligible new {COMBAT_ROSTER_SERVER_KEY.upper()} round can file a roster; automatic voice movement begins at 7+ eligible members.'
+    await interaction.followup.send(details[:1900],ephemeral=True)
 
 @bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
 async def combat_generate(interaction:discord.Interaction):
