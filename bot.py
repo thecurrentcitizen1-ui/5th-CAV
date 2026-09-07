@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 log = logging.getLogger('battalion-clerk')
 
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN = (os.getenv('DISCORD_TOKEN') or os.getenv('DISCORD_BOT_TOKEN') or os.getenv('BOT_TOKEN'))
 GUILD_ID = int(os.getenv('GUILD_ID', '0') or 0)
 TEST_GUILD_ID = int(os.getenv('TEST_GUILD_ID', '0') or 0)
 COMMAND_GUILD_ID = TEST_GUILD_ID or GUILD_ID
@@ -4402,6 +4402,10 @@ async def ensure_match_formation_schema():
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_deferred_match_id BIGINT",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS voice_presence_required BOOLEAN NOT NULL DEFAULT TRUE",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS late_join_queue_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_since TIMESTAMPTZ",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_last_attempt_at TIMESTAMPTZ",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_last_error TEXT",
     ):
         await collector.db.execute(ddl)
     await collector.db.execute("""
@@ -4766,10 +4770,12 @@ async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
 
 @tasks.loop(seconds=15)
 async def match_formation_watch():
-    """Return at round end and route only at a newly observed match boundary.
+    """Server #1 combat roster watcher with retry-safe pending match handling.
 
-    If V75 is enabled/deployed while a round is already active, that round is
-    baselined and never routed mid-game. The next round is eligible.
+    V87 fixes the one-shot failure mode: observing a new match no longer marks it
+    processed before a roster is actually filed.  A live match remains pending
+    and is retried every watcher cycle until enough verified Ready Room members
+    and faction telemetry are available, the roster succeeds, or the match ends.
     """
     if not bot.is_ready(): return
     try:
@@ -4783,12 +4789,16 @@ async def match_formation_watch():
             if not guild: continue
             match_formation_busy.add(gid)
             try:
+                # Preserve the existing mid-round activation safety guard. This
+                # only baselines once when automation is newly enabled/configured.
                 if row.get('activation_baseline_match_id') is None:
                     baseline=int(latest_active or latest_done or 0)
                     await collector.db.execute("""UPDATE clerk_match_formation_config
                         SET activation_baseline_match_id=$2,
                             last_started_match_id=CASE WHEN $3::bigint IS NOT NULL THEN GREATEST(COALESCE(last_started_match_id,0),$3) ELSE last_started_match_id END,
-                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,updated_at=NOW()
+                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,
+                            pending_match_id=NULL,pending_since=NULL,pending_last_attempt_at=NULL,pending_last_error=NULL,
+                            updated_at=NOW()
                         WHERE guild_id=$1""",gid,baseline,latest_active)
                     if latest_active:
                         log.info('[COMBAT ROSTER DEFERRED] guild=%s active_match=%s reason=activated during live round',gid,latest_active)
@@ -4797,27 +4807,87 @@ async def match_formation_watch():
                 returned=int(row.get('last_returned_match_id') or 0)
                 if latest_done and latest_done>returned:
                     result=await _return_combat_members(guild,row)
-                    await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,late_join_queue_json='[]'::jsonb,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_returned_match_id=$2,late_join_queue_json='[]'::jsonb,
+                            pending_match_id=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_match_id END,
+                            pending_since=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_since END,
+                            pending_last_attempt_at=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_last_attempt_at END,
+                            pending_last_error=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_last_error END,
+                            updated_at=NOW() WHERE guild_id=$1""",gid,latest_done)
                     log.info('[COMBAT RETURN] guild=%s match=%s moved=%s failures=%s',gid,latest_done,result['moved'],len(result['failures']))
                     row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
 
-                started=int(row.get('last_started_match_id') or 0)
-                if latest_active and latest_active>started:
-                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
-                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0)); count=len(_formation_members(ready)) if ready else 0
-                    if count < MATCH_FORMATION_MIN_PLAYERS:
-                        log.info('[COMBAT ROSTER SKIP] guild=%s match=%s players=%s (<6)',gid,latest_active,count)
-                    else:
-                        await asyncio.sleep(12)
-                        if await _latest_active_hll_match_id() != latest_active:
-                            log.info('[COMBAT ROSTER ABORT] guild=%s match changed during telemetry settle',gid); continue
-                        result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
-                        if result.get('ok'):
-                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
-                        else:
-                            log.warning('[COMBAT ROSTER NOT ROUTED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
-            except Exception:
+                processed=int(row.get('last_processed_match_id') or 0)
+                pending=int(row.get('pending_match_id') or 0)
+
+                # No live Server #1 match: clear stale pending state. The next
+                # observed live match will become a fresh pending candidate.
+                if not latest_active:
+                    if pending:
+                        await collector.db.execute("""UPDATE clerk_match_formation_config
+                            SET pending_match_id=NULL,pending_since=NULL,pending_last_attempt_at=NULL,pending_last_error=NULL,updated_at=NOW()
+                            WHERE guild_id=$1""",gid)
+                    continue
+
+                # A new live match becomes PENDING, not processed. last_started
+                # records observation only and is no longer used as the success gate.
+                if latest_active>processed and pending != latest_active:
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_started_match_id=GREATEST(COALESCE(last_started_match_id,0),$2),
+                            pending_match_id=$2,pending_since=NOW(),pending_last_attempt_at=NULL,
+                            pending_last_error='Waiting for Ready Room / HLL telemetry',updated_at=NOW()
+                        WHERE guild_id=$1""",gid,latest_active)
+                    log.info('[COMBAT ROSTER PENDING] guild=%s match=%s',gid,latest_active)
+                    row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
+                    pending=latest_active
+
+                # Nothing to do if this live match has already filed successfully.
+                if latest_active<=processed or pending != latest_active:
+                    continue
+
+                ready=guild.get_channel(int(row.get('voice_channel_id') or 0))
+                count=len(_formation_members(ready)) if ready else 0
+                if count < MATCH_FORMATION_MIN_PLAYERS:
+                    reason=f'Waiting for Ready Room: {count}/6 member(s) present'
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                        WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,reason)
+                    log.info('[COMBAT ROSTER RETRY] guild=%s match=%s reason=%s',gid,latest_active,reason)
+                    continue
+
+                # Retry on every 15-second watcher pass. There is no one-time
+                # 12-second window anymore; the publish function itself validates
+                # live HLL participation and faction evidence on each attempt.
+                await collector.db.execute("""UPDATE clerk_match_formation_config
+                    SET pending_last_attempt_at=NOW(),pending_last_error='Checking live HLL telemetry',updated_at=NOW()
+                    WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active)
+
+                if await _latest_active_hll_match_id() != latest_active:
+                    log.info('[COMBAT ROSTER RETRY] guild=%s match=%s reason=match changed before attempt',gid,latest_active)
+                    continue
+
+                result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
+                if result.get('ok'):
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_processed_match_id=$2,pending_match_id=NULL,pending_since=NULL,
+                            pending_last_attempt_at=NULL,pending_last_error=NULL,updated_at=NOW()
+                        WHERE guild_id=$1""",gid,latest_active)
+                    log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
+                else:
+                    reason=str(result.get('error') or 'Roster prerequisites are not ready yet')[:500]
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                        WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,reason)
+                    log.warning('[COMBAT ROSTER RETRY] guild=%s match=%s error=%s',gid,latest_active,reason)
+            except Exception as exc:
                 log.exception('[COMBAT ROSTER WATCH FAILED] guild=%s',gid)
+                try:
+                    if latest_active:
+                        await collector.db.execute("""UPDATE clerk_match_formation_config
+                            SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                            WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,f'Watcher error: {str(exc)[:420]}')
+                except Exception:
+                    pass
             finally:
                 match_formation_busy.discard(gid)
     except Exception:
@@ -4904,8 +4974,10 @@ async def combat_status(interaction:discord.Interaction):
         lines.append(f"• **{key.replace('_',' ').title()}** → {ch.mention if ch else 'NOT ASSIGNED'}")
     count=len(_formation_members(ready)) if ready else 0
     queued=len(_late_join_queue(cfg))
+    pending_id=cfg.get('pending_match_id'); pending_error=cfg.get('pending_last_error')
+    pending_line=f"Match {pending_id} — {pending_error or 'waiting to retry'}" if pending_id else 'NONE'
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — '+COMBAT_ROSTER_SERVER_KEY.upper() if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — '+COMBAT_ROSTER_SERVER_KEY.upper() if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRetry-safe pending roster: **{pending_line}**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
 
 @bot.tree.command(name='combat-system-check', description='Diagnose why the automatic combat roster or voice routing is blocked.')
 async def combat_system_check(interaction:discord.Interaction):
@@ -4916,6 +4988,7 @@ async def combat_system_check(interaction:discord.Interaction):
     if not row:
         await interaction.followup.send('**COMBAT SYSTEM CHECK — NOT CONFIGURED**\nRun `/combat-setup` first.',ephemeral=True); return
     cfg=dict(row); guild=interaction.guild
+    pending_id=cfg.get('pending_match_id'); pending_error=cfg.get('pending_last_error')
     ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=guild.get_channel(int(cfg.get('text_channel_id') or 0))
     bindings=_combat_bindings(cfg)
     bound=[]; missing=[]
@@ -4959,6 +5032,8 @@ async def combat_system_check(interaction:discord.Interaction):
         f"Voice nets bound: **{len(bound)}/9**\n"
         f"Move Members permission: **{'YES' if guild_move else 'NO'}**\n"
         f"Active combat-server match: **{label}**\n"
+        f"Pending auto-roster: **{('Match '+str(pending_id)) if pending_id else 'NONE'}**\n"
+        f"Pending reason: **{pending_error or '—'}**\n"
         f"Ready Room members: **{len(ready_members)}**\n"
         f"Detected U.S.: **{us}** | NVA: **{nva}**\n"
         f"Not game-linked: **{linked_missing}** | Linked but not live: **{not_live}** | Side unresolved: **{unknown_side}**\n"
@@ -7632,7 +7707,7 @@ async def hll_stats(interaction:discord.Interaction):
         f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)
 
 if not TOKEN:
-    raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables.')
+    raise RuntimeError('Discord bot token is not set. Add DISCORD_TOKEN in Railway Variables (DISCORD_BOT_TOKEN or BOT_TOKEN are also accepted).')
 
 if not WEBSITE_BASE_URL:
     log.warning('WEBSITE_BASE_URL is not set; duty commands will fail until it is configured.')
