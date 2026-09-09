@@ -90,3 +90,16 @@ Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with 
 - No self-commendations; same giver/recipient/category is limited to once per 24 hours; maximum five commendations per giver per day.
 - Commendations are recognition only and do not directly grant promotion points or ribbons.
 - V37 reliability fix: `/commend` no longer runs schema/backfill DDL inside the Discord interaction; database work is timeout-bounded and always resolves the deferred response instead of hanging on Thinking.
+
+## V91 — Server Watch Intelligence
+Server Watch now includes short-lived public-player movement trails and a Spawn-Hunt / Movement Analysis section in Server Admin DMs for both official HLL: Vietnam servers. Movement evidence is behavioral only unless the game exposes actual Garrison/Outpost coordinates; no automatic punishment is performed.
+
+
+## V92 — Server Watch shared case channel
+- Server Watch alerts continue to DM every non-bot member holding the exact `Server Admin` role.
+- The identical alert embed is also posted to a shared Discord text channel for team visibility and case history.
+- Preferred routing: `SERVER_WATCH_CHANNEL_ID`; fallback: channel name `server-watch` via `SERVER_WATCH_CHANNEL_NAME`.
+- `/server-watch-status` now reports whether the shared channel is found.
+- `/server-watch-test` tests both DM delivery and the shared channel post.
+- Server 1 and Server 2 alerts use the same channel, while each alert clearly identifies its source server.
+- No automatic kick/ban behavior was added.

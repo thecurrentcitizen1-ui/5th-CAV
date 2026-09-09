@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 log = logging.getLogger('battalion-clerk')
 
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN = (os.getenv('DISCORD_TOKEN') or os.getenv('DISCORD_BOT_TOKEN') or os.getenv('BOT_TOKEN'))
 GUILD_ID = int(os.getenv('GUILD_ID', '0') or 0)
 TEST_GUILD_ID = int(os.getenv('TEST_GUILD_ID', '0') or 0)
 COMMAND_GUILD_ID = TEST_GUILD_ID or GUILD_ID
@@ -43,8 +43,29 @@ WEBSITE_STATUS_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_STATUS_CHECK_DAYS','14
 WEBSITE_NEVER_LOGIN_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_NEVER_LOGIN_CHECK_DAYS','3') or 3))
 WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_REPEAT_DAYS','30') or 30))
 GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or 3))
+APPLICATION_REMINDER_DAYS = max(1, int(os.getenv('APPLICATION_REMINDER_DAYS','3') or 3))
 NEW_ARRIVAL_ROLE_NAME = os.getenv('NEW_ARRIVAL_ROLE_NAME', 'NEW ARRIVAL').strip() or 'NEW ARRIVAL'
 NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
+
+
+# Server Watch — suspicious-player telemetry alerts. Human review only; this
+# subsystem never kicks, bans, punishes, or publicly labels a player as a cheater.
+SERVER_ADMIN_ROLE_NAME = os.getenv('SERVER_ADMIN_ROLE_NAME', 'Server Admin').strip() or 'Server Admin'
+SERVER_WATCH_ENABLED = str(os.getenv('SERVER_WATCH_ENABLED', 'true')).strip().lower() in {'1','true','yes','on','enabled'}
+SERVER_WATCH_INTERVAL_SECONDS = max(15, int(os.getenv('SERVER_WATCH_INTERVAL_SECONDS', '30') or 30))
+SERVER_WATCH_MIN_CONNECTED_SECONDS = max(300, int(os.getenv('SERVER_WATCH_MIN_CONNECTED_SECONDS', '600') or 600))
+SERVER_WATCH_MIN_KILLS = max(10, int(os.getenv('SERVER_WATCH_MIN_KILLS', '25') or 25))
+SERVER_WATCH_KPM = max(0.5, float(os.getenv('SERVER_WATCH_KPM', '1.75') or 1.75))
+SERVER_WATCH_HIGH_KD = max(2.0, float(os.getenv('SERVER_WATCH_HIGH_KD', '8.0') or 8.0))
+SERVER_WATCH_ZERO_DEATH_KILLS = max(15, int(os.getenv('SERVER_WATCH_ZERO_DEATH_KILLS', '30') or 30))
+SERVER_WATCH_BURST_2M = max(6, int(os.getenv('SERVER_WATCH_BURST_2M', '10') or 10))
+SERVER_WATCH_BURST_5M = max(10, int(os.getenv('SERVER_WATCH_BURST_5M', '18') or 18))
+SERVER_WATCH_REPEAT_MINUTES = max(5, int(os.getenv('SERVER_WATCH_REPEAT_MINUTES', '15') or 15))
+SERVER_WATCH_POSITION_HISTORY_MINUTES = max(3, int(os.getenv('SERVER_WATCH_POSITION_HISTORY_MINUTES', '10') or 10))
+SERVER_WATCH_DIRECT_ROUTE_RATIO = max(0.60, min(1.0, float(os.getenv('SERVER_WATCH_DIRECT_ROUTE_RATIO', '0.88') or 0.88)))
+SERVER_WATCH_DIRECT_ROUTE_MIN_METERS = max(150.0, float(os.getenv('SERVER_WATCH_DIRECT_ROUTE_MIN_METERS', '400') or 400))
+SERVER_WATCH_CHANNEL_ID = int(os.getenv('SERVER_WATCH_CHANNEL_ID', '0') or 0)
+SERVER_WATCH_CHANNEL_NAME = os.getenv('SERVER_WATCH_CHANNEL_NAME', 'server-watch').strip() or 'server-watch'
 
 # Canonical public publication channels. Stored Command routes always win; these
 # are regression-safe fallbacks so a lost/missing route cannot silently stop
@@ -3591,6 +3612,107 @@ async def canonical_role_sync_watch():
         except Exception as exc:
             log.warning('[CANONICAL ROLE SYNC WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
+
+async def ensure_application_reminder_table():
+    """Persist the recurring no-application reminder clock across bot restarts."""
+    await collector.start()
+    db=collector.db
+    if not db.pool:
+        return
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS clerk_application_reminders (
+            guild_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            last_sent_at TIMESTAMPTZ,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (guild_id, discord_user_id)
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_clerk_application_reminders_sent ON clerk_application_reminders(guild_id,last_sent_at)")
+
+
+@tasks.loop(hours=1)
+async def application_reminder_watch():
+    """DM Discord-only prospects every three days until a Recruiting Case exists."""
+    await collector.start()
+    db=collector.db
+    if not db.pool:
+        return
+    await ensure_application_reminder_table()
+    cutoff=datetime.now(timezone.utc)-timedelta(days=APPLICATION_REMINDER_DAYS)
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            rows=await db.fetch("""
+                SELECT dm.discord_user_id::text AS discord_user_id,
+                       dm.username,dm.display_name,dm.joined_at,dm.updated_at,
+                       r.last_sent_at
+                  FROM discord_members dm
+             LEFT JOIN clerk_application_reminders r
+                    ON r.guild_id=$1 AND r.discord_user_id=dm.discord_user_id::text
+                 WHERE dm.guild_id::text=$1
+                   AND COALESCE(dm.active,TRUE)=TRUE
+                   AND COALESCE(dm.is_bot,FALSE)=FALSE
+                   AND COALESCE(dm.joined_at,dm.updated_at) <= NOW() - ($2::int * INTERVAL '1 day')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM website_member_links w
+                        WHERE w.guild_id::text=dm.guild_id::text
+                          AND w.discord_user_id::text=dm.discord_user_id::text
+                          AND w.personnel_id IS NOT NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM recruiting_cases rc
+                        WHERE rc.discord_user_id::text=dm.discord_user_id::text
+                          AND (rc.guild_id IS NULL OR rc.guild_id::text=dm.guild_id::text)
+                   )
+                   AND (r.last_sent_at IS NULL OR r.last_sent_at <= $3)
+                 ORDER BY COALESCE(dm.joined_at,dm.updated_at)
+                 LIMIT 100
+            """,str(guild.id),APPLICATION_REMINDER_DAYS,cutoff)
+            for row in rows:
+                uid=str(row.get('discord_user_id') or '')
+                if not uid.isdigit():
+                    continue
+                member=await _fetch_guild_member(guild,int(uid))
+                if not member or member.bot:
+                    continue
+                site=(f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else None)
+                message=(
+                    "**1/5 CAV — APPLICATION REMINDER**\n\n"
+                    "You are in the 5th Cav Discord, but Battalion Clerk does not have a completed Recruiting Case linked to you yet. "
+                    "If you already started the Discord intake, running **`/apply`** again will resume it where you left off.\n\n"
+                    "**COMPLETE YOUR APPLICATION**\n"
+                    "• Run **`/apply`** here in Discord for the short in-Discord intake.\n"
+                    + (f"• Or use the website application: **{site}**\n" if site else "") +
+                    "\nThere are **no mandatory schedules, no mandatory trainings, and no forced permanent role**. "
+                    "Once your application is filed, these reminders stop automatically."
+                )
+                try:
+                    await member.send(message)
+                except discord.Forbidden:
+                    log.info('[APPLICATION REMINDER DM BLOCKED] guild=%s member=%s',guild.id,member.id)
+                    continue
+                except Exception as exc:
+                    log.warning('[APPLICATION REMINDER DM FAILED] guild=%s member=%s error=%s',guild.id,member.id,exc)
+                    continue
+                await db.execute("""
+                    INSERT INTO clerk_application_reminders(guild_id,discord_user_id,last_sent_at,sent_count,updated_at)
+                    VALUES($1,$2,NOW(),1,NOW())
+                    ON CONFLICT(guild_id,discord_user_id) DO UPDATE SET
+                        last_sent_at=NOW(),sent_count=clerk_application_reminders.sent_count+1,updated_at=NOW()
+                """,str(guild.id),uid)
+                log.info('[APPLICATION REMINDER SENT] guild=%s member=%s',guild.id,member.id)
+        except Exception as exc:
+            log.warning('[APPLICATION REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@application_reminder_watch.before_loop
+async def before_application_reminder_watch():
+    await bot.wait_until_ready()
+
+
 async def ensure_game_link_reminder_table():
     """Persist the 72-hour game-identity reminder clock across bot restarts."""
     await collector.start()
@@ -3961,101 +4083,146 @@ async def before_operation_lifecycle_review_watch():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name='weekly-battalion-report-channel', description='Set the channel for the automatic weekly battalion manpower/accountability report.')
+async def _ensure_battalionbrief_config_table():
+    await collector.start(); db=collector.db
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_battalionbrief_config(
+        guild_id TEXT PRIMARY KEY,channel_id TEXT,enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        weekday INTEGER NOT NULL DEFAULT 6,hour INTEGER NOT NULL DEFAULT 19,minute INTEGER NOT NULL DEFAULT 0,
+        mention_role_id TEXT,include_fund BOOLEAN NOT NULL DEFAULT TRUE,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+
+async def _brief_config(guild_id:int):
+    await _ensure_battalionbrief_config_table(); db=collector.db
+    row=await db.fetchrow('SELECT * FROM clerk_battalionbrief_config WHERE guild_id=$1',str(guild_id))
+    return dict(row) if row else None
+
+async def _save_brief_config(guild_id:int,*,channel_id=None,enabled=None,weekday=None,hour=None,minute=None,mention_role_id=None,include_fund=None):
+    await _ensure_battalionbrief_config_table(); db=collector.db
+    current=await _brief_config(guild_id) or {}
+    values={'channel_id':str(channel_id or current.get('channel_id') or ''),'enabled':bool(current.get('enabled',True) if enabled is None else enabled),
+            'weekday':int(current.get('weekday',6) if weekday is None else weekday),'hour':int(current.get('hour',19) if hour is None else hour),
+            'minute':int(current.get('minute',0) if minute is None else minute),'mention_role_id':str(mention_role_id or current.get('mention_role_id') or '') or None,
+            'include_fund':bool(current.get('include_fund',True) if include_fund is None else include_fund)}
+    await db.execute("""INSERT INTO clerk_battalionbrief_config(guild_id,channel_id,enabled,weekday,hour,minute,mention_role_id,include_fund,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT(guild_id) DO UPDATE SET channel_id=EXCLUDED.channel_id,
+        enabled=EXCLUDED.enabled,weekday=EXCLUDED.weekday,hour=EXCLUDED.hour,minute=EXCLUDED.minute,
+        mention_role_id=EXCLUDED.mention_role_id,include_fund=EXCLUDED.include_fund,updated_at=NOW()""",
+        str(guild_id),values['channel_id'],values['enabled'],values['weekday'],values['hour'],values['minute'],values['mention_role_id'],values['include_fund'])
+    return values
+
+BRIEF_DAY_CHOICES=[app_commands.Choice(name=n,value=str(i)) for i,n in enumerate(['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'])]
+
+async def _build_battalion_brief(guild:discord.Guild,include_fund=True):
+    data=await web.request('GET','/internal/clerk/reports/weekly-battalion')
+    w=data.get('weekly') or {}; notable=data.get('notable') or []
+    try: tz=ZoneInfo(BATTALION_TIMEZONE)
+    except Exception: tz=ZoneInfo('America/New_York')
+    now=datetime.now(tz); week_end=now.strftime('%d %b %Y').upper()
+    lines=[f"**1/5 CAV — WEEKLY BATTALION BRIEF**",f"**WEEK ENDING: {week_end}**",'',
+           '**PERSONNEL**',f"• New replacements: **{w.get('new_members',0)}**",f"• Promotions/orders: **{w.get('promotions',0)}**",'',
+           '**RECOGNITION**',f"• Awards: **{w.get('awards',0)}**",f"• Ribbons earned: **{w.get('ribbons',0)}**",f"• Campaign medals: **{w.get('campaign_medals',0)}**",'',
+           '**IN THE FIELD**',f"• Members with verified HLL activity: **{w.get('players',0)}**",f"• Combined verified server time: **{w.get('server_hours',0)} hours**",f"• Completed match records: **{w.get('operations',0)}**",'',
+           '**RECRUITING**',f"• Applications: **{w.get('applications',0)}**",f"• Accepted/converted: **{w.get('accepted',0)}**",f"• Recruits credited to members: **{w.get('recruits_credited',0)}**",'',
+           '**TRAINING / UPCOMING**',f"• Training events this week: **{w.get('training_events',0)}**"]
+    upcoming=w.get('upcoming') or []
+    if upcoming:
+        for e in upcoming[:2]: lines.append(f"• Upcoming: **{e.get('title') or 'Battalion event'}**")
+    else: lines.append('• No upcoming event currently filed.')
+    fund=w.get('fund') or {}
+    if include_fund and fund:
+        lines += ['', '**BATTALION FUND**', f"• Current balance: **${float(fund.get('balance',0)):,.2f}**", f"• Monthly goal: **${float(fund.get('monthly_goal',0)):,.2f}**", f"• Contributions this month: **${float(fund.get('month_contributions',0)):,.2f}**"]
+    if notable:
+        lines += ['', '**FROM THE FIELD**']
+        for n in notable[:4]: lines.append(f"• **{n.get('name','Soldier')}** — {n.get('detail','milestone reached')}")
+    lines += ['', '**KEEP MOVING. CHARLIE WON’T WAIT.**']
+    return '\n'.join(lines)[:3950]
+
+battalionbrief_group = app_commands.Group(name='battalionbrief', description='Weekly Battalion Brief controls.')
+bot.tree.add_command(battalionbrief_group)
+
+@battalionbrief_group.command(name='setup', description='Configure the automatic Weekly Battalion Brief channel and schedule.')
+@app_commands.describe(channel='Channel where the weekly brief posts',day='Day of week',hour='24-hour battalion time (0-23)',mention_role='Optional role to mention',include_fund='Include Battalion Fund figures')
+@app_commands.choices(day=BRIEF_DAY_CHOICES)
+async def battalionbrief_setup(interaction:discord.Interaction,channel:discord.TextChannel,day:app_commands.Choice[str],hour:app_commands.Range[int,0,23]=19,mention_role:Optional[discord.Role]=None,include_fund:bool=True):
+    if not await require_manage_guild(interaction): return
+    cfg=await _save_brief_config(interaction.guild_id,channel_id=channel.id,enabled=True,weekday=int(day.value),hour=int(hour),minute=0,mention_role_id=mention_role.id if mention_role else None,include_fund=include_fund)
+    await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
+    await interaction.response.send_message(f"**WEEKLY BATTALION BRIEF — CONFIGURED**\nChannel: {channel.mention}\nSchedule: {day.name} at {int(hour):02d}:00 ({BATTALION_TIMEZONE})\nAutomatic posting: **ON**\nBattalion Fund: **{'INCLUDED' if include_fund else 'HIDDEN'}**",ephemeral=True)
+
+@battalionbrief_group.command(name='status', description='Show the Weekly Battalion Brief channel, schedule, and enabled state.')
+async def battalionbrief_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    cfg=await _brief_config(interaction.guild_id)
+    if not cfg: await interaction.response.send_message('Weekly Battalion Brief is not configured. Run `/battalionbrief-setup`.',ephemeral=True); return
+    ch=interaction.guild.get_channel(int(cfg.get('channel_id') or 0)); role=interaction.guild.get_role(int(cfg.get('mention_role_id') or 0)) if cfg.get('mention_role_id') else None
+    day=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][int(cfg.get('weekday') or 0)]
+    await interaction.response.send_message(f"**WEEKLY BATTALION BRIEF**\nChannel: {ch.mention if ch else 'MISSING'}\nSchedule: {day} {int(cfg.get('hour') or 0):02d}:{int(cfg.get('minute') or 0):02d} ({BATTALION_TIMEZONE})\nAutomatic posting: **{'ON' if cfg.get('enabled') else 'OFF'}**\nMention: {role.mention if role else 'None'}\nBattalion Fund: **{'INCLUDED' if cfg.get('include_fund') else 'HIDDEN'}**",ephemeral=True)
+
+@battalionbrief_group.command(name='preview', description='Preview the current Weekly Battalion Brief without posting it.')
+async def battalionbrief_preview(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    cfg=await _brief_config(interaction.guild_id) or {}
+    body=await _build_battalion_brief(interaction.guild,bool(cfg.get('include_fund',True)))
+    await interaction.followup.send(body,ephemeral=True)
+
+@battalionbrief_group.command(name='post', description='Post the current Weekly Battalion Brief now.')
+async def battalionbrief_post(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    cfg=await _brief_config(interaction.guild_id)
+    ch=interaction.guild.get_channel(int((cfg or {}).get('channel_id') or 0)) if cfg else None
+    if not isinstance(ch,discord.TextChannel):
+        ch=await get_report_channel(interaction.guild,'WEEKLY_BATTALION_REPORT')
+    if not ch: await interaction.followup.send('No Battalion Brief channel is configured. Run `/battalionbrief-setup`.',ephemeral=True); return
+    body=await _build_battalion_brief(interaction.guild,bool((cfg or {}).get('include_fund',True)))
+    role=interaction.guild.get_role(int((cfg or {}).get('mention_role_id') or 0)) if (cfg or {}).get('mention_role_id') else None
+    await ch.send(((role.mention+'\n') if role else '')+body)
+    await interaction.followup.send(f'Weekly Battalion Brief posted to {ch.mention}.',ephemeral=True)
+
+@battalionbrief_group.command(name='off', description='Turn off automatic Weekly Battalion Brief posting without deleting its setup.')
+async def battalionbrief_off(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await _save_brief_config(interaction.guild_id,enabled=False)
+    await interaction.response.send_message('Automatic Weekly Battalion Brief posting is **OFF**. Configuration is preserved.',ephemeral=True)
+
+@bot.tree.command(name='weekly-battalion-report-channel', description='Legacy alias: set the Weekly Battalion Brief channel.')
 async def weekly_battalion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
     await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
-    await interaction.response.send_message(
-        f'Weekly Battalion Reports will be posted to {channel.mention} on Sunday evening (battalion time).',
-        ephemeral=True
-    )
-
-
+    await _save_brief_config(interaction.guild_id,channel_id=channel.id,enabled=True)
+    await interaction.response.send_message(f'Weekly Battalion Brief channel set to {channel.mention}. Use `/battalionbrief-setup` to change the schedule.',ephemeral=True)
 
 @bot.tree.command(name='nco-accountability-channel', description='Set the channel for the weekly NCO/company member-attention rollup.')
 async def nco_accountability_channel(interaction:discord.Interaction, channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
     await set_report_channel(interaction.guild_id,'NCO_ACCOUNTABILITY',channel.id)
-    await interaction.response.send_message(
-        f'NCO / Company accountability rollups will be posted to {channel.mention} with the Sunday Battalion Report.',
-        ephemeral=True
-    )
+    await interaction.response.send_message(f'NCO / Company accountability rollups will be posted to {channel.mention}.',ephemeral=True)
 
-
-@tasks.loop(hours=1)
+@tasks.loop(minutes=5)
 async def weekly_battalion_report_watch():
-    """Post one concise weekly leadership report each Sunday evening.
-
-    The Website remains authoritative for strength/readiness/action figures.  A
-    notice key prevents duplicate reports across bot restarts and multiple hourly
-    checks inside the Sunday evening window.
-    """
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        return
-    try:
-        tz=ZoneInfo(BATTALION_TIMEZONE)
-    except Exception:
-        tz=ZoneInfo('America/New_York')
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    try: tz=ZoneInfo(BATTALION_TIMEZONE)
+    except Exception: tz=ZoneInfo('America/New_York')
     now=datetime.now(tz)
-    if now.weekday()!=6 or now.hour!=19:
-        return
-    report_key=f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
     for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
         try:
-            ch=await get_report_channel(guild,'WEEKLY_BATTALION_REPORT')
-            if not ch:
-                continue
-            if not await _notice_once(guild.id,'BATTALION','WEEKLY_BATTALION_REPORT',report_key):
-                continue
-            data=await web.request('GET','/internal/clerk/reports/weekly-battalion')
-            m=data.get('metrics') or {}
-            companies=data.get('companies') or []
-            onboarding=data.get('onboarding') or {}
-            cohort=data.get('cohort30') or {}
-            company_lines=[]
-            for c in companies[:6]:
-                company_lines.append(
-                    f"• **{c.get('name') or c.get('code') or 'Company'}** — "
-                    f"STR {c.get('strength',0)} | 7D {c.get('active7',0)} | "
-                    f"RDY {c.get('readiness',0)}% | WATCH {c.get('inactive14',0)}"
-                )
-            body=(
-                f"**1/5 CAV — WEEKLY BATTALION HEALTH REPORT**\n"
-                f"Week: **{report_key}**\n\n"
-                f"**Personnel:** {m.get('strength',0)} total | {m.get('reserve',0)} reserve | {m.get('replacements',0)} replacement\n"
-                f"**Verified HLL activity:** {m.get('active7',0)} active 7D | {m.get('active30',0)} active 30D ({m.get('active30_rate',0)}%)\n"
-                f"**Inactivity:** {m.get('inactive14',0)} at 14+ days | {m.get('inactive30',0)} at 30+ days\n"
-                f"**Readiness:** {m.get('readiness',0)}% average | {m.get('unlinked_game',0)} game IDs missing\n"
-                f"**Staff workload:** {m.get('open_actions',0)} open | {m.get('overdue_actions',0)} overdue | {m.get('s1_cases',0)} S-1 cases\n"
-                f"**Leadership vacancies:** {m.get('leadership_vacancies',0)} | **Promotion reviews:** {m.get('promotion_reviews',0)}\n"
-                f"**Onboarding:** {onboarding.get('packets_open',0)} open | {onboarding.get('first_session_pending',0)} first-session holds | {onboarding.get('credential_holds',0)} login holds\n"
-                f"**30D cohort:** {cohort.get('joined30',0)} joined | {cohort.get('game_linked',0)} linked | {cohort.get('played',0)} played | {cohort.get('active7',0)} active this week\n"
-            )
-            if company_lines:
-                body += "\n**Company Health**\n" + "\n".join(company_lines)
-            dashboard=data.get('dashboard_url')
-            if dashboard:
-                body += f"\n\n**Command Dashboard:** {dashboard}"
-            await ch.send(body[:1950])
-
-            # Optional leader-facing rollup.  It deliberately contains only exceptions
-            # so NCOs do not have to scan the entire battalion roster every week.
+            cfg=await _brief_config(guild.id)
+            if not cfg or not cfg.get('enabled') or not cfg.get('channel_id'): continue
+            if now.weekday()!=int(cfg.get('weekday') or 0) or now.hour!=int(cfg.get('hour') or 0) or now.minute< int(cfg.get('minute') or 0) or now.minute>=int(cfg.get('minute') or 0)+5: continue
+            report_key=f"{now.isocalendar().year}-W{now.isocalendar().week:02d}-{now.weekday()}-{now.hour:02d}{int(cfg.get('minute') or 0):02d}"
+            if not await _notice_once(guild.id,'BATTALION','WEEKLY_BATTALION_BRIEF',report_key): continue
+            ch=guild.get_channel(int(cfg.get('channel_id') or 0))
+            if not isinstance(ch,discord.TextChannel): continue
+            body=await _build_battalion_brief(guild,bool(cfg.get('include_fund',True)))
+            role=guild.get_role(int(cfg.get('mention_role_id') or 0)) if cfg.get('mention_role_id') else None
+            await ch.send(((role.mention+'\n') if role else '')+body)
             nco_ch=await get_report_channel(guild,'NCO_ACCOUNTABILITY')
-            if nco_ch and await _notice_once(guild.id,'BATTALION','NCO_ACCOUNTABILITY',report_key):
-                attention=data.get('leader_attention') or []
-                lines=[]
-                for item in attention[:15]:
-                    issues=', '.join(item.get('issues') or []) or item.get('activity') or 'REVIEW'
-                    lines.append(f"• **{item.get('name') or 'Soldier'}** — {item.get('unit') or 'UNASSIGNED'} — {item.get('health','AMBER')} — {issues}")
-                nco_body=(f"**1/5 CAV — NCO / COMPANY ACCOUNTABILITY**\nWeek: **{report_key}**\n"
-                          f"Work the exceptions below; routine active Soldiers are intentionally omitted.\n\n")
-                nco_body += "\n".join(lines) if lines else 'No member-health exceptions are currently surfaced.'
-                health_url=data.get('member_health_url')
-                if health_url: nco_body += f"\n\n**Member Health Workbench:** {health_url}"
-                await nco_ch.send(nco_body[:1950])
-        except Exception as exc:
-            log.warning('[WEEKLY BATTALION REPORT FAILED] guild=%s error=%s',guild.id,exc)
-
+            if nco_ch:
+                data=await web.request('GET','/internal/clerk/reports/weekly-battalion'); attention=data.get('leader_attention') or []
+                lines=[f"• **{i.get('name') or 'Soldier'}** — {i.get('unit') or 'UNASSIGNED'} — {', '.join(i.get('issues') or []) or i.get('activity') or 'REVIEW'}" for i in attention[:15]]
+                await nco_ch.send((f"**1/5 CAV — NCO MEMBER ATTENTION**\nWork only the exceptions below. Participation remains voluntary.\n\n"+('\n'.join(lines) if lines else 'No member-health exceptions are currently surfaced.'))[:1950])
+        except Exception as exc: log.warning('[WEEKLY BATTALION BRIEF FAILED] guild=%s error=%s',guild.id,exc)
 
 @weekly_battalion_report_watch.before_loop
 async def before_weekly_battalion_report_watch():
@@ -4130,7 +4297,7 @@ async def system_health_alert_watch():
                         problems=[]
                         for c in data.get('checks') or []:
                             if str(c.get('status') or '').upper() in {'WARN','FAIL'}:
-                                problems.append(f"• **{c.get('name')}** — {c.get('status')}: {c.get('detail')}")
+                                problems.append(f"• **{c.get('name')}** — {c.get('status')}: {c.get('detail')}\n  ↳ **FIX:** {c.get('recommendation') or 'Review the Command System Health page.'}")
                         body='\n'.join(problems[:8]) or 'A system health exception was detected.'
                         await ch.send(f'**BATTALION SYSTEM HEALTH — {state}**\n{body}\n\nCommand should review the Website System Health page.')
             await _system_health_state_set(guild.id,state,data)
@@ -4152,6 +4319,415 @@ async def system_health_alert_watch():
 async def before_system_health_alert_watch():
     await bot.wait_until_ready()
 
+@bot.tree.command(name='first30-channel', description='Assign the NCO channel for non-mandatory first-30-day member retention alerts.')
+async def first30_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if not await require_manage_guild(interaction): return
+    await set_report_channel(interaction.guild_id,'FIRST30_RETENTION',channel.id)
+    await interaction.response.send_message(f'First-30-day NCO retention alerts will be posted to {channel.mention}. These are check-ins, not mandatory participation orders.',ephemeral=True)
+
+@bot.tree.command(name='first30-status', description='Preview new members in the first-30-day retention lane.')
+async def first30_status(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    data=await web.request('GET','/internal/clerk/retention/first30')
+    rows=data.get('members') or []
+    lines=[]
+    for r in rows[:20]:
+        issues=', '.join(r.get('issues') or []) or 'ON TRACK'
+        lines.append(f"• **{r.get('name')}** — Day {r.get('age_days',0)} — {r.get('unit') or 'UNASSIGNED'} — {issues}")
+    await interaction.followup.send((f"**1/5 CAV — FIRST 30 DAYS**\nMembers: **{len(rows)}** | Needs NCO attention: **{data.get('attention_count',0)}**\n\n"+('\n'.join(lines) if lines else 'No members currently in the first-30-day lane.'))[:1950],ephemeral=True)
+
+@tasks.loop(minutes=30)
+async def first30_retention_watch():
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID: continue
+        try:
+            ch=await get_report_channel(guild,'FIRST30_RETENTION')
+            if not ch: continue
+            data=await web.request('GET','/internal/clerk/retention/first30')
+            for r in (data.get('attention') or []):
+                issues=r.get('issues') or []
+                # One notice per Soldier/issue signature; changed problems can surface again.
+                sig='|'.join(sorted(issues)) or 'ON_TRACK'
+                key=f"FIRST30:{r.get('personnel_id')}:{sig}"
+                if not await _notice_once(guild.id,str(r.get('personnel_id')),'FIRST30_RETENTION',key): continue
+                opp=r.get('opportunities') or []
+                opp_line=''
+                if opp:
+                    opp_line='\n**Closest progression:** '+', '.join(f"{x.get('name')} ({x.get('progress',0)}%)" for x in opp[:3])
+                body=(f"**1/5 CAV — NEW MEMBER CHECK-IN**\n**{r.get('name')}** — Day **{r.get('age_days',0)}** — {r.get('unit') or 'UNASSIGNED'}\n"
+                      f"**Needs attention:** {', '.join(issues)}\n**NCO next step:** {r.get('next_step')}"
+                      f"{opp_line}\n\n*This is a support/check-in notice. The 1/5 Cav does not require a mandatory play schedule.*")
+                await ch.send(body[:1900])
+        except Exception as exc: log.warning('[FIRST30 RETENTION WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+@first30_retention_watch.before_loop
+async def before_first30_retention_watch():
+    await bot.wait_until_ready()
+
+
+async def _ensure_server_watch_schema():
+    await collector.start()
+    if not collector.db.pool:
+        return
+    await collector.db.execute("""
+        CREATE TABLE IF NOT EXISTS hll_suspicious_player_alerts (
+            id BIGSERIAL PRIMARY KEY,
+            match_id BIGINT NOT NULL,
+            server_key TEXT NOT NULL,
+            steam_id TEXT NOT NULL,
+            player_name TEXT,
+            alert_level TEXT NOT NULL,
+            reason_signature TEXT NOT NULL,
+            last_kills INTEGER NOT NULL DEFAULT 0,
+            last_deaths INTEGER NOT NULL DEFAULT 0,
+            alert_count INTEGER NOT NULL DEFAULT 1,
+            first_alerted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+            UNIQUE(match_id, steam_id)
+        )
+    """)
+    await collector.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_suspicious_alerts_server_time ON hll_suspicious_player_alerts(server_key,last_alerted_at DESC)")
+    await collector.db.execute("""
+        CREATE TABLE IF NOT EXISTS hll_server_watch_positions (
+            id BIGSERIAL PRIMARY KEY,
+            match_id BIGINT NOT NULL,
+            server_key TEXT NOT NULL,
+            steam_id TEXT NOT NULL,
+            player_name TEXT,
+            team_id TEXT,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            x DOUBLE PRECISION NOT NULL,
+            y DOUBLE PRECISION NOT NULL,
+            z DOUBLE PRECISION NOT NULL
+        )
+    """)
+    await collector.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_server_watch_positions_player_time ON hll_server_watch_positions(match_id,steam_id,observed_at DESC)")
+    await collector.db.execute("DELETE FROM hll_server_watch_positions WHERE observed_at < NOW()-INTERVAL '6 hours'")
+
+
+def _server_admin_role(guild: discord.Guild):
+    target=SERVER_ADMIN_ROLE_NAME.casefold()
+    return next((r for r in guild.roles if r.name.casefold()==target), None)
+
+
+def _server_watch_level(score: int) -> str:
+    if score >= 6:
+        return 'PRIORITY REVIEW'
+    if score >= 4:
+        return 'ELEVATED WATCH'
+    return 'WATCH'
+
+
+def _server_watch_level_rank(level: str) -> int:
+    return {'WATCH':1,'ELEVATED WATCH':2,'PRIORITY REVIEW':3}.get(str(level or '').upper(),0)
+
+
+async def _server_watch_recipients(guild: discord.Guild):
+    role=_server_admin_role(guild)
+    if not role:
+        return role, []
+    return role, [m for m in role.members if not m.bot]
+
+
+def _server_watch_channel(guild: discord.Guild):
+    if not guild:
+        return None
+    if SERVER_WATCH_CHANNEL_ID:
+        ch=guild.get_channel(SERVER_WATCH_CHANNEL_ID)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return ch
+    wanted=SERVER_WATCH_CHANNEL_NAME.lower().lstrip('#')
+    for ch in guild.text_channels:
+        if ch.name.lower()==wanted:
+            return ch
+    return None
+
+
+async def _send_server_watch_alert(guild: discord.Guild, payload: dict, *, test: bool=False):
+    role, recipients = await _server_watch_recipients(guild)
+    channel=_server_watch_channel(guild)
+    delivered=failed=0
+    if test:
+        title='1/5 CAV — SERVER WATCH TEST'
+        description=(f'Battalion Clerk successfully recognized the **{SERVER_ADMIN_ROLE_NAME}** role.\n\n'
+                     'You will receive suspected-player review notices for **Server 1** and **Server 2** here. '
+                     'These notices require human review and never trigger an automatic kick or ban.')
+        embed=discord.Embed(title=title, description=description)
+    else:
+        level=payload['level']
+        server_label='SERVER 1' if payload.get('server_key')=='server_1' else 'SERVER 2'
+        embed=discord.Embed(title=f'1/5 CAV — {level}', description=(
+            f'**{payload.get("player_name") or "Unknown player"}** has crossed Server Watch review thresholds on **{server_label}**.\n\n'
+            '**This is an automated suspicion flag, not confirmation of cheating. Do not punish solely from this alert.**'))
+        embed.add_field(name='Player', value=str(payload.get('player_name') or 'Unknown'), inline=True)
+        embed.add_field(name='Server', value=server_label, inline=True)
+        embed.add_field(name='Map', value=str(payload.get('map_name') or 'Unknown'), inline=True)
+        embed.add_field(name='Kills / Deaths', value=f"{payload.get('kills',0)} / {payload.get('deaths',0)}", inline=True)
+        embed.add_field(name='Kills per minute', value=f"{payload.get('kpm',0):.2f}", inline=True)
+        embed.add_field(name='K/D', value=f"{payload.get('kd',0):.2f}", inline=True)
+        embed.add_field(name='Recent kill burst', value=f"2 min: {payload.get('burst_2m',0)}\n5 min: {payload.get('burst_5m',0)}", inline=True)
+        embed.add_field(name='Observed time', value=f"{payload.get('minutes',0):.1f} min", inline=True)
+        embed.add_field(name='Player ID', value=str(payload.get('steam_id') or 'Unknown')[:1024], inline=False)
+        embed.add_field(name='Why it was flagged', value='\n'.join(f'• {r}' for r in payload.get('reasons',[]))[:1024] or 'Threshold combination', inline=False)
+        movement=payload.get('movement') or {}
+        movement_lines=[]
+        if movement.get('sample_count'):
+            movement_lines.append(f"• Position trail: {movement.get('sample_count')} samples over {movement.get('window_minutes',0):.1f} min")
+            movement_lines.append(f"• Route traveled: {movement.get('path_meters',0):.0f} m • net displacement: {movement.get('direct_meters',0):.0f} m")
+            movement_lines.append(f"• Route directness: {movement.get('directness',0)*100:.0f}%")
+            if movement.get('direct_route_flag'):
+                movement_lines.append('• DIRECT-ROUTE ANOMALY: sustained unusually straight movement through the tracked area')
+        else:
+            movement_lines.append('• Position history is still building for this player.')
+        movement_lines.append('• Exact Garrison/Outpost coordinates are not currently exposed to Clerk; this is behavioral movement evidence, not proof the player can see a spawn.')
+        embed.add_field(name='Spawn-Hunt / Movement Analysis', value='\n'.join(movement_lines)[:1024], inline=False)
+        embed.set_footer(text='Recommended action: observe, preserve evidence, compare match history and movement, then make a human moderation decision.')
+    for member in recipients:
+        try:
+            await member.send(embed=embed)
+            delivered += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+    channel_delivered=False
+    channel_failed=False
+    if channel:
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            channel_delivered=True
+        except (discord.Forbidden, discord.HTTPException):
+            channel_failed=True
+    return {'role_found': bool(role), 'recipients': len(recipients), 'delivered': delivered, 'failed': failed,
+            'channel_found': bool(channel), 'channel_id': getattr(channel,'id',None),
+            'channel_name': getattr(channel,'name',None), 'channel_delivered': channel_delivered, 'channel_failed': channel_failed}
+
+
+async def _server_watch_sample_positions():
+    # Keep a short-lived movement trail for every currently sampled public player.
+    # This is intentionally separated from permanent career telemetry and is
+    # purged automatically. It is used only for human-review Server Watch evidence.
+    rows=await collector.db.fetch("""
+        SELECT ps.match_id,COALESCE(ms.server_key,'server_1') AS server_key,ps.steam_id,ps.player_name,ps.team_id,
+               ps.last_x AS x,ps.last_y AS y,ps.last_z AS z
+          FROM hll_player_match_stats ps
+          JOIN hll_match_sessions ms ON ms.id=ps.match_id
+         WHERE ms.ended_at IS NULL AND ms.last_seen_at >= NOW()-INTERVAL '2 minutes'
+           AND ps.last_seen_at >= NOW()-INTERVAL '2 minutes'
+           AND ps.last_x IS NOT NULL AND ps.last_y IS NOT NULL AND ps.last_z IS NOT NULL
+           AND COALESCE(ms.server_key,'server_1') IN ('server_1','server_2')
+    """)
+    for r in rows:
+        await collector.db.execute("""
+            INSERT INTO hll_server_watch_positions(match_id,server_key,steam_id,player_name,team_id,x,y,z)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        """,int(r['match_id']),str(r['server_key']),str(r['steam_id']),r['player_name'],r['team_id'],float(r['x']),float(r['y']),float(r['z']))
+
+
+def _movement_distance(a,b):
+    import math
+    return math.sqrt((float(b['x'])-float(a['x']))**2+(float(b['y'])-float(a['y']))**2+(float(b['z'])-float(a['z']))**2)/100.0
+
+
+async def _server_watch_movement(match_id:int, steam_id:str):
+    rows=await collector.db.fetch("""
+        SELECT observed_at,x,y,z FROM hll_server_watch_positions
+         WHERE match_id=$1 AND steam_id=$2
+           AND observed_at >= NOW()-($3::text || ' minutes')::interval
+         ORDER BY observed_at ASC
+    """,match_id,steam_id,SERVER_WATCH_POSITION_HISTORY_MINUTES)
+    rows=[dict(r) for r in rows]
+    if len(rows)<2:
+        return {'sample_count':len(rows),'window_minutes':0.0,'path_meters':0.0,'direct_meters':0.0,'directness':0.0,'direct_route_flag':False}
+    path=sum(_movement_distance(rows[i-1],rows[i]) for i in range(1,len(rows)))
+    direct=_movement_distance(rows[0],rows[-1])
+    directness=(direct/path) if path>0 else 0.0
+    window=max(0.0,(rows[-1]['observed_at']-rows[0]['observed_at']).total_seconds()/60.0)
+    return {'sample_count':len(rows),'window_minutes':window,'path_meters':path,'direct_meters':direct,'directness':directness,
+            'direct_route_flag': bool(path>=SERVER_WATCH_DIRECT_ROUTE_MIN_METERS and directness>=SERVER_WATCH_DIRECT_ROUTE_RATIO)}
+
+
+async def _server_watch_candidates():
+    await collector.start()
+    if not collector.db.pool:
+        return []
+    # Evaluate both official servers independently through the match server_key.
+    rows=await collector.db.fetch("""
+        SELECT ps.match_id, COALESCE(ms.server_key,'server_1') AS server_key,
+               ms.server_name, ms.map_name, ms.game_mode, ms.started_at,
+               ps.steam_id, ps.player_name, ps.personnel_id,
+               COALESCE(ps.connected_seconds,0)::int AS connected_seconds,
+               COALESCE(ps.infantry_kills,0)::int AS infantry_kills,
+               COALESCE(ps.deaths,0)::int AS deaths
+          FROM hll_player_match_stats ps
+          JOIN hll_match_sessions ms ON ms.id=ps.match_id
+         WHERE ms.ended_at IS NULL
+           AND ms.last_seen_at >= NOW()-INTERVAL '2 minutes'
+           AND ps.last_seen_at >= NOW()-INTERVAL '2 minutes'
+           AND COALESCE(ms.server_key,'server_1') IN ('server_1','server_2')
+           AND COALESCE(ps.connected_seconds,0) >= $1
+           AND COALESCE(ps.infantry_kills,0) >= $2
+    """, SERVER_WATCH_MIN_CONNECTED_SECONDS, SERVER_WATCH_MIN_KILLS)
+    out=[]
+    for row in rows:
+        r=dict(row)
+        minutes=max(1.0, float(r['connected_seconds'])/60.0)
+        kills=int(r['infantry_kills'] or 0); deaths=int(r['deaths'] or 0)
+        kpm=kills/minutes; kd=kills/max(1,deaths)
+        burst_2m=burst_5m=0
+        try:
+            bursts=await collector.db.fetchrow("""
+                SELECT COUNT(*) FILTER (WHERE we.event_type='KILL' AND we.event_at >= NOW()-INTERVAL '2 minutes')::int AS b2,
+                       COUNT(*) FILTER (WHERE we.event_type='KILL' AND we.event_at >= NOW()-INTERVAL '5 minutes')::int AS b5
+                  FROM hll_weapon_events we
+                 WHERE we.match_id=$1 AND we.attacker_id=$2
+            """, int(r['match_id']), str(r['steam_id']))
+            if bursts:
+                burst_2m=int(bursts['b2'] or 0); burst_5m=int(bursts['b5'] or 0)
+        except Exception:
+            # The aggregate match stats are still authoritative enough for a
+            # review notice if weapon-event enrichment is temporarily absent.
+            pass
+        reasons=[]; score=0
+        if kpm >= SERVER_WATCH_KPM:
+            reasons.append(f'High sustained infantry kill rate: {kpm:.2f} KPM over {minutes:.1f} minutes')
+            score += 2
+        if kills >= 35 and kd >= SERVER_WATCH_HIGH_KD:
+            reasons.append(f'Unusually high K/D: {kd:.2f} with {kills} infantry kills')
+            score += 1
+        if deaths == 0 and kills >= SERVER_WATCH_ZERO_DEATH_KILLS:
+            reasons.append(f'{kills} infantry kills with zero recorded deaths')
+            score += 1
+        if burst_2m >= SERVER_WATCH_BURST_2M:
+            reasons.append(f'Kill burst: {burst_2m} verified kill events in 2 minutes')
+            score += 2
+        if burst_5m >= SERVER_WATCH_BURST_5M:
+            reasons.append(f'Kill burst: {burst_5m} verified kill events in 5 minutes')
+            score += 2
+        movement=await _server_watch_movement(int(r['match_id']),str(r['steam_id']))
+        if movement.get('direct_route_flag'):
+            reasons.append(f"Movement anomaly: {movement.get('directness',0)*100:.0f}% direct route over {movement.get('path_meters',0):.0f} m")
+            score += 1
+        if score < 2:
+            continue
+        r.update({'kills':kills,'deaths':deaths,'minutes':minutes,'kpm':kpm,'kd':kd,
+                  'burst_2m':burst_2m,'burst_5m':burst_5m,'movement':movement,'reasons':reasons,
+                  'score':score,'level':_server_watch_level(score)})
+        out.append(r)
+    return out
+
+
+async def _server_watch_should_alert(candidate: dict):
+    previous=await collector.db.fetchrow("""
+        SELECT alert_level,last_kills,last_alerted_at,reason_signature
+          FROM hll_suspicious_player_alerts
+         WHERE match_id=$1 AND steam_id=$2
+    """, int(candidate['match_id']), str(candidate['steam_id']))
+    signature='|'.join(sorted(candidate.get('reasons') or []))[:1800]
+    candidate['reason_signature']=signature
+    if not previous:
+        return True
+    if _server_watch_level_rank(candidate['level']) > _server_watch_level_rank(previous['alert_level']):
+        return True
+    # Repeat only when the player has materially continued the pattern and the
+    # cooldown has elapsed. This prevents a DM every polling cycle.
+    elapsed=(utc_now()-previous['last_alerted_at']).total_seconds() if previous['last_alerted_at'] else 999999
+    return elapsed >= SERVER_WATCH_REPEAT_MINUTES*60 and int(candidate['kills']) >= int(previous['last_kills'] or 0)+10
+
+
+async def _record_server_watch_alert(candidate: dict):
+    import json as _json
+    metrics={'kills':candidate['kills'],'deaths':candidate['deaths'],'minutes':candidate['minutes'],
+             'kpm':candidate['kpm'],'kd':candidate['kd'],'burst_2m':candidate['burst_2m'],
+             'burst_5m':candidate['burst_5m'],'movement':candidate.get('movement') or {},'score':candidate['score'],'reasons':candidate['reasons']}
+    await collector.db.execute("""
+        INSERT INTO hll_suspicious_player_alerts(match_id,server_key,steam_id,player_name,alert_level,reason_signature,last_kills,last_deaths,last_metrics)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+        ON CONFLICT(match_id,steam_id) DO UPDATE SET
+          server_key=EXCLUDED.server_key,player_name=EXCLUDED.player_name,alert_level=EXCLUDED.alert_level,
+          reason_signature=EXCLUDED.reason_signature,last_kills=EXCLUDED.last_kills,last_deaths=EXCLUDED.last_deaths,
+          last_metrics=EXCLUDED.last_metrics,last_alerted_at=NOW(),alert_count=hll_suspicious_player_alerts.alert_count+1
+    """, int(candidate['match_id']), candidate['server_key'], str(candidate['steam_id']), candidate.get('player_name'),
+         candidate['level'], candidate['reason_signature'], int(candidate['kills']), int(candidate['deaths']), _json.dumps(metrics))
+
+
+@tasks.loop(seconds=30)
+async def server_watch_monitor():
+    if not SERVER_WATCH_ENABLED:
+        return
+    try:
+        await _ensure_server_watch_schema()
+        await _server_watch_sample_positions()
+        candidates=await _server_watch_candidates()
+        for guild in bot.guilds:
+            if GUILD_ID and guild.id != GUILD_ID:
+                continue
+            role, recipients=await _server_watch_recipients(guild)
+            watch_channel=_server_watch_channel(guild)
+            if (not role or not recipients) and not watch_channel:
+                continue
+            for candidate in candidates:
+                if not await _server_watch_should_alert(candidate):
+                    continue
+                result=await _send_server_watch_alert(guild,candidate)
+                await _record_server_watch_alert(candidate)
+                log.warning('[SERVER WATCH ALERT] guild=%s server=%s player=%s level=%s dm_delivered=%s dm_failed=%s channel=%s channel_delivered=%s',
+                            guild.id,candidate['server_key'],candidate.get('player_name'),candidate['level'],result['delivered'],result['failed'],result.get('channel_name'),result.get('channel_delivered'))
+    except Exception:
+        log.exception('[SERVER WATCH MONITOR FAILED]')
+
+
+@server_watch_monitor.before_loop
+async def before_server_watch_monitor():
+    await bot.wait_until_ready()
+
+
+server_watch_group = app_commands.Group(name='server-watch', description='Server Watch suspicious-player monitoring controls.')
+bot.tree.add_command(server_watch_group)
+
+@server_watch_group.command(name='status', description='Show suspicious-player monitoring status for both official HLL servers.')
+async def server_watch_status_command(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    role, recipients=await _server_watch_recipients(interaction.guild)
+    watch_channel=_server_watch_channel(interaction.guild)
+    await collector.start()
+    health=[]
+    if collector.db.pool:
+        try:
+            rows=await collector.db.fetch("SELECT server_key,connected,last_server_name,last_player_count,last_success_at,last_error FROM hll_rcon_health WHERE server_key IN ('server_1','server_2') ORDER BY server_key")
+            for r in rows:
+                health.append(f"**{str(r['server_key']).upper()}** — {'CONNECTED' if r['connected'] else 'OFFLINE'} — {r['last_server_name'] or 'Unknown'} — {r['last_player_count'] or 0} players")
+        except Exception:
+            pass
+    channel_status=(f"**#{watch_channel.name}** ({watch_channel.id})" if watch_channel
+                    else f"**MISSING** — expected ID {SERVER_WATCH_CHANNEL_ID or 'not set'} or name #{SERVER_WATCH_CHANNEL_NAME}")
+    text=(f"**SERVER WATCH STATUS**\nEnabled: **{'YES' if SERVER_WATCH_ENABLED else 'NO'}**\n"
+          f"Alert role: **{SERVER_ADMIN_ROLE_NAME}** — {'FOUND' if role else 'MISSING'}\n"
+          f"Role recipients: **{len(recipients)}**\n"
+          f"Shared alert channel: {channel_status}\n"
+          f"Monitoring: **SERVER 1 + SERVER 2**\n"
+          f"Automatic punishment: **OFF — HUMAN REVIEW REQUIRED**\n"
+          f"Minimum sample: **{SERVER_WATCH_MIN_CONNECTED_SECONDS//60} min / {SERVER_WATCH_MIN_KILLS} kills**\n"
+          f"Sustained KPM trigger: **{SERVER_WATCH_KPM:.2f}**\n"
+          f"Repeat-alert cooldown: **{SERVER_WATCH_REPEAT_MINUTES} min + 10 additional kills**\n"
+          f"Movement trail: **{SERVER_WATCH_POSITION_HISTORY_MINUTES} min** • direct-route flag: **{SERVER_WATCH_DIRECT_ROUTE_RATIO*100:.0f}% / {SERVER_WATCH_DIRECT_ROUTE_MIN_METERS:.0f} m**\n"
+          f"Exact Garrison/OP coordinate feed: **NOT ASSUMED — BEHAVIORAL ANALYSIS ONLY**\n\n" + ('\n'.join(health) if health else 'RCON health rows unavailable.'))
+    await interaction.response.send_message(text[:1900],ephemeral=True)
+
+
+@server_watch_group.command(name='test', description='Test Server Watch DMs and the shared Server Watch text channel.')
+async def server_watch_test_command(interaction: discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    result=await _send_server_watch_alert(interaction.guild,{},test=True)
+    if not result['role_found']:
+        msg=f"The **{SERVER_ADMIN_ROLE_NAME}** role was not found. Create it with that exact name, then run this command again."
+    else:
+        msg=(f"Server Watch test complete. Role members: **{result['recipients']}** — DMs delivered: **{result['delivered']}** — "
+             f"DM failures/blocked: **{result['failed']}** — shared channel: **{'POSTED' if result.get('channel_delivered') else ('FAILED' if result.get('channel_failed') else 'NOT FOUND')}**.")
+    await interaction.response.send_message(msg,ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     try:
@@ -4171,6 +4747,8 @@ async def on_ready():
             except Exception:
                 log.exception('[LEGACY RECRUIT ROLE CLEANUP FAILED] guild=%s',guild.id)
         bot._legacy_recruit_role_cleanup_done=True
+    if not discord_member_action_watch.is_running():
+        discord_member_action_watch.start()
     if not manual_recruit_intake_watch.is_running():
         manual_recruit_intake_watch.start()
     if not applicant_intake_watch.is_running():
@@ -4189,6 +4767,8 @@ async def on_ready():
         welcome_packet_watch.start()
     if not website_status_check_watch.is_running():
         website_status_check_watch.start()
+    if not application_reminder_watch.is_running():
+        application_reminder_watch.start()
     if not game_link_reminder_watch.is_running():
         game_link_reminder_watch.start()
     if not leadership_due_out_watch.is_running():
@@ -4295,6 +4875,11 @@ async def on_ready():
         growth_accountability_watch.start()
     if not system_health_alert_watch.is_running():
         system_health_alert_watch.start()
+    if not first30_retention_watch.is_running():
+        first30_retention_watch.start()
+    if not server_watch_monitor.is_running():
+        server_watch_monitor.change_interval(seconds=SERVER_WATCH_INTERVAL_SECONDS)
+        server_watch_monitor.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -4358,7 +4943,7 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
-# LIVE COMBAT ROSTER + AUTOMATIC VOICE/HLL PARTICIPATION ROUTING (V77)
+# LIVE COMBAT ROSTER + AUTOMATIC VOICE/HLL PARTICIPATION ROUTING (V86)
 # ---------------------------------------------------------------------------
 # Administrative website formations remain authoritative for personnel records.
 # This system creates a temporary combat roster from the Ready Room only.
@@ -4367,6 +4952,9 @@ MATCH_FORMATION_TANK_THRESHOLDS = (9, 18, 27)
 MATCH_FORMATION_HELI_THRESHOLDS = (13, 25, 37)
 COMBAT_ROSTER_MOVE_DELAY_SECONDS = 60
 COMBAT_AUTO_MOVE_MIN_PLAYERS = 7  # 6 or fewer stay together in the Ready Room
+# V86: Combat voice automation is intentionally anchored to one official server.
+# Server #2 continues feeding career telemetry but cannot start/end/cancel a Discord combat roster.
+COMBAT_ROSTER_SERVER_KEY = (os.getenv('COMBAT_ROSTER_SERVER_KEY', 'server_1').strip().lower() or 'server_1')
 COMBAT_ELEMENT_KEYS = tuple(
     [f'INFANTRY_{i}' for i in range(1,4)] +
     [f'TANK_{i}' for i in range(1,4)] +
@@ -4399,6 +4987,10 @@ async def ensure_match_formation_schema():
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS last_deferred_match_id BIGINT",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS voice_presence_required BOOLEAN NOT NULL DEFAULT TRUE",
         "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS late_join_queue_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_match_id BIGINT",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_since TIMESTAMPTZ",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_last_attempt_at TIMESTAMPTZ",
+        "ALTER TABLE clerk_match_formation_config ADD COLUMN IF NOT EXISTS pending_last_error TEXT",
     ):
         await collector.db.execute(ddl)
     await collector.db.execute("""
@@ -4415,18 +5007,28 @@ async def ensure_match_formation_schema():
         )
     """)
 
-async def _latest_completed_hll_match_id():
+async def _latest_completed_hll_match_id(server_key: str = COMBAT_ROSTER_SERVER_KEY):
+    """Latest completed match on the combat-authoritative HLL server only.
+
+    V86 deliberately excludes Server #2 from Discord roster boundaries so a
+    secondary-server map change cannot return, cancel, or start voice routing.
+    """
     try:
-        row = await collector.db.fetchrow("SELECT id FROM hll_match_sessions WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+        row = await collector.db.fetchrow(
+            """SELECT id FROM hll_match_sessions
+               WHERE ended_at IS NOT NULL AND COALESCE(server_key,'server_1')=$1
+               ORDER BY id DESC LIMIT 1""", server_key)
         return int(row['id']) if row else None
     except Exception:
         return None
 
-async def _latest_active_hll_match_id():
+async def _latest_active_hll_match_id(server_key: str = COMBAT_ROSTER_SERVER_KEY):
+    """Latest live match on the combat-authoritative HLL server only."""
     try:
         row=await collector.db.fetchrow("""SELECT id FROM hll_match_sessions
             WHERE ended_at IS NULL AND last_seen_at >= NOW() - INTERVAL '3 minutes'
-            ORDER BY id DESC LIMIT 1""")
+              AND COALESCE(server_key,'server_1')=$1
+            ORDER BY id DESC LIMIT 1""", server_key)
         return int(row['id']) if row else None
     except Exception:
         return None
@@ -4435,8 +5037,8 @@ async def _active_or_latest_match_label(match_id: int | None):
     if not match_id:
         return None
     try:
-        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at
-            FROM hll_match_sessions WHERE id=$1""", int(match_id))
+        row = await collector.db.fetchrow("""SELECT id,map_name,map_id,game_mode,allied_faction_id,axis_faction_id,started_at,ended_at,server_key,server_name
+            FROM hll_match_sessions WHERE id=$1 AND COALESCE(server_key,'server_1')=$2""", int(match_id), COMBAT_ROSTER_SERVER_KEY)
         return dict(row) if row else None
     except Exception:
         return None
@@ -4753,10 +5355,12 @@ async def _publish_match_formation(guild,cfg,match_id=None,automatic=True):
 
 @tasks.loop(seconds=15)
 async def match_formation_watch():
-    """Return at round end and route only at a newly observed match boundary.
+    """Server #1 combat roster watcher with retry-safe pending match handling.
 
-    If V75 is enabled/deployed while a round is already active, that round is
-    baselined and never routed mid-game. The next round is eligible.
+    V87 fixes the one-shot failure mode: observing a new match no longer marks it
+    processed before a roster is actually filed.  A live match remains pending
+    and is retried every watcher cycle until enough verified Ready Room members
+    and faction telemetry are available, the roster succeeds, or the match ends.
     """
     if not bot.is_ready(): return
     try:
@@ -4770,12 +5374,16 @@ async def match_formation_watch():
             if not guild: continue
             match_formation_busy.add(gid)
             try:
+                # Preserve the existing mid-round activation safety guard. This
+                # only baselines once when automation is newly enabled/configured.
                 if row.get('activation_baseline_match_id') is None:
                     baseline=int(latest_active or latest_done or 0)
                     await collector.db.execute("""UPDATE clerk_match_formation_config
                         SET activation_baseline_match_id=$2,
                             last_started_match_id=CASE WHEN $3::bigint IS NOT NULL THEN GREATEST(COALESCE(last_started_match_id,0),$3) ELSE last_started_match_id END,
-                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,updated_at=NOW()
+                            last_deferred_match_id=CASE WHEN $3::bigint IS NOT NULL THEN $3 ELSE last_deferred_match_id END,
+                            pending_match_id=NULL,pending_since=NULL,pending_last_attempt_at=NULL,pending_last_error=NULL,
+                            updated_at=NOW()
                         WHERE guild_id=$1""",gid,baseline,latest_active)
                     if latest_active:
                         log.info('[COMBAT ROSTER DEFERRED] guild=%s active_match=%s reason=activated during live round',gid,latest_active)
@@ -4784,27 +5392,87 @@ async def match_formation_watch():
                 returned=int(row.get('last_returned_match_id') or 0)
                 if latest_done and latest_done>returned:
                     result=await _return_combat_members(guild,row)
-                    await collector.db.execute("UPDATE clerk_match_formation_config SET last_returned_match_id=$2,late_join_queue_json='[]'::jsonb,updated_at=NOW() WHERE guild_id=$1",gid,latest_done)
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_returned_match_id=$2,late_join_queue_json='[]'::jsonb,
+                            pending_match_id=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_match_id END,
+                            pending_since=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_since END,
+                            pending_last_attempt_at=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_last_attempt_at END,
+                            pending_last_error=CASE WHEN pending_match_id=$2 THEN NULL ELSE pending_last_error END,
+                            updated_at=NOW() WHERE guild_id=$1""",gid,latest_done)
                     log.info('[COMBAT RETURN] guild=%s match=%s moved=%s failures=%s',gid,latest_done,result['moved'],len(result['failures']))
                     row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
 
-                started=int(row.get('last_started_match_id') or 0)
-                if latest_active and latest_active>started:
-                    await collector.db.execute("""UPDATE clerk_match_formation_config SET last_started_match_id=$2,last_processed_match_id=$2,updated_at=NOW() WHERE guild_id=$1""",gid,latest_active)
-                    ready=guild.get_channel(int(row.get('voice_channel_id') or 0)); count=len(_formation_members(ready)) if ready else 0
-                    if count < MATCH_FORMATION_MIN_PLAYERS:
-                        log.info('[COMBAT ROSTER SKIP] guild=%s match=%s players=%s (<6)',gid,latest_active,count)
-                    else:
-                        await asyncio.sleep(12)
-                        if await _latest_active_hll_match_id() != latest_active:
-                            log.info('[COMBAT ROSTER ABORT] guild=%s match changed during telemetry settle',gid); continue
-                        result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
-                        if result.get('ok'):
-                            log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
-                        else:
-                            log.warning('[COMBAT ROSTER NOT ROUTED] guild=%s match=%s error=%s',gid,latest_active,result.get('error'))
-            except Exception:
+                processed=int(row.get('last_processed_match_id') or 0)
+                pending=int(row.get('pending_match_id') or 0)
+
+                # No live Server #1 match: clear stale pending state. The next
+                # observed live match will become a fresh pending candidate.
+                if not latest_active:
+                    if pending:
+                        await collector.db.execute("""UPDATE clerk_match_formation_config
+                            SET pending_match_id=NULL,pending_since=NULL,pending_last_attempt_at=NULL,pending_last_error=NULL,updated_at=NOW()
+                            WHERE guild_id=$1""",gid)
+                    continue
+
+                # A new live match becomes PENDING, not processed. last_started
+                # records observation only and is no longer used as the success gate.
+                if latest_active>processed and pending != latest_active:
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_started_match_id=GREATEST(COALESCE(last_started_match_id,0),$2),
+                            pending_match_id=$2,pending_since=NOW(),pending_last_attempt_at=NULL,
+                            pending_last_error='Waiting for Ready Room / HLL telemetry',updated_at=NOW()
+                        WHERE guild_id=$1""",gid,latest_active)
+                    log.info('[COMBAT ROSTER PENDING] guild=%s match=%s',gid,latest_active)
+                    row=dict(await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",gid))
+                    pending=latest_active
+
+                # Nothing to do if this live match has already filed successfully.
+                if latest_active<=processed or pending != latest_active:
+                    continue
+
+                ready=guild.get_channel(int(row.get('voice_channel_id') or 0))
+                count=len(_formation_members(ready)) if ready else 0
+                if count < MATCH_FORMATION_MIN_PLAYERS:
+                    reason=f'Waiting for Ready Room: {count}/6 member(s) present'
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                        WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,reason)
+                    log.info('[COMBAT ROSTER RETRY] guild=%s match=%s reason=%s',gid,latest_active,reason)
+                    continue
+
+                # Retry on every 15-second watcher pass. There is no one-time
+                # 12-second window anymore; the publish function itself validates
+                # live HLL participation and faction evidence on each attempt.
+                await collector.db.execute("""UPDATE clerk_match_formation_config
+                    SET pending_last_attempt_at=NOW(),pending_last_error='Checking live HLL telemetry',updated_at=NOW()
+                    WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active)
+
+                if await _latest_active_hll_match_id() != latest_active:
+                    log.info('[COMBAT ROSTER RETRY] guild=%s match=%s reason=match changed before attempt',gid,latest_active)
+                    continue
+
+                result=await _publish_match_formation(guild,row,match_id=latest_active,automatic=True)
+                if result.get('ok'):
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET last_processed_match_id=$2,pending_match_id=NULL,pending_since=NULL,
+                            pending_last_attempt_at=NULL,pending_last_error=NULL,updated_at=NOW()
+                        WHERE guild_id=$1""",gid,latest_active)
+                    log.info('[COMBAT ROSTER ROUTED] guild=%s match=%s side=%s players=%s moved=%s',gid,latest_active,result.get('side'),result['player_count'],result['routing']['moved'])
+                else:
+                    reason=str(result.get('error') or 'Roster prerequisites are not ready yet')[:500]
+                    await collector.db.execute("""UPDATE clerk_match_formation_config
+                        SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                        WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,reason)
+                    log.warning('[COMBAT ROSTER RETRY] guild=%s match=%s error=%s',gid,latest_active,reason)
+            except Exception as exc:
                 log.exception('[COMBAT ROSTER WATCH FAILED] guild=%s',gid)
+                try:
+                    if latest_active:
+                        await collector.db.execute("""UPDATE clerk_match_formation_config
+                            SET pending_last_attempt_at=NOW(),pending_last_error=$3,updated_at=NOW()
+                            WHERE guild_id=$1 AND pending_match_id=$2""",gid,latest_active,f'Watcher error: {str(exc)[:420]}')
+                except Exception:
+                    pass
             finally:
                 match_formation_busy.discard(gid)
     except Exception:
@@ -4891,8 +5559,76 @@ async def combat_status(interaction:discord.Interaction):
         lines.append(f"• **{key.replace('_',' ').title()}** → {ch.mention if ch else 'NOT ASSIGNED'}")
     count=len(_formation_members(ready)) if ready else 0
     queued=len(_late_join_queue(cfg))
+    pending_id=cfg.get('pending_match_id'); pending_error=cfg.get('pending_last_error')
+    pending_line=f"Match {pending_id} — {pending_error or 'waiting to retry'}" if pending_id else 'NONE'
     await interaction.response.send_message(
-        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — LIVE HLL SERVER' if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+        f"**COMBAT ROSTER STATUS**\nEnabled: **{'YES' if cfg.get('enabled') else 'NO'}**\nReady Room: {ready.mention if ready else 'Missing'}\nRoster channel: {text.mention if text else 'Missing'}\nParticipation gate: **DISCORD READY ROOM + LIVE HLL**\nSide detection: **{'AUTO — '+COMBAT_ROSTER_SERVER_KEY.upper() if cfg.get('auto_side',True) else 'MANUAL — '+str(cfg.get('side_mode') or 'US')}**\nMid-game protection: **ON**\nRetry-safe pending roster: **{pending_line}**\nRoster-to-move delay: **60 seconds**\nAutomatic voice-move threshold: **7+ eligible players**\nLive Ready Room muster: **{count}**\nQueued during current round: **{queued}**\n\n"+'\n'.join(lines),ephemeral=True)
+
+@bot.tree.command(name='combat-system-check', description='Diagnose why the automatic combat roster or voice routing is blocked.')
+async def combat_system_check(interaction:discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
+    row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
+    if not row:
+        await interaction.followup.send('**COMBAT SYSTEM CHECK — NOT CONFIGURED**\nRun `/combat-setup` first.',ephemeral=True); return
+    cfg=dict(row); guild=interaction.guild
+    pending_id=cfg.get('pending_match_id'); pending_error=cfg.get('pending_last_error')
+    ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=guild.get_channel(int(cfg.get('text_channel_id') or 0))
+    bindings=_combat_bindings(cfg)
+    bound=[]; missing=[]
+    for key in COMBAT_ELEMENT_KEYS:
+        ch=guild.get_channel(int(bindings.get(key) or 0))
+        (bound if isinstance(ch,(discord.VoiceChannel,discord.StageChannel)) else missing).append(key)
+    me=guild.me
+    guild_move=bool(me and me.guild_permissions.move_members)
+    ready_members=_formation_members(ready) if ready else []
+    active=await _latest_active_hll_match_id(); match_row=await _active_or_latest_match_label(active)
+    muster=None
+    if active and ready_members:
+        try: muster=await _live_ready_room_side_muster(active,ready_members)
+        except Exception: log.exception('[COMBAT SYSTEM CHECK MUSTER FAILED] guild=%s',guild.id)
+    us=len((muster or {}).get('US',[])); nva=len((muster or {}).get('NVA',[]))
+    linked_missing=len((muster or {}).get('NOT_LINKED',[])); not_live=len((muster or {}).get('NOT_IN_SERVER',[])); unknown_side=len((muster or {}).get('UNKNOWN_SIDE',[]))
+    eligible=max(us,nva)
+    side='US' if us>nva else ('NVA' if nva>us else None)
+    blockers=[]
+    if not cfg.get('enabled'): blockers.append('automation is OFF')
+    if not ready: blockers.append('Ready Room missing')
+    if not text: blockers.append('roster text channel missing')
+    if missing: blockers.append(f'{len(missing)} combat voice net(s) unbound')
+    if not guild_move: blockers.append('Battalion Clerk lacks Move Members permission')
+    if not active: blockers.append(f'no live match detected on {COMBAT_ROSTER_SERVER_KEY}')
+    if active and len(ready_members)<MATCH_FORMATION_MIN_PLAYERS: blockers.append(f'only {len(ready_members)} member(s) in Ready Room; 6 required')
+    if active and len(ready_members)>=MATCH_FORMATION_MIN_PLAYERS and eligible<MATCH_FORMATION_MIN_PLAYERS:
+        blockers.append(f'only {eligible} eligible linked member(s) on one HLL side; 6 required')
+    if active and us==nva and us>0: blockers.append(f'side is tied U.S. {us} / NVA {nva}; no majority side')
+    if eligible==6: blockers.append('6-player hold is active; roster can post but automatic voice movement starts at 7+')
+    state='READY' if not blockers else 'BLOCKED'
+    label='None'
+    if match_row:
+        label=f"{match_row.get('map_name') or match_row.get('map_id') or 'Unknown map'} • {match_row.get('game_mode') or 'Unknown mode'} • Match {active}"
+    details=(
+        f"**COMBAT SYSTEM CHECK — {state}**\n"
+        f"Combat server: **{COMBAT_ROSTER_SERVER_KEY.upper()}**\n"
+        f"Automation: **{'ON' if cfg.get('enabled') else 'OFF'}**\n"
+        f"Ready Room: {ready.mention if ready else '**MISSING**'}\n"
+        f"Roster channel: {text.mention if text else '**MISSING**'}\n"
+        f"Voice nets bound: **{len(bound)}/9**\n"
+        f"Move Members permission: **{'YES' if guild_move else 'NO'}**\n"
+        f"Active combat-server match: **{label}**\n"
+        f"Pending auto-roster: **{('Match '+str(pending_id)) if pending_id else 'NONE'}**\n"
+        f"Pending reason: **{pending_error or '—'}**\n"
+        f"Ready Room members: **{len(ready_members)}**\n"
+        f"Detected U.S.: **{us}** | NVA: **{nva}**\n"
+        f"Not game-linked: **{linked_missing}** | Linked but not live: **{not_live}** | Side unresolved: **{unknown_side}**\n"
+        f"Eligible majority side: **{side or 'NONE'} ({eligible})**\n"
+    )
+    if blockers:
+        details += '\n**WHY IT IS BLOCKED**\n' + '\n'.join(f'• {x}' for x in blockers[:10])
+    else:
+        details += f'\n**ROUTING READY** — next eligible new {COMBAT_ROSTER_SERVER_KEY.upper()} round can file a roster; automatic voice movement begins at 7+ eligible members.'
+    await interaction.followup.send(details[:1900],ephemeral=True)
 
 @bot.tree.command(name='combat-generate', description='Manually randomize the current Ready Room and move everyone to bound combat channels.')
 async def combat_generate(interaction:discord.Interaction):
@@ -5009,12 +5745,12 @@ async def _recruit_save(user, step:int, answers:dict):
     return result
 
 
-class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
+class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Intake — Part 1 of 3'):
     age=discord.ui.TextInput(label='Age (optional)',required=False,max_length=2,placeholder='Leave blank if you prefer')
     timezone_name=discord.ui.TextInput(label='Time zone',max_length=60,placeholder='Example: Eastern / EDT')
     game_platform=discord.ui.TextInput(label='Platform',max_length=30,placeholder='STEAM, XBOX, or PS5')
     game_identity=discord.ui.TextInput(label='SteamID64 / Gamertag / PSN ID',max_length=100,placeholder='Steam must be the 17-digit SteamID64')
-    hll_experience=discord.ui.TextInput(label='HLL / HLL: Vietnam experience',max_length=80,placeholder='New / Some / Experienced / Very experienced')
+    hll_experience=discord.ui.TextInput(label='HLL / HLL: Vietnam experience',max_length=80,placeholder='New / Some experience / Experienced / Very experienced')
 
     async def on_submit(self, interaction:discord.Interaction):
         platform=RECRUIT_PLATFORM_ALIASES.get(str(self.game_platform.value).strip().upper())
@@ -5036,17 +5772,17 @@ class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — Part 2 of 3'):
+class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Intake — Part 2 of 3'):
     role_interest=discord.ui.TextInput(label='Preferred duty / role',max_length=100,placeholder='Example: Rifleman / Infantry')
-    looking_for=discord.ui.TextInput(label='Why do you want assignment to 1/5 CAV?',style=discord.TextStyle.paragraph,max_length=1000)
-    play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Casual organized / Milsim / Competitive / Mixed')
-    follows_chain=discord.ui.TextInput(label='Will you follow the chain of command?',max_length=5,placeholder='YES or NO')
-    participation=discord.ui.TextInput(label='Typical participation',max_length=100,placeholder='Example: Multiple times per week')
+    looking_for=discord.ui.TextInput(label='What are you looking for in the 5th Cav?',style=discord.TextStyle.paragraph,max_length=1000,placeholder='Good community / teamwork / armor / aviation / leadership / mix')
+    play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Organized casual / team-focused / competitive / mixed')
+    follows_chain=discord.ui.TextInput(label='Organized teamwork / staff direction okay?',max_length=5,placeholder='YES or NO')
+    participation=discord.ui.TextInput(label='Typical participation (not mandatory)',max_length=100,placeholder='Varies / weekly / multiple times per week')
 
     async def on_submit(self, interaction:discord.Interaction):
         chain=str(self.follows_chain.value).strip().upper()
         if chain not in {'YES','Y','NO','N'}:
-            await interaction.response.send_message('Chain of command answer must be **YES** or **NO**. Press Part 2 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+            await interaction.response.send_message('Organized-teamwork answer must be **YES** or **NO**. Press Part 2 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
         try:
             await _recruit_save(interaction.user,3,{
                 'role_interest':str(self.role_interest.value).strip(),'looking_for':str(self.looking_for.value).strip(),
@@ -5058,9 +5794,9 @@ class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — P
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — Final Step'):
+class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Intake — Final Step'):
     heard_about=discord.ui.TextInput(label='How did you hear about the 1/5 Cav?',max_length=120,placeholder='Discord / server / friend / Reddit / other')
-    community_ack=discord.ui.TextInput(label='Respectful teamwork expected — agree?',max_length=8,placeholder='YES')
+    community_ack=discord.ui.TextInput(label='Community rules / fair play — agree?',max_length=8,placeholder='YES')
     applicant_notes=discord.ui.TextInput(label='Anything else HQ should know?',required=False,style=discord.TextStyle.paragraph,max_length=1000,placeholder='Optional')
 
     def __init__(self, recruited_by: str='NONE', recruiter_personnel_id: str | None=None, recruiter_discord_user_id: int | None=None):
@@ -5072,7 +5808,7 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
     async def on_submit(self, interaction:discord.Interaction):
         ack=str(self.community_ack.value).strip().upper()
         if ack not in {'YES','Y','AGREE','I AGREE'}:
-            await interaction.response.send_message('You must answer **YES** to the community expectations acknowledgment to file the intake.',ephemeral=_recruit_ephemeral(interaction)); return
+            await interaction.response.send_message('You must answer **YES** to the community rules/fair-play acknowledgment to file the intake.',ephemeral=_recruit_ephemeral(interaction)); return
         await interaction.response.defer(thinking=True,ephemeral=_recruit_ephemeral(interaction))
         try:
             await _recruit_save(interaction.user,4,{
@@ -5247,7 +5983,7 @@ def _manual_recruit_intake_message(case_number: str | None = None) -> str:
     case_label=(case_number or 'RECRUITING CASE').strip()
     return (f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
             f"**REPORT TO THE REPLACEMENT LINE — {case_label}**\n\n"
-            "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
+            "You’re on the books with Recruiting. This is the optional Discord version of the same application pipeline—no second website application is needed. Knock out these items so Command can finish your case:\n\n"
             "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
             "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
             "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
@@ -5283,6 +6019,35 @@ async def recruit_intake_health(interaction:discord.Interaction):
             '**REPLACEMENT INTERVIEW PIPELINE — FAILED**\n'
             f'Website queue could not be read: `{type(exc).__name__}: {str(exc)[:350]}`\n'
             'Check the Website service URL, CLERK_SYNC_KEY on both services, and Railway logs.',ephemeral=True)
+
+
+@bot.tree.command(name='send-recruit-intake',description='Send or resume the optional 1/5 Cav Discord intake for a member.')
+@app_commands.describe(member='Discord member who should receive the recruiting intake')
+async def send_recruit_intake(interaction:discord.Interaction, member:discord.Member):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    gid=interaction.guild.id if interaction.guild else int(GUILD_ID or 0)
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        await interaction.followup.send('**DISCORD INTAKE NOT SENT**\nWebsite/Clerk synchronization is not configured.',ephemeral=True); return
+    try:
+        state=await web.request('POST','/internal/clerk/recruiting/intake/start',json={
+            'guild_id':gid,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name
+        })
+        if state.get('existing_member'):
+            await interaction.followup.send(f'**NO INTAKE REQUIRED**\n{member.mention} is already linked to an active Soldier Record.',ephemeral=True); return
+        case=(state.get('case') or state.get('target_case') or {})
+        sent=await member.send(_manual_recruit_intake_message(case.get('case_number')),view=RecruitIntakePromptView())
+        await interaction.followup.send(
+            f'**DISCORD INTAKE SENT**\nRecipient: **{member.display_name}** (`{member.id}`)\n'
+            f'Recruiting Case: **{case.get("case_number") or "WILL BE CREATED/RESUMED ON SUBMIT"}**\n'
+            f'Discord message: **{getattr(sent,"id","CONFIRMED")}**\n'
+            'The member can use **BEGIN / RESUME INTAKE** and each completed section is saved automatically.',ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f'**DISCORD INTAKE DM BLOCKED**\nDiscord would not allow Battalion Clerk to DM **{member.display_name}**. '
+            'Have the member enable server DMs or run **/apply** directly.',ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'**DISCORD INTAKE NOT SENT**\n`{type(exc).__name__}: {str(exc)[:450]}`',ephemeral=True)
 
 
 @bot.tree.command(name='test-recruit-intake',description='Send the exact Replacement Interview DM directly to a Discord member for testing.')
@@ -5606,6 +6371,55 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         pass
     return False
 
+
+
+
+@tasks.loop(seconds=15)
+async def discord_member_action_watch():
+    """Execute explicit Command member-removal requests filed by the website."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id != GUILD_ID:
+            continue
+        try:
+            data=await web.request('GET','/internal/clerk/discord-member-actions/pending',params={'guild_id':guild.id})
+            for item in data.get('items',[]):
+                action_id=str(item.get('id') or '')
+                uid=str(item.get('discord_user_id') or '')
+                action=str(item.get('action_type') or '').upper()
+                if not action_id or not uid.isdigit():
+                    continue
+                ok=False; error=None
+                try:
+                    if action!='REMOVE_FROM_GUILD':
+                        raise RuntimeError(f'Unsupported Discord member action: {action}')
+                    member=await _fetch_guild_member(guild,int(uid))
+                    if member is not None:
+                        requested_by=str(item.get('requested_by') or 'Command')[:120]
+                        reason=str(item.get('reason') or 'Removed from unit by Command')[:250]
+                        await member.kick(reason=f'1/5 Cav Command removal — {requested_by}: {reason}')
+                    ok=True
+                    log.info('[COMMAND DISCORD MEMBER REMOVAL COMPLETE] guild=%s member=%s action=%s',guild.id,uid,action_id)
+                except discord.Forbidden:
+                    error='Battalion Clerk lacks Kick Members permission or Discord role hierarchy blocks this removal.'
+                except discord.HTTPException as exc:
+                    error=f'Discord HTTP error while removing member: {exc}'[:500]
+                except Exception as exc:
+                    error=str(exc)[:500]
+                try:
+                    await web.request('POST',f'/internal/clerk/discord-member-actions/{action_id}/complete',json={'ok':ok,'error':error})
+                except Exception as exc:
+                    log.warning('[COMMAND DISCORD MEMBER REMOVAL ACK FAILED] action=%s error=%s',action_id,exc)
+                if error:
+                    log.warning('[COMMAND DISCORD MEMBER REMOVAL FAILED] guild=%s member=%s action=%s error=%s',guild.id,uid,action_id,error)
+        except Exception as exc:
+            log.warning('[DISCORD MEMBER ACTION WATCH FAILED] guild=%s error=%s',guild.id,exc)
+
+
+@discord_member_action_watch.before_loop
+async def before_discord_member_action_watch():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=5)
@@ -7243,18 +8057,7 @@ async def unlink_game(interaction:discord.Interaction):
     )
 
 
-@bot.tree.command(name='hll-unlink', description='Legacy alias: unlink your HLL identity before using /link-game again.')
-async def hll_unlink(interaction:discord.Interaction):
-    # Keep the old command working for members who already know it, but route it
-    # through the same safe identity-only behavior as /unlink-game.
-    if not interaction.guild:
-        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
-    ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
-    await interaction.response.send_message(
-        'Your HLL game identity was unlinked. Your historical telemetry was preserved. Use `/link-game` to file the correct identity.'
-        if ok else 'No HLL identity link was on file. You can use `/link-game` now.',
-        ephemeral=True
-    )
+# V95: retired legacy /hll-unlink alias; use /unlink-game.
 
 @bot.tree.command(name='unlink-member-game', description='Command: unlink a Soldier’s incorrect SteamID64 or console gamertag.')
 @app_commands.describe(member='Soldier whose current HLL game identity should be cleared')
@@ -7417,7 +8220,10 @@ async def seeding_message_watch():
 async def before_seeding_message_watch():
     await bot.wait_until_ready()
 
-@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
+seeding_group = app_commands.Group(name='seeding', description='HLL server seeding automation controls.')
+bot.tree.add_command(seeding_group)
+
+@seeding_group.command(name='set-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
 @app_commands.describe(channel='Text channel for the 1/5 Cav server seeding calls')
 async def set_seeding_channel_command(interaction:discord.Interaction,channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
@@ -7426,7 +8232,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
         f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**; **Saturday/Sunday also 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
-@bot.tree.command(name='seeding-status', description='Show the seeding channel, schedule, and current HLL population.')
+@seeding_group.command(name='status', description='Show the seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     channel_id=await get_seeding_channel_id(interaction.guild_id)
@@ -7441,13 +8247,16 @@ async def seeding_status(interaction:discord.Interaction):
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
-@bot.tree.command(name='clear-seeding-channel', description='Disable automatic seeding messages by clearing the configured channel.')
+@seeding_group.command(name='clear-channel', description='Disable automatic seeding messages by clearing the configured channel.')
 async def clear_seeding_channel_command(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await clear_seeding_channel(interaction.guild_id)
     await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic seeding messages are disabled until a channel is assigned.',ephemeral=True)
 
-@bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
+server_message_group = app_commands.Group(name='server-message', description='HLL server broadcast message controls.')
+bot.tree.add_command(server_message_group)
+
+@server_message_group.command(name='send', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
 @app_commands.describe(message='Message to display in game (180 characters maximum)')
 async def server_message(interaction:discord.Interaction, message:str):
     if not await require_manage_guild(interaction): return
@@ -7464,7 +8273,7 @@ async def server_message(interaction:discord.Interaction, message:str):
         f"**SERVER MESSAGE SENT**\nDisplayed for **{result.get('display_seconds',10)} seconds**, then it will clear automatically.\n\n{result.get('message')}",
         ephemeral=True)
 
-@bot.tree.command(name='server-message-clear', description='Staff: immediately clear the current HLL: Vietnam server broadcast.')
+@server_message_group.command(name='clear', description='Staff: immediately clear the current HLL: Vietnam server broadcast.')
 async def server_message_clear(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
@@ -7556,7 +8365,7 @@ async def hll_stats(interaction:discord.Interaction):
         f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)
 
 if not TOKEN:
-    raise RuntimeError('DISCORD_TOKEN is not set. Add DISCORD_TOKEN in Railway Variables.')
+    raise RuntimeError('Discord bot token is not set. Add DISCORD_TOKEN in Railway Variables (DISCORD_BOT_TOKEN or BOT_TOKEN are also accepted).')
 
 if not WEBSITE_BASE_URL:
     log.warning('WEBSITE_BASE_URL is not set; duty commands will fail until it is configured.')
