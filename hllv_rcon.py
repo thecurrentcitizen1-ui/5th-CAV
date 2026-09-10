@@ -338,10 +338,14 @@ class HLLVTelemetryCollector:
             self.enabled = bool(self.host and self.password and self.port)
         else:
             self.enabled = _env_bool(enabled_key, False)
-        # Server 1 keeps the established seeding behavior. Additional servers
-        # collect normal career telemetry by default without granting duplicate
-        # seeding credit unless explicitly enabled in Railway.
-        self.seeding_enabled = True if self.server_slot == 1 else _env_bool(f"HLL_RCON_SEEDING_ENABLED{suffix}", False)
+        # V94: Seeding is population-based on BOTH official servers. Any linked
+        # Soldier present while that server is below 50 players earns seeding
+        # service credit. A server-specific Railway override may explicitly
+        # disable this, but missing variables default ON for every configured
+        # official server.
+        seed_key=f"HLL_RCON_SEEDING_ENABLED{suffix}"
+        seed_raw=os.getenv(seed_key)
+        self.seeding_enabled = True if seed_raw is None else _env_bool(seed_key, True)
         self.server_key = f"server_{self.server_slot}"
         self.health_id = self.server_slot
         self.db = data_collector.db
@@ -881,19 +885,22 @@ class HLLVTelemetryCollector:
         log.debug("[HLLV RCON SAMPLE] match=%s map=%s players=%s", match_id, server.get("map_name"), len(players))
 
     def _is_seeding_credit_window(self, player_count: int) -> bool:
+        """V94: credit every observed second below the 50-player threshold.
+
+        Message scheduling is deliberately separate from credit eligibility.
+        Credit pauses at 50+ and automatically resumes if population falls back
+        below 50, regardless of time of day.
+        """
         if not self.seeding_enabled:
             return False
-        """Credit scheduled Eastern windows while population remains below 50."""
-        now_et=utcnow().astimezone(SEEDING_TIMEZONE)
-        minutes=now_et.hour*60+now_et.minute
-        daily_window=19*60 <= minutes < 21*60
-        weekend_window=now_et.weekday() >= 5 and 14*60 <= minutes < 17*60
-        return (daily_window or weekend_window) and int(player_count or 0) < SEEDING_STOP_PLAYERS
+        return int(player_count or 0) < SEEDING_STOP_PLAYERS
 
     async def _file_seeding_credit(self, credits: list[tuple[str,int]]):
         now_et=utcnow().astimezone(SEEDING_TIMEZONE)
         service_date=now_et.date()
-        daily_cap=18000 if now_et.weekday() >= 5 else 7200
+        # Full-day population-based credit; cap only protects against duplicate
+        # poll replay exceeding the number of seconds in a calendar day.
+        daily_cap=86400
         combined={}
         for pid,seconds in credits:
             if pid and seconds>0:

@@ -1095,7 +1095,7 @@ async def reset_discord_routing(guild_id:int):
     return {'paused':True,'duty_channels_cleared':cleared_duty}
 
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
-SEEDING_EVENING_SLOTS = ((19, 0), (19, 30), (20, 0), (20, 30))
+SEEDING_EVENING_SLOTS = ((18, 0), (18, 30), (19, 0), (19, 30), (20, 0), (20, 30))
 SEEDING_WEEKEND_SLOTS = ((14, 0), (14, 30), (15, 0), (15, 30), (16, 0), (16, 30))
 SEEDING_STOP_POPULATION = max(1, int(os.getenv('HLL_SEED_STOP_PLAYERS', '50') or 50))
 SEEDING_MENTION_ROLE_NAMES = ('5th Cavalry Regiment', 'Member', 'Replacement')
@@ -7728,24 +7728,19 @@ async def hll_link_soldier(interaction:discord.Interaction, member:discord.Membe
 
 @tasks.loop(minutes=1)
 async def seeding_message_watch():
-    """Post scheduled seeding calls during active Eastern-time credit windows.
+    """Post the daily automated seeding call from 18:00-21:00 Eastern.
 
-    Every day: 19:00–21:00 Eastern. Saturday/Sunday additionally: 14:00–17:00
-    Eastern. Calls remain on the established 30-minute cadence and are suppressed
-    at the populated threshold.
+    V94 separates MESSAGE timing from CREDIT timing. Seeding credit itself is
+    earned at any hour whenever the observed official server is below 50 players.
+    Discord reminders remain a focused 6 PM-9 PM Eastern recruiting/seeding push.
     """
     now_et=datetime.now(SEEDING_TIMEZONE)
-    weekend=now_et.weekday() >= 5
-    if weekend and 14 <= now_et.hour < 17:
-        active_slots=SEEDING_WEEKEND_SLOTS
-    elif 19 <= now_et.hour < 21:
-        active_slots=SEEDING_EVENING_SLOTS
-    else:
+    if not (18 <= now_et.hour < 21):
         return
+    active_slots=SEEDING_EVENING_SLOTS
     elapsed=now_et.hour*60+now_et.minute
     eligible=[(h,m) for h,m in active_slots if h*60+m <= elapsed]
     if not eligible: return
-    # Only consider the most recent elapsed slot; older missed slots are not spammed on restart.
     hour,minute=eligible[-1]
     slot=f'{hour:02d}:{minute:02d}'
     for guild in bot.guilds:
@@ -7774,21 +7769,15 @@ async def seeding_message_watch():
             missing_roles=[]
             for role_name in SEEDING_MENTION_ROLE_NAMES:
                 role=discord.utils.get(guild.roles,name=role_name)
-                if role is not None:
-                    mention_roles.append(role)
-                else:
-                    missing_roles.append(role_name)
+                if role is not None: mention_roles.append(role)
+                else: missing_roles.append(role_name)
             role_prefix=(' '.join(role.mention for role in mention_roles) + '\n') if mention_roles else ''
             if missing_roles:
                 log.warning('[SEEDING] mention role(s) missing guild=%s roles=%s',guild.id,', '.join(missing_roles))
-            await channel.send(
-                role_prefix + SEEDING_MESSAGE.format(population=population),
-                allowed_mentions=discord.AllowedMentions(everyone=False,users=False,roles=True,replied_user=False),
-            )
+            await channel.send(role_prefix + SEEDING_MESSAGE.format(population=population),allowed_mentions=discord.AllowedMentions(roles=True,everyone=False,users=False))
             await record_seeding_notice(guild.id,now_et.date(),slot,channel.id,population)
-            log.info('[SEEDING] sent slot=%s guild=%s channel=%s population=%s',slot,guild.id,channel.id,population)
-        except Exception:
-            log.exception('[SEEDING] scheduled message failed guild=%s slot=%s',guild.id,slot)
+        except Exception as exc:
+            log.exception('[SEEDING] automated call failed guild=%s slot=%s: %s',guild.id,slot,exc)
 
 @seeding_message_watch.before_loop
 async def before_seeding_message_watch():
@@ -7802,7 +7791,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
     if not await require_manage_guild(interaction): return
     await set_seeding_channel(interaction.guild_id,channel.id)
     await interaction.response.send_message(
-        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**; **Saturday/Sunday also 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern**. '
+        f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 6:00 / 6:30 / 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
 @seeding_group.command(name='status', description='Show the seeding channel, schedule, and current HLL population.')
@@ -7813,8 +7802,8 @@ async def seeding_status(interaction:discord.Interaction):
     await interaction.response.send_message(
         '**1/5 CAV SEEDING AUTOMATION**\n'
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
-        '**Daily:** 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
-        '**Weekend extra:** 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern\n'
+        '**Daily message window:** 6:00 / 6:30 / 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
+        '**Credit rule:** Any time of day while the observed server population is below 50\n'
         f'**Populated threshold:** {SEEDING_STOP_POPULATION}+ players — seeding calls suppressed\n'
         f'**Mention roles:** {" / ".join(SEEDING_MENTION_ROLE_NAMES)}\n'
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
