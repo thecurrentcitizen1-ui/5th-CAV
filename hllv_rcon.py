@@ -324,10 +324,20 @@ class HLLVTelemetryCollector:
         self.server_slot = max(1, int(server_slot or 1))
         self.telemetry_only = bool(telemetry_only)
         suffix = "" if self.server_slot == 1 else f"_{self.server_slot}"
-        self.enabled = RCON_ENABLED if self.server_slot == 1 else _env_bool(f"HLL_RCON_ENABLED{suffix}", True)
         self.host = os.getenv(f"HLL_RCON_HOST{suffix}", "").strip()
         self.port = int(os.getenv(f"HLL_RCON_PORT{suffix}", str(RCON_PORT)) or RCON_PORT)
         self.password = os.getenv(f"HLL_RCON_PASSWORD{suffix}", "")
+        # Reliability V3: when credentials are present, RCON telemetry should be
+        # enabled unless Railway explicitly sets HLL_RCON_ENABLED[_N]=false.
+        # Older builds defaulted Server #1 to disabled when the enable variable
+        # was missing, which could silently turn the public live board into 0/100
+        # after a redeploy even though valid credentials were still configured.
+        enabled_key = f"HLL_RCON_ENABLED{suffix}"
+        enabled_raw = os.getenv(enabled_key)
+        if enabled_raw is None:
+            self.enabled = bool(self.host and self.password and self.port)
+        else:
+            self.enabled = _env_bool(enabled_key, False)
         # Server 1 keeps the established seeding behavior. Additional servers
         # collect normal career telemetry by default without granting duplicate
         # seeding credit unless explicitly enabled in Railway.
@@ -733,15 +743,27 @@ class HLLVTelemetryCollector:
             return
         now = utcnow()
         await self.db.execute("""
-            UPDATE hll_rcon_health SET connected=$1,
-                last_success_at=CASE WHEN $1 THEN $2 ELSE last_success_at END,
-                last_error_at=CASE WHEN $1 THEN last_error_at ELSE $2 END,
-                last_error=CASE WHEN $1 THEN NULL ELSE $3 END,
-                last_server_name=$4,last_map_name=$5,last_game_mode=$6,last_player_count=$7,updated_at=NOW()
-            WHERE id=$8
+            INSERT INTO hll_rcon_health(
+                id,enabled,connected,host,port,server_key,last_success_at,last_error_at,last_error,
+                last_server_name,last_map_name,last_game_mode,last_player_count,updated_at
+            ) VALUES(
+                $8,$9,$1,$10,$11,$12,
+                CASE WHEN $1 THEN $2 ELSE NULL END,
+                CASE WHEN $1 THEN NULL ELSE $2 END,
+                CASE WHEN $1 THEN NULL ELSE $3 END,
+                $4,$5,$6,$7,NOW()
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                enabled=EXCLUDED.enabled,connected=EXCLUDED.connected,host=EXCLUDED.host,port=EXCLUDED.port,server_key=EXCLUDED.server_key,
+                last_success_at=CASE WHEN EXCLUDED.connected THEN EXCLUDED.last_success_at ELSE hll_rcon_health.last_success_at END,
+                last_error_at=CASE WHEN EXCLUDED.connected THEN hll_rcon_health.last_error_at ELSE EXCLUDED.last_error_at END,
+                last_error=CASE WHEN EXCLUDED.connected THEN NULL ELSE EXCLUDED.last_error END,
+                last_server_name=EXCLUDED.last_server_name,last_map_name=EXCLUDED.last_map_name,
+                last_game_mode=EXCLUDED.last_game_mode,last_player_count=EXCLUDED.last_player_count,updated_at=NOW()
         """, connected, now, error[:1000] if error else None,
              self.last_server.get("server_name"), self.last_server.get("map_name"),
-             self.last_server.get("game_mode"), int(self.last_players or 0), self.health_id)
+             self.last_server.get("game_mode"), int(self.last_players or 0), self.health_id,
+             bool(self.enabled), self.host or None, self.port, self.server_key)
 
     async def _run(self):
         while not self._stop.is_set():
@@ -778,13 +800,26 @@ class HLLVTelemetryCollector:
             # Some hllrcon builds auto-connect on first command and may consider an
             # already-connected connect() harmless/invalid. Continue to commands.
             pass
-        session = await self.rcon.get_server_session()
+        session_response = await self.rcon.get_server_session()
         players_response = await self.rcon.get_players()
+        # hllrcon 2.x patch releases have used both direct models and wrapped
+        # response objects. Unwrap common shapes so a library serialization change
+        # cannot make a healthy server appear empty.
+        session_dump = _dump_model(session_response)
+        session = _first(session_dump, "session", "server_session", "serverSession", "data", default=session_response)
         server = self._server_payload(session)
         players = getattr(players_response, "players", None)
         if players is None:
-            players = _first(_dump_model(players_response), "players", default=[])
-        players = list(players or [])
+            pd = _dump_model(players_response)
+            players = _first(pd, "players", "player_list", "playerList", default=None)
+            if players is None:
+                wrapped = _first(pd, "data", "result", default={})
+                wrapped = wrapped if isinstance(wrapped, dict) else _dump_model(wrapped)
+                players = _first(wrapped, "players", "player_list", "playerList", default=[])
+        if isinstance(players, dict):
+            players = list(players.values())
+        else:
+            players = list(players or [])
         self.last_server = server
         self.last_players = len(players)
         match_id = await self._ensure_match(server)
