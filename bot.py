@@ -4146,7 +4146,9 @@ async def _recovery_v2_record(guild_id,key,ok,error=None):
         await db.execute("""INSERT INTO clerk_recovery_v2_state(guild_id,recovery_key,attempt_count,last_attempt_at,last_error)
             VALUES($1,$2,1,NOW(),$3) ON CONFLICT(guild_id,recovery_key) DO UPDATE SET attempt_count=clerk_recovery_v2_state.attempt_count+1,last_attempt_at=NOW(),last_error=EXCLUDED.last_error,updated_at=NOW()""",str(guild_id),str(key),str(error or '')[:500])
 
-@bot.tree.command(name='system-health', description='Show Battalion Clerk, Website, Discord, Recruiting, Awards, database, and HLL system health.')
+system_group = app_commands.Group(name='system', description='Battalion Clerk health, tracking diagnostics, and safe recovery.')
+
+@system_group.command(name='health', description='Show Website, Discord, Recruiting, Awards, database, and HLL system health.')
 async def system_health_summary(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
@@ -4161,7 +4163,24 @@ async def system_health_summary(interaction:discord.Interaction):
     except Exception as exc:
         await interaction.followup.send(f'🔴 **SYSTEM HEALTH UNAVAILABLE**\nWebsite health endpoint could not be reached: `{str(exc)[:300]}`',ephemeral=True)
 
-@bot.tree.command(name='repair-system', description='Run safe Battalion Clerk/Website reconciliation for retryable failures.')
+
+@system_group.command(name='tracking', description='Audit member HLL stats, match ledgers, identity attribution, and seeding integrity.')
+async def tracking_health_summary(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        data=await web.request('GET','/internal/clerk/tracking-health')
+        state=str(data.get('overall') or 'UNKNOWN').upper(); icon={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(state,'⚪')
+        lines=[f'**{icon} MEMBER TRACKING HEALTH — {state}**']
+        for c in data.get('checks') or []:
+            st=str(c.get('status') or 'UNKNOWN').upper(); e={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(st,'⚪')
+            lines.append(f"{e} **{c.get('name') or 'CHECK'}** — {c.get('detail') or st}")
+        lines.append('Use `/system repair` for safe, mechanically provable repairs. Identity ownership and match winners are never guessed.')
+        await interaction.followup.send(('\n'.join(lines))[:1950],ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'🔴 **TRACKING AUDIT UNAVAILABLE**\n`{str(exc)[:500]}`',ephemeral=True)
+
+@system_group.command(name='repair', description='Run safe Battalion Clerk/Website reconciliation for retryable failures.')
 async def repair_system(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
@@ -4174,6 +4193,10 @@ async def repair_system(interaction:discord.Interaction):
                f"Discord role syncs requeued: **{r.get('role_sync_requeued',0)}**",
                f"Recruit/login deliveries requeued: **{r.get('recruit_delivery_requeued',0)}**",
                f"Recruiting safeguards reconciled: **{r.get('recruit_reconciled',0)}**",
+               f"Historical HLL rows re-attributed: **{r.get('telemetry_identity_backfilled',0)}**",
+               f"Invalid telemetry rows normalized: **{r.get('negative_telemetry_clamped',0)}**",
+               f"Orphan tracking rows cleared: **{sum(int(r.get(k,0) or 0) for k in ('orphan_hll_links_removed','orphan_hll_stats_removed','orphan_hll_samples_removed','orphan_hll_weapon_events_removed','orphan_commander_rows_removed'))}**",
+               f"Seeding ledger corrections: **{int(r.get('seeding_negative_fixed',0) or 0)+int(r.get('seeding_cap_fixed',0) or 0)}**",
                f"Current health: **{health.get('overall','UNKNOWN')}**"]
         if data.get('warnings'): lines.append('Warnings: '+ ' | '.join(data.get('warnings')[:3]))
         lines.append('No rank, award, assignment, or game-identity ownership decision was changed automatically.')
@@ -4203,12 +4226,15 @@ async def reliability_recovery_v2_watch():
 async def before_reliability_recovery_v2_watch():
     await bot.wait_until_ready()
 
-@bot.tree.command(name='system-health-channel', description='Assign the Command channel for Battalion Clerk/system failure alerts.')
+@system_group.command(name='channel', description='Assign the Command channel for Battalion Clerk/system failure alerts.')
 async def system_health_channel(interaction:discord.Interaction, channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
     await set_report_channel(interaction.guild_id,'SYSTEM_HEALTH',channel.id)
     await interaction.response.send_message(f'Battalion system failure/recovery alerts will be posted to {channel.mention}.',ephemeral=True)
 
+# One top-level /system command replaces four diagnostic commands, keeping the
+# Discord global application-command budget safely below the 100-command cap.
+bot.tree.add_command(system_group)
 
 @tasks.loop(minutes=60)
 async def growth_accountability_watch():
@@ -7768,7 +7794,9 @@ async def seeding_message_watch():
 async def before_seeding_message_watch():
     await bot.wait_until_ready()
 
-@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
+seeding_group = app_commands.Group(name='seeding', description='Configure and inspect automated server seeding calls.')
+
+@seeding_group.command(name='set', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
 @app_commands.describe(channel='Text channel for the 1/5 Cav server seeding calls')
 async def set_seeding_channel_command(interaction:discord.Interaction,channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
@@ -7777,7 +7805,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
         f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**; **Saturday/Sunday also 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
-@bot.tree.command(name='seeding-status', description='Show the seeding channel, schedule, and current HLL population.')
+@seeding_group.command(name='status', description='Show the seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     channel_id=await get_seeding_channel_id(interaction.guild_id)
@@ -7792,11 +7820,14 @@ async def seeding_status(interaction:discord.Interaction):
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
-@bot.tree.command(name='clear-seeding-channel', description='Disable automatic seeding messages by clearing the configured channel.')
+@seeding_group.command(name='clear', description='Disable automatic seeding messages by clearing the configured channel.')
 async def clear_seeding_channel_command(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await clear_seeding_channel(interaction.guild_id)
     await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic seeding messages are disabled until a channel is assigned.',ephemeral=True)
+
+# Consolidated to preserve global slash-command headroom.
+bot.tree.add_command(seeding_group)
 
 @bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
 @app_commands.describe(message='Message to display in game (180 characters maximum)')
@@ -7835,7 +7866,9 @@ async def hll_vip_sync_command(interaction: discord.Interaction):
         await interaction.followup.send(f'VIP reconciliation failed: `{exc}`',ephemeral=True)
 
 
-@bot.tree.command(name='hll-rcon-status', description='Show Battalion Clerk HLL: Vietnam RCON collector health.')
+hll_group = app_commands.Group(name='hll', description='HLL: Vietnam telemetry status, research, and member statistics.')
+
+@hll_group.command(name='status', description='Show Battalion Clerk HLL: Vietnam RCON collector health.')
 async def hll_rcon_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
@@ -7851,7 +7884,7 @@ async def hll_rcon_status(interaction:discord.Interaction):
         f"Players: **{st.get('player_count',0)}**\nLast successful sample: `{last_txt}`\n"
         + (f"Last error: `{str(st.get('last_error'))[:700]}`" if st.get('last_error') else 'Last error: **NONE**'),ephemeral=True)
 
-@bot.tree.command(name='hll-research', description='Show your latest HLLV telemetry research sample for role/vehicle/aviation mapping.')
+@hll_group.command(name='research', description='Show your latest HLLV telemetry research sample for role/vehicle/aviation mapping.')
 async def hll_research(interaction:discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
@@ -7868,7 +7901,7 @@ async def hll_research(interaction:discord.Interaction):
         f"Loadout: **{r.get('loadout') or '—'}**\nSpeed: **{speed:.1f} km/h** • Vertical rate: **{vs:.2f} m/s**\n"
         f"Position: `{r.get('x')}, {r.get('y')}, {r.get('z')}`\nObserved: `{r.get('observed_at')}`",ephemeral=True)
 
-@bot.tree.command(name='hll-role-research', description='Staff: summarize observed HLLV role IDs and movement evidence.')
+@hll_group.command(name='role-research', description='Staff: summarize observed HLLV role IDs and movement evidence.')
 async def hll_role_research(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
@@ -7880,7 +7913,7 @@ async def hll_role_research(interaction:discord.Interaction):
         lines.append(f"`{r.get('role_id')}` — {r.get('verified_role_name') or r.get('observed_label') or 'UNMAPPED'} | samples {int(r.get('sample_count') or 0)} | loadouts {int(r.get('loadout_count') or 0)} | max {float(r.get('max_speed_mps') or 0)*3.6:.0f} km/h | vertical {float(r.get('max_vertical_speed_mps') or 0):.1f} m/s | {'VERIFIED' if r.get('verified') else 'OBSERVE'}")
     await interaction.followup.send('**HLLV ROLE / VEHICLE / AVIATION RESEARCH**\n'+'\n'.join(lines),ephemeral=True)
 
-@bot.tree.command(name='hll-stats', description='Show your automatically recorded HLL: Vietnam field-service statistics.')
+@hll_group.command(name='stats', description='Show your automatically recorded HLL: Vietnam field-service statistics.')
 async def hll_stats(interaction:discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
@@ -7905,6 +7938,16 @@ async def hll_stats(interaction:discord.Interaction):
         f"Verified field experience: **{a.get('field_experience') or 'NEWLY ARRIVED'}**\n"
         f"Total score: **{int(a.get('score_total') or 0)}**\n"
         f"Latest map: **{latest.get('map_name') or '—'} / {latest.get('game_mode') or '—'}**",ephemeral=True)
+
+# Consolidated to preserve global slash-command headroom.
+bot.tree.add_command(hll_group)
+
+# Fail fast with a readable diagnostic if future development approaches Discord's
+# 100 global CHAT_INPUT command limit again. Groups count as one top-level command.
+_top_level_command_count = len(bot.tree.get_commands())
+if _top_level_command_count > 100:
+    raise RuntimeError(f'Discord global slash-command budget exceeded: {_top_level_command_count}/100. Consolidate related commands into app_commands.Group before deploy.')
+log.info('[COMMAND BUDGET] top_level=%s/100 headroom=%s', _top_level_command_count, 100-_top_level_command_count)
 
 if not TOKEN:
     raise RuntimeError('Discord bot token is not set. Add DISCORD_TOKEN in Railway Variables (DISCORD_BOT_TOKEN or BOT_TOKEN are also accepted).')

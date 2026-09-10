@@ -354,6 +354,9 @@ class HLLVTelemetryCollector:
         self.last_error: str = ""
         self.last_server: dict = {}
         self.last_players: int = 0
+        self.last_players_filed: int = 0
+        self.last_player_errors: int = 0
+        self.last_partial_error: str = ""
         self._broadcast_match_id: Optional[int] = None
         self._broadcast_next_elapsed: Optional[int] = None
         self._broadcast_generation: int = 0
@@ -426,6 +429,8 @@ class HLLVTelemetryCollector:
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS winner_side TEXT")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS winner_faction_id TEXT")
         await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS result_verified_at TIMESTAMPTZ")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS last_remaining_seconds INTEGER")
+        await self.db.execute("ALTER TABLE hll_match_sessions ADD COLUMN IF NOT EXISTS last_match_length_seconds INTEGER")
         # Historical HLL: Vietnam collector rows may predate faction-id retention.
         # WDEV launch factions are US=2 (Allied/Southern) and NVA=1 (Axis/Northern).
         await self.db.execute("""UPDATE hll_match_sessions
@@ -684,6 +689,9 @@ class HLLVTelemetryCollector:
         # each official server can retain independent connection health.
         await self.db.execute("ALTER TABLE hll_rcon_health DROP CONSTRAINT IF EXISTS hll_rcon_health_id_check")
         await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS server_key TEXT")
+        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_players_filed INTEGER NOT NULL DEFAULT 0")
+        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_player_errors INTEGER NOT NULL DEFAULT 0")
+        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_partial_error TEXT")
         await self.db.execute("""
             INSERT INTO hll_rcon_health(id,enabled,connected,host,port,server_key)
             VALUES($1,$2,FALSE,$3,$4,$5)
@@ -745,13 +753,14 @@ class HLLVTelemetryCollector:
         await self.db.execute("""
             INSERT INTO hll_rcon_health(
                 id,enabled,connected,host,port,server_key,last_success_at,last_error_at,last_error,
-                last_server_name,last_map_name,last_game_mode,last_player_count,updated_at
+                last_server_name,last_map_name,last_game_mode,last_player_count,
+                last_players_filed,last_player_errors,last_partial_error,updated_at
             ) VALUES(
                 $8,$9,$1,$10,$11,$12,
                 CASE WHEN $1 THEN $2 ELSE NULL END,
                 CASE WHEN $1 THEN NULL ELSE $2 END,
                 CASE WHEN $1 THEN NULL ELSE $3 END,
-                $4,$5,$6,$7,NOW()
+                $4,$5,$6,$7,$13,$14,$15,NOW()
             )
             ON CONFLICT(id) DO UPDATE SET
                 enabled=EXCLUDED.enabled,connected=EXCLUDED.connected,host=EXCLUDED.host,port=EXCLUDED.port,server_key=EXCLUDED.server_key,
@@ -759,11 +768,15 @@ class HLLVTelemetryCollector:
                 last_error_at=CASE WHEN EXCLUDED.connected THEN hll_rcon_health.last_error_at ELSE EXCLUDED.last_error_at END,
                 last_error=CASE WHEN EXCLUDED.connected THEN NULL ELSE EXCLUDED.last_error END,
                 last_server_name=EXCLUDED.last_server_name,last_map_name=EXCLUDED.last_map_name,
-                last_game_mode=EXCLUDED.last_game_mode,last_player_count=EXCLUDED.last_player_count,updated_at=NOW()
+                last_game_mode=EXCLUDED.last_game_mode,last_player_count=EXCLUDED.last_player_count,
+                last_players_filed=EXCLUDED.last_players_filed,last_player_errors=EXCLUDED.last_player_errors,
+                last_partial_error=EXCLUDED.last_partial_error,updated_at=NOW()
         """, connected, now, error[:1000] if error else None,
              self.last_server.get("server_name"), self.last_server.get("map_name"),
              self.last_server.get("game_mode"), int(self.last_players or 0), self.health_id,
-             bool(self.enabled), self.host or None, self.port, self.server_key)
+             bool(self.enabled), self.host or None, self.port, self.server_key,
+             int(self.last_players_filed or 0), int(self.last_player_errors or 0),
+             (self.last_partial_error or None))
 
     async def _run(self):
         while not self._stop.is_set():
@@ -832,12 +845,27 @@ class HLLVTelemetryCollector:
                 log.warning("[HLLV RECRUITING BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
         seeding_now = self._is_seeding_credit_window(len(players))
         seeding_credits=[]
+        filed_count=0
+        player_errors=[]
         for player in players:
-            filed=await self._file_player(match_id, player, server_player_count=len(players))
-            if seeding_now and filed and filed[0] and int(filed[1] or 0)>0:
-                seeding_credits.append((filed[0],int(filed[1] or 0)))
+            try:
+                filed=await self._file_player(match_id, player, server_player_count=len(players))
+                filed_count += 1
+                if seeding_now and filed and filed[0] and int(filed[1] or 0)>0:
+                    seeding_credits.append((filed[0],int(filed[1] or 0)))
+            except Exception as exc:
+                # One malformed/public player payload must never interrupt stat
+                # filing for every other Soldier on the server.
+                player_errors.append(f"{type(exc).__name__}: {exc}")
+                log.warning("[HLLV PLAYER SAMPLE SKIPPED] match=%s error=%s", match_id, player_errors[-1])
+        self.last_players_filed=filed_count
+        self.last_player_errors=len(player_errors)
+        self.last_partial_error=(player_errors[0][:500] if player_errors else "")
         if seeding_credits:
-            await self._file_seeding_credit(seeding_credits)
+            try:
+                await self._file_seeding_credit(seeding_credits)
+            except Exception as exc:
+                log.warning("[HLLV SEEDING CREDIT WRITE FAILED] match=%s error=%s",match_id,exc)
         try:
             await self._reconcile_pending_identity_claims()
         except Exception as exc:
@@ -999,9 +1027,19 @@ class HLLVTelemetryCollector:
         response = await self.rcon.get_admin_log(max(20, RCON_POLL_SECONDS * 4))
         entries = getattr(response, "entries", None)
         if entries is None:
-            entries = _first(_dump_model(response), "entries", default=[])
+            payload=_dump_model(response)
+            entries = _first(payload, "entries", default=None)
+            if entries is None:
+                wrapped=_first(payload,"data","result",default={})
+                wrapped=wrapped if isinstance(wrapped,dict) else _dump_model(wrapped)
+                entries=_first(wrapped,"entries","logs","events",default=[])
         for entry in list(entries or []):
-            await self._file_weapon_log(match_id, entry)
+            try:
+                await self._file_weapon_log(match_id, entry)
+            except Exception as exc:
+                # Do not let one malformed admin-log event block all later weapon
+                # attribution or the player telemetry poll.
+                log.warning("[HLLV WEAPON EVENT SKIPPED] match=%s error=%s",match_id,exc)
 
     async def _file_weapon_log(self, match_id: int, entry: Any):
         d = _dump_model(entry)
@@ -1286,18 +1324,26 @@ class HLLVTelemetryCollector:
         # Map/mode changes are authoritative round boundaries. A match timer reset
         # on the same layer is also detected by closing records that have been stale.
         if self._active_match_id and self._active_match_signature == signature:
-            # Preserve the latest score from THIS active round on every poll.  When
-            # the layer changes, the first payload belongs to the NEW round and its
-            # score is usually reset to 0-0.  Persisting the old round continuously
-            # prevents that new-round score from being written over the completed
-            # match and corrupting Commander win/loss history.
-            await self.db.execute("""UPDATE hll_match_sessions SET last_seen_at=NOW(),
-                final_allied_score=$1,final_axis_score=$2,
-                allied_faction_id=COALESCE(NULLIF($3,''),allied_faction_id),
-                axis_faction_id=COALESCE(NULLIF($4,''),axis_faction_id) WHERE id=$5""",
-                int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),
-                str(server.get('allied_faction_id') or ''),str(server.get('axis_faction_id') or ''),self._active_match_id)
-            return self._active_match_id
+            # Same-layer restarts/rematches are real round boundaries too. Detect a
+            # significant remaining-time jump so two rounds on the same map/mode are
+            # never merged into one lifetime-stat ledger.
+            current_remaining=int(server.get("remaining_match_time") or 0)
+            current_length=int(server.get("match_length") or 0)
+            previous=await self.db.fetchrow("SELECT last_remaining_seconds,last_match_length_seconds FROM hll_match_sessions WHERE id=$1",self._active_match_id)
+            previous_remaining=int((previous or {}).get("last_remaining_seconds") or 0)
+            timer_reset=bool(previous_remaining>0 and current_remaining>previous_remaining+max(120,RCON_POLL_SECONDS*4))
+            if not timer_reset:
+                # Preserve the latest score from THIS active round on every poll.
+                await self.db.execute("""UPDATE hll_match_sessions SET last_seen_at=NOW(),
+                    final_allied_score=$1,final_axis_score=$2,
+                    allied_faction_id=COALESCE(NULLIF($3,''),allied_faction_id),
+                    axis_faction_id=COALESCE(NULLIF($4,''),axis_faction_id),
+                    last_remaining_seconds=$5,last_match_length_seconds=$6 WHERE id=$7""",
+                    int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),
+                    str(server.get('allied_faction_id') or ''),str(server.get('axis_faction_id') or ''),
+                    current_remaining,current_length,self._active_match_id)
+                return self._active_match_id
+            log.info("[HLLV SAME-LAYER ROUND RESET] old_match=%s previous_remaining=%s current_remaining=%s",self._active_match_id,previous_remaining,current_remaining)
         if self._active_match_id:
             closed_match_id=self._active_match_id
             # DO NOT use `server` scores here: `server` is already the newly
@@ -1333,11 +1379,12 @@ class HLLVTelemetryCollector:
             except Exception:
                 log.exception("[HLL KILL ROUND RECONCILE FAILED] match=%s",closed_match_id)
         row = await self.db.fetchrow("""
-            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id,final_allied_score,final_axis_score,server_key)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id
+            INSERT INTO hll_match_sessions(server_name,map_id,map_name,game_mode,match_length_seconds,allied_faction_id,axis_faction_id,final_allied_score,final_axis_score,server_key,last_remaining_seconds,last_match_length_seconds)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id
         """, server.get("server_name"), server.get("map_id"), server.get("map_name"), server.get("game_mode"), int(server.get("match_length") or 0),
              str(server.get('allied_faction_id') or '') or None,str(server.get('axis_faction_id') or '') or None,
-             int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),self.server_key)
+             int(server.get("allied_score") or 0),int(server.get("axis_score") or 0),self.server_key,
+             int(server.get("remaining_match_time") or 0),int(server.get("match_length") or 0))
         self._active_match_id = int(row["id"])
         self._active_match_signature = signature
         log.info("[HLLV MATCH OPEN] id=%s map=%s mode=%s", self._active_match_id, server.get("map_name"), server.get("game_mode"))
@@ -1489,7 +1536,8 @@ class HLLVTelemetryCollector:
              altitude_gain_m, 1 if distance_m > 0 else 0, rejected, json.dumps(role_seconds), json.dumps(role_distance),
              json.dumps(role_max_speed), json.dumps(role_high_speed), json.dumps(role_airmobile_seconds), json.dumps(role_airmobile_distance),
              observed_speed_mps, high_speed_add,
-             accrue_seconds if personnel_id else 0, distance_m if personnel_id else 0.0,
+             accrue_seconds if (personnel_id and (_looks_like_m16(loadout) or _looks_like_m16(_first(d,"weapon","weapon_name","weaponName",default="")))) else 0,
+             distance_m if (personnel_id and (_looks_like_m16(loadout) or _looks_like_m16(_first(d,"weapon","weapon_name","weaponName",default="")))) else 0.0,
              int(_first(score, "combat", "COMBAT", default=0) or 0), int(_first(score, "defense", "DEFENSE", default=0) or 0),
              int(_first(score, "offense", "OFFENSE", default=0) or 0), int(_first(score, "support", "SUPPORT", default=0) or 0),
              int(_first(stats, "deaths", default=0) or 0), int(_first(stats, "infantry_kills", "infantryKills", default=0) or 0),
