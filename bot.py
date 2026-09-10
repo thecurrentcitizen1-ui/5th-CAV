@@ -4081,6 +4081,7 @@ async def weekly_battalion_report_watch():
     now=datetime.now(tz)
     for guild in bot.guilds:
         if GUILD_ID and guild.id != GUILD_ID: continue
+        report_key=None
         try:
             cfg=await _brief_config(guild.id)
             if not cfg or not cfg.get('enabled') or not cfg.get('channel_id'): continue
@@ -4092,12 +4093,21 @@ async def weekly_battalion_report_watch():
             body=await _build_battalion_brief(guild,bool(cfg.get('include_fund',True)))
             role=guild.get_role(int(cfg.get('mention_role_id') or 0)) if cfg.get('mention_role_id') else None
             await ch.send(((role.mention+'\n') if role else '')+body)
+            await _recovery_v2_record(guild.id,'WEEKLY_BRIEF:'+report_key,True)
             nco_ch=await get_report_channel(guild,'NCO_ACCOUNTABILITY')
             if nco_ch:
                 data=await web.request('GET','/internal/clerk/reports/weekly-battalion'); attention=data.get('leader_attention') or []
                 lines=[f"• **{i.get('name') or 'Soldier'}** — {i.get('unit') or 'UNASSIGNED'} — {', '.join(i.get('issues') or []) or i.get('activity') or 'REVIEW'}" for i in attention[:15]]
                 await nco_ch.send((f"**1/5 CAV — NCO MEMBER ATTENTION**\nWork only the exceptions below. Participation remains voluntary.\n\n"+('\n'.join(lines) if lines else 'No member-health exceptions are currently surfaced.'))[:1950])
-        except Exception as exc: log.warning('[WEEKLY BATTALION BRIEF FAILED] guild=%s error=%s',guild.id,exc)
+        except Exception as exc:
+            log.warning('[WEEKLY BATTALION BRIEF FAILED] guild=%s error=%s',guild.id,exc)
+            try:
+                if report_key and await _recovery_v2_can_attempt(guild.id,'WEEKLY_BRIEF:'+report_key,max_attempts=3,quarantine_minutes=120):
+                    await collector.start(); db=collector.db
+                    await db.execute("DELETE FROM clerk_automation_notices WHERE guild_id=$1 AND personnel_id='BATTALION' AND notice_type='WEEKLY_BATTALION_BRIEF' AND notice_key=$2",str(guild.id),str(report_key))
+                    await _recovery_v2_record(guild.id,'WEEKLY_BRIEF:'+report_key,False,exc)
+            except Exception as retry_exc:
+                log.warning('[WEEKLY BRIEF RETRY STATE FAILED] guild=%s error=%s',guild.id,retry_exc)
 
 @weekly_battalion_report_watch.before_loop
 async def before_weekly_battalion_report_watch():
@@ -4109,6 +4119,90 @@ async def before_weekly_battalion_report_watch():
 # ---------------------------------------------------------------------------
 # V83 — growth accountability + system-health failure alerts
 # ---------------------------------------------------------------------------
+
+async def _ensure_recovery_v2_table():
+    await collector.start(); db=collector.db
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_recovery_v2_state(
+        guild_id TEXT NOT NULL,recovery_key TEXT NOT NULL,attempt_count INT NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMPTZ,last_error TEXT,quarantined_until TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,recovery_key))""")
+
+async def _recovery_v2_can_attempt(guild_id,key,max_attempts=3,quarantine_minutes=60):
+    await _ensure_recovery_v2_table(); db=collector.db
+    row=await db.fetchrow('SELECT * FROM clerk_recovery_v2_state WHERE guild_id=$1 AND recovery_key=$2',str(guild_id),str(key))
+    now=datetime.now(timezone.utc)
+    if row and row.get('quarantined_until') and row['quarantined_until']>now: return False
+    if row and int(row.get('attempt_count') or 0)>=max_attempts:
+        await db.execute("UPDATE clerk_recovery_v2_state SET quarantined_until=NOW()+($3::text||' minutes')::interval,attempt_count=0,updated_at=NOW() WHERE guild_id=$1 AND recovery_key=$2",str(guild_id),str(key),str(quarantine_minutes))
+        return False
+    return True
+
+async def _recovery_v2_record(guild_id,key,ok,error=None):
+    await _ensure_recovery_v2_table(); db=collector.db
+    if ok:
+        await db.execute("""INSERT INTO clerk_recovery_v2_state(guild_id,recovery_key,attempt_count,last_attempt_at,last_error,quarantined_until)
+            VALUES($1,$2,0,NOW(),NULL,NULL) ON CONFLICT(guild_id,recovery_key) DO UPDATE SET attempt_count=0,last_attempt_at=NOW(),last_error=NULL,quarantined_until=NULL,updated_at=NOW()""",str(guild_id),str(key))
+    else:
+        await db.execute("""INSERT INTO clerk_recovery_v2_state(guild_id,recovery_key,attempt_count,last_attempt_at,last_error)
+            VALUES($1,$2,1,NOW(),$3) ON CONFLICT(guild_id,recovery_key) DO UPDATE SET attempt_count=clerk_recovery_v2_state.attempt_count+1,last_attempt_at=NOW(),last_error=EXCLUDED.last_error,updated_at=NOW()""",str(guild_id),str(key),str(error or '')[:500])
+
+@bot.tree.command(name='system-health', description='Show Battalion Clerk, Website, Discord, Recruiting, Awards, database, and HLL system health.')
+async def system_health_summary(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        data=await web.request('GET','/internal/clerk/system-health',params={'guild_id':interaction.guild_id})
+        state=str(data.get('overall') or 'UNKNOWN').upper(); icon={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(state,'⚪')
+        lines=[f'**{icon} BATTALION SYSTEM HEALTH — {state}**']
+        for c in data.get('checks') or []:
+            st=str(c.get('status') or 'UNKNOWN').upper(); e={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(st,'⚪')
+            lines.append(f"{e} **{c.get('name') or 'SYSTEM'}** — {st}\n{c.get('detail') or 'No detail.'}")
+        await interaction.followup.send(('\n\n'.join(lines))[:1950],ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'🔴 **SYSTEM HEALTH UNAVAILABLE**\nWebsite health endpoint could not be reached: `{str(exc)[:300]}`',ephemeral=True)
+
+@bot.tree.command(name='repair-system', description='Run safe Battalion Clerk/Website reconciliation for retryable failures.')
+async def repair_system(interaction:discord.Interaction):
+    if not await require_manage_guild(interaction): return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
+        await interaction.followup.send('Website recovery is not configured on this Battalion Clerk deployment.',ephemeral=True); return
+    try:
+        data=await web.request('POST','/internal/clerk/recovery/run',json={'guild_id':interaction.guild_id,'requested_by':str(interaction.user.id)})
+        r=data.get('repaired') or {}; health=data.get('health') or {}
+        lines=["**SAFE SYSTEM RECONCILIATION COMPLETE**",
+               f"Discord role syncs requeued: **{r.get('role_sync_requeued',0)}**",
+               f"Recruit/login deliveries requeued: **{r.get('recruit_delivery_requeued',0)}**",
+               f"Recruiting safeguards reconciled: **{r.get('recruit_reconciled',0)}**",
+               f"Current health: **{health.get('overall','UNKNOWN')}**"]
+        if data.get('warnings'): lines.append('Warnings: '+ ' | '.join(data.get('warnings')[:3]))
+        lines.append('No rank, award, assignment, or game-identity ownership decision was changed automatically.')
+        await interaction.followup.send('\n'.join(lines)[:1950],ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f'**REPAIR FAILED**\n`{str(exc)[:500]}`',ephemeral=True)
+
+@tasks.loop(minutes=10)
+async def reliability_recovery_v2_watch():
+    """Retry only recoverable failures; persistent failures are quarantined to stop alert spam."""
+    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY: return
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id!=GUILD_ID: continue
+        key='SAFE_RECONCILIATION'
+        try:
+            health=await web.request('GET','/internal/clerk/system-health',params={'guild_id':guild.id})
+            if str(health.get('overall') or 'OK').upper()=='OK':
+                await _recovery_v2_record(guild.id,key,True); continue
+            if not await _recovery_v2_can_attempt(guild.id,key,max_attempts=3,quarantine_minutes=60): continue
+            result=await web.request('POST','/internal/clerk/recovery/run',json={'guild_id':guild.id,'automatic':True})
+            await _recovery_v2_record(guild.id,key,bool(result.get('ok')),None if result.get('ok') else result.get('error'))
+        except Exception as exc:
+            await _recovery_v2_record(guild.id,key,False,exc)
+            log.warning('[RELIABILITY RECOVERY V2 FAILED] guild=%s error=%s',guild.id,exc)
+
+@reliability_recovery_v2_watch.before_loop
+async def before_reliability_recovery_v2_watch():
+    await bot.wait_until_ready()
+
 @bot.tree.command(name='system-health-channel', description='Assign the Command channel for Battalion Clerk/system failure alerts.')
 async def system_health_channel(interaction:discord.Interaction, channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
@@ -4384,6 +4478,8 @@ async def on_ready():
         growth_accountability_watch.start()
     if not system_health_alert_watch.is_running():
         system_health_alert_watch.start()
+    if not reliability_recovery_v2_watch.is_running():
+        reliability_recovery_v2_watch.start()
     if not first30_retention_watch.is_running():
         first30_retention_watch.start()
 
