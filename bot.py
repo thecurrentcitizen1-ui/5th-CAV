@@ -43,29 +43,8 @@ WEBSITE_STATUS_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_STATUS_CHECK_DAYS','14
 WEBSITE_NEVER_LOGIN_CHECK_DAYS = max(1, int(os.getenv('WEBSITE_NEVER_LOGIN_CHECK_DAYS','3') or 3))
 WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_REPEAT_DAYS','30') or 30))
 GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or 3))
-APPLICATION_REMINDER_DAYS = max(1, int(os.getenv('APPLICATION_REMINDER_DAYS','3') or 3))
 NEW_ARRIVAL_ROLE_NAME = os.getenv('NEW_ARRIVAL_ROLE_NAME', 'NEW ARRIVAL').strip() or 'NEW ARRIVAL'
 NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
-
-
-# Server Watch — suspicious-player telemetry alerts. Human review only; this
-# subsystem never kicks, bans, punishes, or publicly labels a player as a cheater.
-SERVER_ADMIN_ROLE_NAME = os.getenv('SERVER_ADMIN_ROLE_NAME', 'Server Admin').strip() or 'Server Admin'
-SERVER_WATCH_ENABLED = str(os.getenv('SERVER_WATCH_ENABLED', 'true')).strip().lower() in {'1','true','yes','on','enabled'}
-SERVER_WATCH_INTERVAL_SECONDS = max(15, int(os.getenv('SERVER_WATCH_INTERVAL_SECONDS', '30') or 30))
-SERVER_WATCH_MIN_CONNECTED_SECONDS = max(300, int(os.getenv('SERVER_WATCH_MIN_CONNECTED_SECONDS', '600') or 600))
-SERVER_WATCH_MIN_KILLS = max(10, int(os.getenv('SERVER_WATCH_MIN_KILLS', '25') or 25))
-SERVER_WATCH_KPM = max(0.5, float(os.getenv('SERVER_WATCH_KPM', '1.75') or 1.75))
-SERVER_WATCH_HIGH_KD = max(2.0, float(os.getenv('SERVER_WATCH_HIGH_KD', '8.0') or 8.0))
-SERVER_WATCH_ZERO_DEATH_KILLS = max(15, int(os.getenv('SERVER_WATCH_ZERO_DEATH_KILLS', '30') or 30))
-SERVER_WATCH_BURST_2M = max(6, int(os.getenv('SERVER_WATCH_BURST_2M', '10') or 10))
-SERVER_WATCH_BURST_5M = max(10, int(os.getenv('SERVER_WATCH_BURST_5M', '18') or 18))
-SERVER_WATCH_REPEAT_MINUTES = max(5, int(os.getenv('SERVER_WATCH_REPEAT_MINUTES', '15') or 15))
-SERVER_WATCH_POSITION_HISTORY_MINUTES = max(3, int(os.getenv('SERVER_WATCH_POSITION_HISTORY_MINUTES', '10') or 10))
-SERVER_WATCH_DIRECT_ROUTE_RATIO = max(0.60, min(1.0, float(os.getenv('SERVER_WATCH_DIRECT_ROUTE_RATIO', '0.88') or 0.88)))
-SERVER_WATCH_DIRECT_ROUTE_MIN_METERS = max(150.0, float(os.getenv('SERVER_WATCH_DIRECT_ROUTE_MIN_METERS', '400') or 400))
-SERVER_WATCH_CHANNEL_ID = int(os.getenv('SERVER_WATCH_CHANNEL_ID', '0') or 0)
-SERVER_WATCH_CHANNEL_NAME = os.getenv('SERVER_WATCH_CHANNEL_NAME', 'server-watch').strip() or 'server-watch'
 
 # Canonical public publication channels. Stored Command routes always win; these
 # are regression-safe fallbacks so a lost/missing route cannot silently stop
@@ -3612,107 +3591,6 @@ async def canonical_role_sync_watch():
         except Exception as exc:
             log.warning('[CANONICAL ROLE SYNC WATCH FAILED] guild=%s error=%s',guild.id,exc)
 
-
-async def ensure_application_reminder_table():
-    """Persist the recurring no-application reminder clock across bot restarts."""
-    await collector.start()
-    db=collector.db
-    if not db.pool:
-        return
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS clerk_application_reminders (
-            guild_id TEXT NOT NULL,
-            discord_user_id TEXT NOT NULL,
-            last_sent_at TIMESTAMPTZ,
-            sent_count INTEGER NOT NULL DEFAULT 0,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (guild_id, discord_user_id)
-        )
-    """)
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_clerk_application_reminders_sent ON clerk_application_reminders(guild_id,last_sent_at)")
-
-
-@tasks.loop(hours=1)
-async def application_reminder_watch():
-    """DM Discord-only prospects every three days until a Recruiting Case exists."""
-    await collector.start()
-    db=collector.db
-    if not db.pool:
-        return
-    await ensure_application_reminder_table()
-    cutoff=datetime.now(timezone.utc)-timedelta(days=APPLICATION_REMINDER_DAYS)
-    for guild in bot.guilds:
-        if GUILD_ID and guild.id != GUILD_ID:
-            continue
-        try:
-            rows=await db.fetch("""
-                SELECT dm.discord_user_id::text AS discord_user_id,
-                       dm.username,dm.display_name,dm.joined_at,dm.updated_at,
-                       r.last_sent_at
-                  FROM discord_members dm
-             LEFT JOIN clerk_application_reminders r
-                    ON r.guild_id=$1 AND r.discord_user_id=dm.discord_user_id::text
-                 WHERE dm.guild_id::text=$1
-                   AND COALESCE(dm.active,TRUE)=TRUE
-                   AND COALESCE(dm.is_bot,FALSE)=FALSE
-                   AND COALESCE(dm.joined_at,dm.updated_at) <= NOW() - ($2::int * INTERVAL '1 day')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM website_member_links w
-                        WHERE w.guild_id::text=dm.guild_id::text
-                          AND w.discord_user_id::text=dm.discord_user_id::text
-                          AND w.personnel_id IS NOT NULL
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM recruiting_cases rc
-                        WHERE rc.discord_user_id::text=dm.discord_user_id::text
-                          AND (rc.guild_id IS NULL OR rc.guild_id::text=dm.guild_id::text)
-                   )
-                   AND (r.last_sent_at IS NULL OR r.last_sent_at <= $3)
-                 ORDER BY COALESCE(dm.joined_at,dm.updated_at)
-                 LIMIT 100
-            """,str(guild.id),APPLICATION_REMINDER_DAYS,cutoff)
-            for row in rows:
-                uid=str(row.get('discord_user_id') or '')
-                if not uid.isdigit():
-                    continue
-                member=await _fetch_guild_member(guild,int(uid))
-                if not member or member.bot:
-                    continue
-                site=(f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else None)
-                message=(
-                    "**1/5 CAV — APPLICATION REMINDER**\n\n"
-                    "You are in the 5th Cav Discord, but Battalion Clerk does not have a completed Recruiting Case linked to you yet. "
-                    "If you already started the Discord intake, running **`/apply`** again will resume it where you left off.\n\n"
-                    "**COMPLETE YOUR APPLICATION**\n"
-                    "• Run **`/apply`** here in Discord for the short in-Discord intake.\n"
-                    + (f"• Or use the website application: **{site}**\n" if site else "") +
-                    "\nThere are **no mandatory schedules, no mandatory trainings, and no forced permanent role**. "
-                    "Once your application is filed, these reminders stop automatically."
-                )
-                try:
-                    await member.send(message)
-                except discord.Forbidden:
-                    log.info('[APPLICATION REMINDER DM BLOCKED] guild=%s member=%s',guild.id,member.id)
-                    continue
-                except Exception as exc:
-                    log.warning('[APPLICATION REMINDER DM FAILED] guild=%s member=%s error=%s',guild.id,member.id,exc)
-                    continue
-                await db.execute("""
-                    INSERT INTO clerk_application_reminders(guild_id,discord_user_id,last_sent_at,sent_count,updated_at)
-                    VALUES($1,$2,NOW(),1,NOW())
-                    ON CONFLICT(guild_id,discord_user_id) DO UPDATE SET
-                        last_sent_at=NOW(),sent_count=clerk_application_reminders.sent_count+1,updated_at=NOW()
-                """,str(guild.id),uid)
-                log.info('[APPLICATION REMINDER SENT] guild=%s member=%s',guild.id,member.id)
-        except Exception as exc:
-            log.warning('[APPLICATION REMINDER WATCH FAILED] guild=%s error=%s',guild.id,exc)
-
-
-@application_reminder_watch.before_loop
-async def before_application_reminder_watch():
-    await bot.wait_until_ready()
-
-
 async def ensure_game_link_reminder_table():
     """Persist the 72-hour game-identity reminder clock across bot restarts."""
     await collector.start()
@@ -4136,10 +4014,7 @@ async def _build_battalion_brief(guild:discord.Guild,include_fund=True):
     lines += ['', '**KEEP MOVING. CHARLIE WON’T WAIT.**']
     return '\n'.join(lines)[:3950]
 
-battalionbrief_group = app_commands.Group(name='battalionbrief', description='Weekly Battalion Brief controls.')
-bot.tree.add_command(battalionbrief_group)
-
-@battalionbrief_group.command(name='setup', description='Configure the automatic Weekly Battalion Brief channel and schedule.')
+@bot.tree.command(name='battalionbrief-setup', description='Configure the automatic Weekly Battalion Brief channel and schedule.')
 @app_commands.describe(channel='Channel where the weekly brief posts',day='Day of week',hour='24-hour battalion time (0-23)',mention_role='Optional role to mention',include_fund='Include Battalion Fund figures')
 @app_commands.choices(day=BRIEF_DAY_CHOICES)
 async def battalionbrief_setup(interaction:discord.Interaction,channel:discord.TextChannel,day:app_commands.Choice[str],hour:app_commands.Range[int,0,23]=19,mention_role:Optional[discord.Role]=None,include_fund:bool=True):
@@ -4148,7 +4023,7 @@ async def battalionbrief_setup(interaction:discord.Interaction,channel:discord.T
     await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
     await interaction.response.send_message(f"**WEEKLY BATTALION BRIEF — CONFIGURED**\nChannel: {channel.mention}\nSchedule: {day.name} at {int(hour):02d}:00 ({BATTALION_TIMEZONE})\nAutomatic posting: **ON**\nBattalion Fund: **{'INCLUDED' if include_fund else 'HIDDEN'}**",ephemeral=True)
 
-@battalionbrief_group.command(name='status', description='Show the Weekly Battalion Brief channel, schedule, and enabled state.')
+@bot.tree.command(name='battalionbrief-status', description='Show the Weekly Battalion Brief channel, schedule, and enabled state.')
 async def battalionbrief_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     cfg=await _brief_config(interaction.guild_id)
@@ -4157,7 +4032,7 @@ async def battalionbrief_status(interaction:discord.Interaction):
     day=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][int(cfg.get('weekday') or 0)]
     await interaction.response.send_message(f"**WEEKLY BATTALION BRIEF**\nChannel: {ch.mention if ch else 'MISSING'}\nSchedule: {day} {int(cfg.get('hour') or 0):02d}:{int(cfg.get('minute') or 0):02d} ({BATTALION_TIMEZONE})\nAutomatic posting: **{'ON' if cfg.get('enabled') else 'OFF'}**\nMention: {role.mention if role else 'None'}\nBattalion Fund: **{'INCLUDED' if cfg.get('include_fund') else 'HIDDEN'}**",ephemeral=True)
 
-@battalionbrief_group.command(name='preview', description='Preview the current Weekly Battalion Brief without posting it.')
+@bot.tree.command(name='battalionbrief-preview', description='Preview the current Weekly Battalion Brief without posting it.')
 async def battalionbrief_preview(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True)
@@ -4165,7 +4040,7 @@ async def battalionbrief_preview(interaction:discord.Interaction):
     body=await _build_battalion_brief(interaction.guild,bool(cfg.get('include_fund',True)))
     await interaction.followup.send(body,ephemeral=True)
 
-@battalionbrief_group.command(name='post', description='Post the current Weekly Battalion Brief now.')
+@bot.tree.command(name='battalionbrief-post', description='Post the current Weekly Battalion Brief now.')
 async def battalionbrief_post(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True)
@@ -4179,7 +4054,7 @@ async def battalionbrief_post(interaction:discord.Interaction):
     await ch.send(((role.mention+'\n') if role else '')+body)
     await interaction.followup.send(f'Weekly Battalion Brief posted to {ch.mention}.',ephemeral=True)
 
-@battalionbrief_group.command(name='off', description='Turn off automatic Weekly Battalion Brief posting without deleting its setup.')
+@bot.tree.command(name='battalionbrief-off', description='Turn off automatic Weekly Battalion Brief posting without deleting its setup.')
 async def battalionbrief_off(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await _save_brief_config(interaction.guild_id,enabled=False)
@@ -4366,368 +4241,6 @@ async def first30_retention_watch():
 async def before_first30_retention_watch():
     await bot.wait_until_ready()
 
-
-async def _ensure_server_watch_schema():
-    await collector.start()
-    if not collector.db.pool:
-        return
-    await collector.db.execute("""
-        CREATE TABLE IF NOT EXISTS hll_suspicious_player_alerts (
-            id BIGSERIAL PRIMARY KEY,
-            match_id BIGINT NOT NULL,
-            server_key TEXT NOT NULL,
-            steam_id TEXT NOT NULL,
-            player_name TEXT,
-            alert_level TEXT NOT NULL,
-            reason_signature TEXT NOT NULL,
-            last_kills INTEGER NOT NULL DEFAULT 0,
-            last_deaths INTEGER NOT NULL DEFAULT 0,
-            alert_count INTEGER NOT NULL DEFAULT 1,
-            first_alerted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
-            UNIQUE(match_id, steam_id)
-        )
-    """)
-    await collector.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_suspicious_alerts_server_time ON hll_suspicious_player_alerts(server_key,last_alerted_at DESC)")
-    await collector.db.execute("""
-        CREATE TABLE IF NOT EXISTS hll_server_watch_positions (
-            id BIGSERIAL PRIMARY KEY,
-            match_id BIGINT NOT NULL,
-            server_key TEXT NOT NULL,
-            steam_id TEXT NOT NULL,
-            player_name TEXT,
-            team_id TEXT,
-            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            x DOUBLE PRECISION NOT NULL,
-            y DOUBLE PRECISION NOT NULL,
-            z DOUBLE PRECISION NOT NULL
-        )
-    """)
-    await collector.db.execute("CREATE INDEX IF NOT EXISTS idx_hll_server_watch_positions_player_time ON hll_server_watch_positions(match_id,steam_id,observed_at DESC)")
-    await collector.db.execute("DELETE FROM hll_server_watch_positions WHERE observed_at < NOW()-INTERVAL '6 hours'")
-
-
-def _server_admin_role(guild: discord.Guild):
-    target=SERVER_ADMIN_ROLE_NAME.casefold()
-    return next((r for r in guild.roles if r.name.casefold()==target), None)
-
-
-def _server_watch_level(score: int) -> str:
-    if score >= 6:
-        return 'PRIORITY REVIEW'
-    if score >= 4:
-        return 'ELEVATED WATCH'
-    return 'WATCH'
-
-
-def _server_watch_level_rank(level: str) -> int:
-    return {'WATCH':1,'ELEVATED WATCH':2,'PRIORITY REVIEW':3}.get(str(level or '').upper(),0)
-
-
-async def _server_watch_recipients(guild: discord.Guild):
-    role=_server_admin_role(guild)
-    if not role:
-        return role, []
-    return role, [m for m in role.members if not m.bot]
-
-
-def _server_watch_channel(guild: discord.Guild):
-    if not guild:
-        return None
-    if SERVER_WATCH_CHANNEL_ID:
-        ch=guild.get_channel(SERVER_WATCH_CHANNEL_ID)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    wanted=SERVER_WATCH_CHANNEL_NAME.lower().lstrip('#')
-    for ch in guild.text_channels:
-        if ch.name.lower()==wanted:
-            return ch
-    return None
-
-
-async def _send_server_watch_alert(guild: discord.Guild, payload: dict, *, test: bool=False):
-    role, recipients = await _server_watch_recipients(guild)
-    channel=_server_watch_channel(guild)
-    delivered=failed=0
-    if test:
-        title='1/5 CAV — SERVER WATCH TEST'
-        description=(f'Battalion Clerk successfully recognized the **{SERVER_ADMIN_ROLE_NAME}** role.\n\n'
-                     'You will receive suspected-player review notices for **Server 1** and **Server 2** here. '
-                     'These notices require human review and never trigger an automatic kick or ban.')
-        embed=discord.Embed(title=title, description=description)
-    else:
-        level=payload['level']
-        server_label='SERVER 1' if payload.get('server_key')=='server_1' else 'SERVER 2'
-        embed=discord.Embed(title=f'1/5 CAV — {level}', description=(
-            f'**{payload.get("player_name") or "Unknown player"}** has crossed Server Watch review thresholds on **{server_label}**.\n\n'
-            '**This is an automated suspicion flag, not confirmation of cheating. Do not punish solely from this alert.**'))
-        embed.add_field(name='Player', value=str(payload.get('player_name') or 'Unknown'), inline=True)
-        embed.add_field(name='Server', value=server_label, inline=True)
-        embed.add_field(name='Map', value=str(payload.get('map_name') or 'Unknown'), inline=True)
-        embed.add_field(name='Kills / Deaths', value=f"{payload.get('kills',0)} / {payload.get('deaths',0)}", inline=True)
-        embed.add_field(name='Kills per minute', value=f"{payload.get('kpm',0):.2f}", inline=True)
-        embed.add_field(name='K/D', value=f"{payload.get('kd',0):.2f}", inline=True)
-        embed.add_field(name='Recent kill burst', value=f"2 min: {payload.get('burst_2m',0)}\n5 min: {payload.get('burst_5m',0)}", inline=True)
-        embed.add_field(name='Observed time', value=f"{payload.get('minutes',0):.1f} min", inline=True)
-        embed.add_field(name='Player ID', value=str(payload.get('steam_id') or 'Unknown')[:1024], inline=False)
-        embed.add_field(name='Why it was flagged', value='\n'.join(f'• {r}' for r in payload.get('reasons',[]))[:1024] or 'Threshold combination', inline=False)
-        movement=payload.get('movement') or {}
-        movement_lines=[]
-        if movement.get('sample_count'):
-            movement_lines.append(f"• Position trail: {movement.get('sample_count')} samples over {movement.get('window_minutes',0):.1f} min")
-            movement_lines.append(f"• Route traveled: {movement.get('path_meters',0):.0f} m • net displacement: {movement.get('direct_meters',0):.0f} m")
-            movement_lines.append(f"• Route directness: {movement.get('directness',0)*100:.0f}%")
-            if movement.get('direct_route_flag'):
-                movement_lines.append('• DIRECT-ROUTE ANOMALY: sustained unusually straight movement through the tracked area')
-        else:
-            movement_lines.append('• Position history is still building for this player.')
-        movement_lines.append('• Exact Garrison/Outpost coordinates are not currently exposed to Clerk; this is behavioral movement evidence, not proof the player can see a spawn.')
-        embed.add_field(name='Spawn-Hunt / Movement Analysis', value='\n'.join(movement_lines)[:1024], inline=False)
-        embed.set_footer(text='Recommended action: observe, preserve evidence, compare match history and movement, then make a human moderation decision.')
-    for member in recipients:
-        try:
-            await member.send(embed=embed)
-            delivered += 1
-        except (discord.Forbidden, discord.HTTPException):
-            failed += 1
-    channel_delivered=False
-    channel_failed=False
-    if channel:
-        try:
-            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-            channel_delivered=True
-        except (discord.Forbidden, discord.HTTPException):
-            channel_failed=True
-    return {'role_found': bool(role), 'recipients': len(recipients), 'delivered': delivered, 'failed': failed,
-            'channel_found': bool(channel), 'channel_id': getattr(channel,'id',None),
-            'channel_name': getattr(channel,'name',None), 'channel_delivered': channel_delivered, 'channel_failed': channel_failed}
-
-
-async def _server_watch_sample_positions():
-    # Keep a short-lived movement trail for every currently sampled public player.
-    # This is intentionally separated from permanent career telemetry and is
-    # purged automatically. It is used only for human-review Server Watch evidence.
-    rows=await collector.db.fetch("""
-        SELECT ps.match_id,COALESCE(ms.server_key,'server_1') AS server_key,ps.steam_id,ps.player_name,ps.team_id,
-               ps.last_x AS x,ps.last_y AS y,ps.last_z AS z
-          FROM hll_player_match_stats ps
-          JOIN hll_match_sessions ms ON ms.id=ps.match_id
-         WHERE ms.ended_at IS NULL AND ms.last_seen_at >= NOW()-INTERVAL '2 minutes'
-           AND ps.last_seen_at >= NOW()-INTERVAL '2 minutes'
-           AND ps.last_x IS NOT NULL AND ps.last_y IS NOT NULL AND ps.last_z IS NOT NULL
-           AND COALESCE(ms.server_key,'server_1') IN ('server_1','server_2')
-    """)
-    for r in rows:
-        await collector.db.execute("""
-            INSERT INTO hll_server_watch_positions(match_id,server_key,steam_id,player_name,team_id,x,y,z)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-        """,int(r['match_id']),str(r['server_key']),str(r['steam_id']),r['player_name'],r['team_id'],float(r['x']),float(r['y']),float(r['z']))
-
-
-def _movement_distance(a,b):
-    import math
-    return math.sqrt((float(b['x'])-float(a['x']))**2+(float(b['y'])-float(a['y']))**2+(float(b['z'])-float(a['z']))**2)/100.0
-
-
-async def _server_watch_movement(match_id:int, steam_id:str):
-    rows=await collector.db.fetch("""
-        SELECT observed_at,x,y,z FROM hll_server_watch_positions
-         WHERE match_id=$1 AND steam_id=$2
-           AND observed_at >= NOW()-($3::text || ' minutes')::interval
-         ORDER BY observed_at ASC
-    """,match_id,steam_id,SERVER_WATCH_POSITION_HISTORY_MINUTES)
-    rows=[dict(r) for r in rows]
-    if len(rows)<2:
-        return {'sample_count':len(rows),'window_minutes':0.0,'path_meters':0.0,'direct_meters':0.0,'directness':0.0,'direct_route_flag':False}
-    path=sum(_movement_distance(rows[i-1],rows[i]) for i in range(1,len(rows)))
-    direct=_movement_distance(rows[0],rows[-1])
-    directness=(direct/path) if path>0 else 0.0
-    window=max(0.0,(rows[-1]['observed_at']-rows[0]['observed_at']).total_seconds()/60.0)
-    return {'sample_count':len(rows),'window_minutes':window,'path_meters':path,'direct_meters':direct,'directness':directness,
-            'direct_route_flag': bool(path>=SERVER_WATCH_DIRECT_ROUTE_MIN_METERS and directness>=SERVER_WATCH_DIRECT_ROUTE_RATIO)}
-
-
-async def _server_watch_candidates():
-    await collector.start()
-    if not collector.db.pool:
-        return []
-    # Evaluate both official servers independently through the match server_key.
-    rows=await collector.db.fetch("""
-        SELECT ps.match_id, COALESCE(ms.server_key,'server_1') AS server_key,
-               ms.server_name, ms.map_name, ms.game_mode, ms.started_at,
-               ps.steam_id, ps.player_name, ps.personnel_id,
-               COALESCE(ps.connected_seconds,0)::int AS connected_seconds,
-               COALESCE(ps.infantry_kills,0)::int AS infantry_kills,
-               COALESCE(ps.deaths,0)::int AS deaths
-          FROM hll_player_match_stats ps
-          JOIN hll_match_sessions ms ON ms.id=ps.match_id
-         WHERE ms.ended_at IS NULL
-           AND ms.last_seen_at >= NOW()-INTERVAL '2 minutes'
-           AND ps.last_seen_at >= NOW()-INTERVAL '2 minutes'
-           AND COALESCE(ms.server_key,'server_1') IN ('server_1','server_2')
-           AND COALESCE(ps.connected_seconds,0) >= $1
-           AND COALESCE(ps.infantry_kills,0) >= $2
-    """, SERVER_WATCH_MIN_CONNECTED_SECONDS, SERVER_WATCH_MIN_KILLS)
-    out=[]
-    for row in rows:
-        r=dict(row)
-        minutes=max(1.0, float(r['connected_seconds'])/60.0)
-        kills=int(r['infantry_kills'] or 0); deaths=int(r['deaths'] or 0)
-        kpm=kills/minutes; kd=kills/max(1,deaths)
-        burst_2m=burst_5m=0
-        try:
-            bursts=await collector.db.fetchrow("""
-                SELECT COUNT(*) FILTER (WHERE we.event_type='KILL' AND we.event_at >= NOW()-INTERVAL '2 minutes')::int AS b2,
-                       COUNT(*) FILTER (WHERE we.event_type='KILL' AND we.event_at >= NOW()-INTERVAL '5 minutes')::int AS b5
-                  FROM hll_weapon_events we
-                 WHERE we.match_id=$1 AND we.attacker_id=$2
-            """, int(r['match_id']), str(r['steam_id']))
-            if bursts:
-                burst_2m=int(bursts['b2'] or 0); burst_5m=int(bursts['b5'] or 0)
-        except Exception:
-            # The aggregate match stats are still authoritative enough for a
-            # review notice if weapon-event enrichment is temporarily absent.
-            pass
-        reasons=[]; score=0
-        if kpm >= SERVER_WATCH_KPM:
-            reasons.append(f'High sustained infantry kill rate: {kpm:.2f} KPM over {minutes:.1f} minutes')
-            score += 2
-        if kills >= 35 and kd >= SERVER_WATCH_HIGH_KD:
-            reasons.append(f'Unusually high K/D: {kd:.2f} with {kills} infantry kills')
-            score += 1
-        if deaths == 0 and kills >= SERVER_WATCH_ZERO_DEATH_KILLS:
-            reasons.append(f'{kills} infantry kills with zero recorded deaths')
-            score += 1
-        if burst_2m >= SERVER_WATCH_BURST_2M:
-            reasons.append(f'Kill burst: {burst_2m} verified kill events in 2 minutes')
-            score += 2
-        if burst_5m >= SERVER_WATCH_BURST_5M:
-            reasons.append(f'Kill burst: {burst_5m} verified kill events in 5 minutes')
-            score += 2
-        movement=await _server_watch_movement(int(r['match_id']),str(r['steam_id']))
-        if movement.get('direct_route_flag'):
-            reasons.append(f"Movement anomaly: {movement.get('directness',0)*100:.0f}% direct route over {movement.get('path_meters',0):.0f} m")
-            score += 1
-        if score < 2:
-            continue
-        r.update({'kills':kills,'deaths':deaths,'minutes':minutes,'kpm':kpm,'kd':kd,
-                  'burst_2m':burst_2m,'burst_5m':burst_5m,'movement':movement,'reasons':reasons,
-                  'score':score,'level':_server_watch_level(score)})
-        out.append(r)
-    return out
-
-
-async def _server_watch_should_alert(candidate: dict):
-    previous=await collector.db.fetchrow("""
-        SELECT alert_level,last_kills,last_alerted_at,reason_signature
-          FROM hll_suspicious_player_alerts
-         WHERE match_id=$1 AND steam_id=$2
-    """, int(candidate['match_id']), str(candidate['steam_id']))
-    signature='|'.join(sorted(candidate.get('reasons') or []))[:1800]
-    candidate['reason_signature']=signature
-    if not previous:
-        return True
-    if _server_watch_level_rank(candidate['level']) > _server_watch_level_rank(previous['alert_level']):
-        return True
-    # Repeat only when the player has materially continued the pattern and the
-    # cooldown has elapsed. This prevents a DM every polling cycle.
-    elapsed=(utc_now()-previous['last_alerted_at']).total_seconds() if previous['last_alerted_at'] else 999999
-    return elapsed >= SERVER_WATCH_REPEAT_MINUTES*60 and int(candidate['kills']) >= int(previous['last_kills'] or 0)+10
-
-
-async def _record_server_watch_alert(candidate: dict):
-    import json as _json
-    metrics={'kills':candidate['kills'],'deaths':candidate['deaths'],'minutes':candidate['minutes'],
-             'kpm':candidate['kpm'],'kd':candidate['kd'],'burst_2m':candidate['burst_2m'],
-             'burst_5m':candidate['burst_5m'],'movement':candidate.get('movement') or {},'score':candidate['score'],'reasons':candidate['reasons']}
-    await collector.db.execute("""
-        INSERT INTO hll_suspicious_player_alerts(match_id,server_key,steam_id,player_name,alert_level,reason_signature,last_kills,last_deaths,last_metrics)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
-        ON CONFLICT(match_id,steam_id) DO UPDATE SET
-          server_key=EXCLUDED.server_key,player_name=EXCLUDED.player_name,alert_level=EXCLUDED.alert_level,
-          reason_signature=EXCLUDED.reason_signature,last_kills=EXCLUDED.last_kills,last_deaths=EXCLUDED.last_deaths,
-          last_metrics=EXCLUDED.last_metrics,last_alerted_at=NOW(),alert_count=hll_suspicious_player_alerts.alert_count+1
-    """, int(candidate['match_id']), candidate['server_key'], str(candidate['steam_id']), candidate.get('player_name'),
-         candidate['level'], candidate['reason_signature'], int(candidate['kills']), int(candidate['deaths']), _json.dumps(metrics))
-
-
-@tasks.loop(seconds=30)
-async def server_watch_monitor():
-    if not SERVER_WATCH_ENABLED:
-        return
-    try:
-        await _ensure_server_watch_schema()
-        await _server_watch_sample_positions()
-        candidates=await _server_watch_candidates()
-        for guild in bot.guilds:
-            if GUILD_ID and guild.id != GUILD_ID:
-                continue
-            role, recipients=await _server_watch_recipients(guild)
-            watch_channel=_server_watch_channel(guild)
-            if (not role or not recipients) and not watch_channel:
-                continue
-            for candidate in candidates:
-                if not await _server_watch_should_alert(candidate):
-                    continue
-                result=await _send_server_watch_alert(guild,candidate)
-                await _record_server_watch_alert(candidate)
-                log.warning('[SERVER WATCH ALERT] guild=%s server=%s player=%s level=%s dm_delivered=%s dm_failed=%s channel=%s channel_delivered=%s',
-                            guild.id,candidate['server_key'],candidate.get('player_name'),candidate['level'],result['delivered'],result['failed'],result.get('channel_name'),result.get('channel_delivered'))
-    except Exception:
-        log.exception('[SERVER WATCH MONITOR FAILED]')
-
-
-@server_watch_monitor.before_loop
-async def before_server_watch_monitor():
-    await bot.wait_until_ready()
-
-
-server_watch_group = app_commands.Group(name='server-watch', description='Server Watch suspicious-player monitoring controls.')
-bot.tree.add_command(server_watch_group)
-
-@server_watch_group.command(name='status', description='Show suspicious-player monitoring status for both official HLL servers.')
-async def server_watch_status_command(interaction: discord.Interaction):
-    if not await require_manage_guild(interaction): return
-    role, recipients=await _server_watch_recipients(interaction.guild)
-    watch_channel=_server_watch_channel(interaction.guild)
-    await collector.start()
-    health=[]
-    if collector.db.pool:
-        try:
-            rows=await collector.db.fetch("SELECT server_key,connected,last_server_name,last_player_count,last_success_at,last_error FROM hll_rcon_health WHERE server_key IN ('server_1','server_2') ORDER BY server_key")
-            for r in rows:
-                health.append(f"**{str(r['server_key']).upper()}** — {'CONNECTED' if r['connected'] else 'OFFLINE'} — {r['last_server_name'] or 'Unknown'} — {r['last_player_count'] or 0} players")
-        except Exception:
-            pass
-    channel_status=(f"**#{watch_channel.name}** ({watch_channel.id})" if watch_channel
-                    else f"**MISSING** — expected ID {SERVER_WATCH_CHANNEL_ID or 'not set'} or name #{SERVER_WATCH_CHANNEL_NAME}")
-    text=(f"**SERVER WATCH STATUS**\nEnabled: **{'YES' if SERVER_WATCH_ENABLED else 'NO'}**\n"
-          f"Alert role: **{SERVER_ADMIN_ROLE_NAME}** — {'FOUND' if role else 'MISSING'}\n"
-          f"Role recipients: **{len(recipients)}**\n"
-          f"Shared alert channel: {channel_status}\n"
-          f"Monitoring: **SERVER 1 + SERVER 2**\n"
-          f"Automatic punishment: **OFF — HUMAN REVIEW REQUIRED**\n"
-          f"Minimum sample: **{SERVER_WATCH_MIN_CONNECTED_SECONDS//60} min / {SERVER_WATCH_MIN_KILLS} kills**\n"
-          f"Sustained KPM trigger: **{SERVER_WATCH_KPM:.2f}**\n"
-          f"Repeat-alert cooldown: **{SERVER_WATCH_REPEAT_MINUTES} min + 10 additional kills**\n"
-          f"Movement trail: **{SERVER_WATCH_POSITION_HISTORY_MINUTES} min** • direct-route flag: **{SERVER_WATCH_DIRECT_ROUTE_RATIO*100:.0f}% / {SERVER_WATCH_DIRECT_ROUTE_MIN_METERS:.0f} m**\n"
-          f"Exact Garrison/OP coordinate feed: **NOT ASSUMED — BEHAVIORAL ANALYSIS ONLY**\n\n" + ('\n'.join(health) if health else 'RCON health rows unavailable.'))
-    await interaction.response.send_message(text[:1900],ephemeral=True)
-
-
-@server_watch_group.command(name='test', description='Test Server Watch DMs and the shared Server Watch text channel.')
-async def server_watch_test_command(interaction: discord.Interaction):
-    if not await require_manage_guild(interaction): return
-    result=await _send_server_watch_alert(interaction.guild,{},test=True)
-    if not result['role_found']:
-        msg=f"The **{SERVER_ADMIN_ROLE_NAME}** role was not found. Create it with that exact name, then run this command again."
-    else:
-        msg=(f"Server Watch test complete. Role members: **{result['recipients']}** — DMs delivered: **{result['delivered']}** — "
-             f"DM failures/blocked: **{result['failed']}** — shared channel: **{'POSTED' if result.get('channel_delivered') else ('FAILED' if result.get('channel_failed') else 'NOT FOUND')}**.")
-    await interaction.response.send_message(msg,ephemeral=True)
-
-
 @bot.event
 async def on_ready():
     try:
@@ -4747,8 +4260,6 @@ async def on_ready():
             except Exception:
                 log.exception('[LEGACY RECRUIT ROLE CLEANUP FAILED] guild=%s',guild.id)
         bot._legacy_recruit_role_cleanup_done=True
-    if not discord_member_action_watch.is_running():
-        discord_member_action_watch.start()
     if not manual_recruit_intake_watch.is_running():
         manual_recruit_intake_watch.start()
     if not applicant_intake_watch.is_running():
@@ -4767,8 +4278,6 @@ async def on_ready():
         welcome_packet_watch.start()
     if not website_status_check_watch.is_running():
         website_status_check_watch.start()
-    if not application_reminder_watch.is_running():
-        application_reminder_watch.start()
     if not game_link_reminder_watch.is_running():
         game_link_reminder_watch.start()
     if not leadership_due_out_watch.is_running():
@@ -4877,9 +4386,6 @@ async def on_ready():
         system_health_alert_watch.start()
     if not first30_retention_watch.is_running():
         first30_retention_watch.start()
-    if not server_watch_monitor.is_running():
-        server_watch_monitor.change_interval(seconds=SERVER_WATCH_INTERVAL_SECONDS)
-        server_watch_monitor.start()
 
     log.info('Battalion Clerk online as %s (%s)', bot.user, bot.user.id if bot.user else 'unknown')
 
@@ -5745,12 +5251,12 @@ async def _recruit_save(user, step:int, answers:dict):
     return result
 
 
-class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Intake — Part 1 of 3'):
+class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
     age=discord.ui.TextInput(label='Age (optional)',required=False,max_length=2,placeholder='Leave blank if you prefer')
     timezone_name=discord.ui.TextInput(label='Time zone',max_length=60,placeholder='Example: Eastern / EDT')
     game_platform=discord.ui.TextInput(label='Platform',max_length=30,placeholder='STEAM, XBOX, or PS5')
     game_identity=discord.ui.TextInput(label='SteamID64 / Gamertag / PSN ID',max_length=100,placeholder='Steam must be the 17-digit SteamID64')
-    hll_experience=discord.ui.TextInput(label='HLL / HLL: Vietnam experience',max_length=80,placeholder='New / Some experience / Experienced / Very experienced')
+    hll_experience=discord.ui.TextInput(label='HLL / HLL: Vietnam experience',max_length=80,placeholder='New / Some / Experienced / Very experienced')
 
     async def on_submit(self, interaction:discord.Interaction):
         platform=RECRUIT_PLATFORM_ALIASES.get(str(self.game_platform.value).strip().upper())
@@ -5772,17 +5278,17 @@ class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Intake — Part 1 of 3
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Intake — Part 2 of 3'):
+class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — Part 2 of 3'):
     role_interest=discord.ui.TextInput(label='Preferred duty / role',max_length=100,placeholder='Example: Rifleman / Infantry')
-    looking_for=discord.ui.TextInput(label='What are you looking for in the 5th Cav?',style=discord.TextStyle.paragraph,max_length=1000,placeholder='Good community / teamwork / armor / aviation / leadership / mix')
-    play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Organized casual / team-focused / competitive / mixed')
-    follows_chain=discord.ui.TextInput(label='Organized teamwork / staff direction okay?',max_length=5,placeholder='YES or NO')
-    participation=discord.ui.TextInput(label='Typical participation (not mandatory)',max_length=100,placeholder='Varies / weekly / multiple times per week')
+    looking_for=discord.ui.TextInput(label='Why do you want assignment to 1/5 CAV?',style=discord.TextStyle.paragraph,max_length=1000)
+    play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Casual organized / Milsim / Competitive / Mixed')
+    follows_chain=discord.ui.TextInput(label='Will you follow the chain of command?',max_length=5,placeholder='YES or NO')
+    participation=discord.ui.TextInput(label='Typical participation',max_length=100,placeholder='Example: Multiple times per week')
 
     async def on_submit(self, interaction:discord.Interaction):
         chain=str(self.follows_chain.value).strip().upper()
         if chain not in {'YES','Y','NO','N'}:
-            await interaction.response.send_message('Organized-teamwork answer must be **YES** or **NO**. Press Part 2 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
+            await interaction.response.send_message('Chain of command answer must be **YES** or **NO**. Press Part 2 and try again.',ephemeral=_recruit_ephemeral(interaction)); return
         try:
             await _recruit_save(interaction.user,3,{
                 'role_interest':str(self.role_interest.value).strip(),'looking_for':str(self.looking_for.value).strip(),
@@ -5794,9 +5300,9 @@ class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Intake — Part 2
             await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Intake — Final Step'):
+class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — Final Step'):
     heard_about=discord.ui.TextInput(label='How did you hear about the 1/5 Cav?',max_length=120,placeholder='Discord / server / friend / Reddit / other')
-    community_ack=discord.ui.TextInput(label='Community rules / fair play — agree?',max_length=8,placeholder='YES')
+    community_ack=discord.ui.TextInput(label='Respectful teamwork expected — agree?',max_length=8,placeholder='YES')
     applicant_notes=discord.ui.TextInput(label='Anything else HQ should know?',required=False,style=discord.TextStyle.paragraph,max_length=1000,placeholder='Optional')
 
     def __init__(self, recruited_by: str='NONE', recruiter_personnel_id: str | None=None, recruiter_discord_user_id: int | None=None):
@@ -5808,7 +5314,7 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Intake — Final
     async def on_submit(self, interaction:discord.Interaction):
         ack=str(self.community_ack.value).strip().upper()
         if ack not in {'YES','Y','AGREE','I AGREE'}:
-            await interaction.response.send_message('You must answer **YES** to the community rules/fair-play acknowledgment to file the intake.',ephemeral=_recruit_ephemeral(interaction)); return
+            await interaction.response.send_message('You must answer **YES** to the community expectations acknowledgment to file the intake.',ephemeral=_recruit_ephemeral(interaction)); return
         await interaction.response.defer(thinking=True,ephemeral=_recruit_ephemeral(interaction))
         try:
             await _recruit_save(interaction.user,4,{
@@ -5983,7 +5489,7 @@ def _manual_recruit_intake_message(case_number: str | None = None) -> str:
     case_label=(case_number or 'RECRUITING CASE').strip()
     return (f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n\n"
             f"**REPORT TO THE REPLACEMENT LINE — {case_label}**\n\n"
-            "You’re on the books with Recruiting. This is the optional Discord version of the same application pipeline—no second website application is needed. Knock out these items so Command can finish your case:\n\n"
+            "You’re on the books with Recruiting. Knock out these two items so Command can finish your case:\n\n"
             "**1 — LINK YOUR GAME ACCOUNT**\nRun **`/link-game`** in the 1/5 Cav Discord and follow Battalion Clerk’s prompts.\n\n"
             "**2 — COMPLETE YOUR INTAKE**\nUse the button below. It’s short, stays inside Discord, and includes recruiter credit if an active member brought you in.\n\n"
             "**3 — STAND BY FOR ORDERS**\nOnce Command accepts your case, you’ll move to **Ready to Assign** until your Company, Platoon, and Squad are filed.\n\n"
@@ -6019,35 +5525,6 @@ async def recruit_intake_health(interaction:discord.Interaction):
             '**REPLACEMENT INTERVIEW PIPELINE — FAILED**\n'
             f'Website queue could not be read: `{type(exc).__name__}: {str(exc)[:350]}`\n'
             'Check the Website service URL, CLERK_SYNC_KEY on both services, and Railway logs.',ephemeral=True)
-
-
-@bot.tree.command(name='send-recruit-intake',description='Send or resume the optional 1/5 Cav Discord intake for a member.')
-@app_commands.describe(member='Discord member who should receive the recruiting intake')
-async def send_recruit_intake(interaction:discord.Interaction, member:discord.Member):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True)
-    gid=interaction.guild.id if interaction.guild else int(GUILD_ID or 0)
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        await interaction.followup.send('**DISCORD INTAKE NOT SENT**\nWebsite/Clerk synchronization is not configured.',ephemeral=True); return
-    try:
-        state=await web.request('POST','/internal/clerk/recruiting/intake/start',json={
-            'guild_id':gid,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name
-        })
-        if state.get('existing_member'):
-            await interaction.followup.send(f'**NO INTAKE REQUIRED**\n{member.mention} is already linked to an active Soldier Record.',ephemeral=True); return
-        case=(state.get('case') or state.get('target_case') or {})
-        sent=await member.send(_manual_recruit_intake_message(case.get('case_number')),view=RecruitIntakePromptView())
-        await interaction.followup.send(
-            f'**DISCORD INTAKE SENT**\nRecipient: **{member.display_name}** (`{member.id}`)\n'
-            f'Recruiting Case: **{case.get("case_number") or "WILL BE CREATED/RESUMED ON SUBMIT"}**\n'
-            f'Discord message: **{getattr(sent,"id","CONFIRMED")}**\n'
-            'The member can use **BEGIN / RESUME INTAKE** and each completed section is saved automatically.',ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            f'**DISCORD INTAKE DM BLOCKED**\nDiscord would not allow Battalion Clerk to DM **{member.display_name}**. '
-            'Have the member enable server DMs or run **/apply** directly.',ephemeral=True)
-    except Exception as exc:
-        await interaction.followup.send(f'**DISCORD INTAKE NOT SENT**\n`{type(exc).__name__}: {str(exc)[:450]}`',ephemeral=True)
 
 
 @bot.tree.command(name='test-recruit-intake',description='Send the exact Replacement Interview DM directly to a Discord member for testing.')
@@ -6371,55 +5848,6 @@ async def deliver_recruit_credentials(member: discord.Member, case: dict, provis
         pass
     return False
 
-
-
-
-@tasks.loop(seconds=15)
-async def discord_member_action_watch():
-    """Execute explicit Command member-removal requests filed by the website."""
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        return
-    for guild in bot.guilds:
-        if GUILD_ID and guild.id != GUILD_ID:
-            continue
-        try:
-            data=await web.request('GET','/internal/clerk/discord-member-actions/pending',params={'guild_id':guild.id})
-            for item in data.get('items',[]):
-                action_id=str(item.get('id') or '')
-                uid=str(item.get('discord_user_id') or '')
-                action=str(item.get('action_type') or '').upper()
-                if not action_id or not uid.isdigit():
-                    continue
-                ok=False; error=None
-                try:
-                    if action!='REMOVE_FROM_GUILD':
-                        raise RuntimeError(f'Unsupported Discord member action: {action}')
-                    member=await _fetch_guild_member(guild,int(uid))
-                    if member is not None:
-                        requested_by=str(item.get('requested_by') or 'Command')[:120]
-                        reason=str(item.get('reason') or 'Removed from unit by Command')[:250]
-                        await member.kick(reason=f'1/5 Cav Command removal — {requested_by}: {reason}')
-                    ok=True
-                    log.info('[COMMAND DISCORD MEMBER REMOVAL COMPLETE] guild=%s member=%s action=%s',guild.id,uid,action_id)
-                except discord.Forbidden:
-                    error='Battalion Clerk lacks Kick Members permission or Discord role hierarchy blocks this removal.'
-                except discord.HTTPException as exc:
-                    error=f'Discord HTTP error while removing member: {exc}'[:500]
-                except Exception as exc:
-                    error=str(exc)[:500]
-                try:
-                    await web.request('POST',f'/internal/clerk/discord-member-actions/{action_id}/complete',json={'ok':ok,'error':error})
-                except Exception as exc:
-                    log.warning('[COMMAND DISCORD MEMBER REMOVAL ACK FAILED] action=%s error=%s',action_id,exc)
-                if error:
-                    log.warning('[COMMAND DISCORD MEMBER REMOVAL FAILED] guild=%s member=%s action=%s error=%s',guild.id,uid,action_id,error)
-        except Exception as exc:
-            log.warning('[DISCORD MEMBER ACTION WATCH FAILED] guild=%s error=%s',guild.id,exc)
-
-
-@discord_member_action_watch.before_loop
-async def before_discord_member_action_watch():
-    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=5)
@@ -6921,10 +6349,23 @@ async def on_member_remove(member: discord.Member):
 
     await collector.mark_member_left(member, now)
     if not member.bot:
-        try:
-            await web.request('POST','/internal/clerk/personnel/departure',json={'guild_id':member.guild.id,'discord_user_id':member.id,'reason':'member_left_discord'})
-        except Exception as exc:
-            log.warning('[PERSONNEL DEPARTURE FILING FAILED] member=%s error=%s',member.id,exc)
+        # V90 — Discord departure is authoritative for active battalion membership.
+        # Retry the website purge so a transient web/API error does not leave a ghost 201 File.
+        departure_payload={'guild_id':member.guild.id,'discord_user_id':member.id,'reason':'member_left_discord'}
+        last_exc=None
+        for attempt in range(1,4):
+            try:
+                result=await web.request('POST','/internal/clerk/personnel/departure',json=departure_payload)
+                log.info('[PERSONNEL DEPARTURE PURGE] member=%s attempt=%s result=%s',member.id,attempt,result)
+                last_exc=None
+                break
+            except Exception as exc:
+                last_exc=exc
+                log.warning('[PERSONNEL DEPARTURE PURGE RETRY] member=%s attempt=%s error=%s',member.id,attempt,exc)
+                if attempt<3:
+                    await asyncio.sleep(2*attempt)
+        if last_exc is not None:
+            log.error('[PERSONNEL DEPARTURE PURGE FAILED] member=%s after 3 attempts error=%s',member.id,last_exc)
     await collector.record_event('member_leave', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
@@ -8057,7 +7498,18 @@ async def unlink_game(interaction:discord.Interaction):
     )
 
 
-# V95: retired legacy /hll-unlink alias; use /unlink-game.
+@bot.tree.command(name='hll-unlink', description='Legacy alias: unlink your HLL identity before using /link-game again.')
+async def hll_unlink(interaction:discord.Interaction):
+    # Keep the old command working for members who already know it, but route it
+    # through the same safe identity-only behavior as /unlink-game.
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
+    ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
+    await interaction.response.send_message(
+        'Your HLL game identity was unlinked. Your historical telemetry was preserved. Use `/link-game` to file the correct identity.'
+        if ok else 'No HLL identity link was on file. You can use `/link-game` now.',
+        ephemeral=True
+    )
 
 @bot.tree.command(name='unlink-member-game', description='Command: unlink a Soldier’s incorrect SteamID64 or console gamertag.')
 @app_commands.describe(member='Soldier whose current HLL game identity should be cleared')
@@ -8220,10 +7672,7 @@ async def seeding_message_watch():
 async def before_seeding_message_watch():
     await bot.wait_until_ready()
 
-seeding_group = app_commands.Group(name='seeding', description='HLL server seeding automation controls.')
-bot.tree.add_command(seeding_group)
-
-@seeding_group.command(name='set-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
+@bot.tree.command(name='set-seeding-channel', description='Assign the Discord channel that receives automatic HLL server seeding calls.')
 @app_commands.describe(channel='Text channel for the 1/5 Cav server seeding calls')
 async def set_seeding_channel_command(interaction:discord.Interaction,channel:discord.TextChannel):
     if not await require_manage_guild(interaction): return
@@ -8232,7 +7681,7 @@ async def set_seeding_channel_command(interaction:discord.Interaction,channel:di
         f'**SEEDING CHANNEL SET**\n{channel.mention}\n\nAutomatic calls: **Daily 7:00 / 7:30 / 8:00 / 8:30 PM Eastern**; **Saturday/Sunday also 2:00 / 2:30 / 3:00 / 3:30 / 4:00 / 4:30 PM Eastern**. '
         f'Messages are suppressed once HLL population reaches **{SEEDING_STOP_POPULATION}+** and each call tags **{" / ".join(SEEDING_MENTION_ROLE_NAMES)}**.',ephemeral=True)
 
-@seeding_group.command(name='status', description='Show the seeding channel, schedule, and current HLL population.')
+@bot.tree.command(name='seeding-status', description='Show the seeding channel, schedule, and current HLL population.')
 async def seeding_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     channel_id=await get_seeding_channel_id(interaction.guild_id)
@@ -8247,16 +7696,13 @@ async def seeding_status(interaction:discord.Interaction):
         f"**Current population:** {int(st.get('player_count') or 0)}\n"
         f"**RCON:** {'CURRENT' if st.get('connected') else 'NOT CURRENT'}",ephemeral=True)
 
-@seeding_group.command(name='clear-channel', description='Disable automatic seeding messages by clearing the configured channel.')
+@bot.tree.command(name='clear-seeding-channel', description='Disable automatic seeding messages by clearing the configured channel.')
 async def clear_seeding_channel_command(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await clear_seeding_channel(interaction.guild_id)
     await interaction.response.send_message('**SEEDING CHANNEL CLEARED** — automatic seeding messages are disabled until a channel is assigned.',ephemeral=True)
 
-server_message_group = app_commands.Group(name='server-message', description='HLL server broadcast message controls.')
-bot.tree.add_command(server_message_group)
-
-@server_message_group.command(name='send', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
+@bot.tree.command(name='server-message', description='Staff: send a one-time message to everyone on the HLL: Vietnam server.')
 @app_commands.describe(message='Message to display in game (180 characters maximum)')
 async def server_message(interaction:discord.Interaction, message:str):
     if not await require_manage_guild(interaction): return
@@ -8273,7 +7719,7 @@ async def server_message(interaction:discord.Interaction, message:str):
         f"**SERVER MESSAGE SENT**\nDisplayed for **{result.get('display_seconds',10)} seconds**, then it will clear automatically.\n\n{result.get('message')}",
         ephemeral=True)
 
-@server_message_group.command(name='clear', description='Staff: immediately clear the current HLL: Vietnam server broadcast.')
+@bot.tree.command(name='server-message-clear', description='Staff: immediately clear the current HLL: Vietnam server broadcast.')
 async def server_message_clear(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await interaction.response.defer(ephemeral=True,thinking=True)
