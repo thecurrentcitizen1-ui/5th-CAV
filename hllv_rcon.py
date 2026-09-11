@@ -38,8 +38,6 @@ RCON_CM_PER_METER = max(1.0, float(os.getenv("HLL_RCON_CM_PER_METER", "100") or 
 # is 468 km/h, comfortably above Vietnam-era helicopter speeds.
 RCON_MAX_SPEED_MPS = max(20.0, float(os.getenv("HLL_RCON_MAX_SPEED_MPS", "130") or 130))
 RCON_RECONNECT_SECONDS = max(5, int(os.getenv("HLL_RCON_RECONNECT_SECONDS", "15") or 15))
-RCON_COMMAND_TIMEOUT_SECONDS = max(5, int(os.getenv("HLL_RCON_COMMAND_TIMEOUT_SECONDS", "20") or 20))
-RCON_HEARTBEAT_SECONDS = max(10, int(os.getenv("HLL_RCON_HEARTBEAT_SECONDS", "20") or 20))
 
 # Single, low-frequency 1/5 CAV server recruiting broadcast.
 RCON_RECRUITING_WEBSITE = "WWW.5THCAVGAMING.COM"
@@ -353,7 +351,6 @@ class HLLVTelemetryCollector:
         self.db = data_collector.db
         self.rcon = None
         self.task: Optional[asyncio.Task] = None
-        self.heartbeat_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._active_match_id: Optional[int] = None
         self._active_match_signature: Optional[str] = None
@@ -699,9 +696,6 @@ class HLLVTelemetryCollector:
         await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_players_filed INTEGER NOT NULL DEFAULT 0")
         await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_player_errors INTEGER NOT NULL DEFAULT 0")
         await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_partial_error TEXT")
-        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
-        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_poll_started_at TIMESTAMPTZ")
-        await self.db.execute("ALTER TABLE hll_rcon_health ADD COLUMN IF NOT EXISTS last_poll_finished_at TIMESTAMPTZ")
         await self.db.execute("""
             INSERT INTO hll_rcon_health(id,enabled,connected,host,port,server_key)
             VALUES($1,$2,FALSE,$3,$4,$5)
@@ -738,9 +732,7 @@ class HLLVTelemetryCollector:
         self.rcon = HLLVRcon(host=self.host, port=self.port, password=self.password)
         self._stop.clear()
         self.task = asyncio.create_task(self._run(), name=f"hllv-rcon-telemetry-{self.server_slot}")
-        if not self.heartbeat_task or self.heartbeat_task.done():
-            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name=f"hllv-rcon-heartbeat-{self.server_slot}")
-        log.info("[HLLV RCON STARTED] slot=%s host=%s port=%s interval=%ss timeout=%ss telemetry_only=%s", self.server_slot, self.host, self.port, RCON_POLL_SECONDS, RCON_COMMAND_TIMEOUT_SECONDS, self.telemetry_only)
+        log.info("[HLLV RCON STARTED] slot=%s host=%s port=%s interval=%ss telemetry_only=%s", self.server_slot, self.host, self.port, RCON_POLL_SECONDS, self.telemetry_only)
         return True
 
     async def stop(self):
@@ -752,30 +744,11 @@ class HLLVTelemetryCollector:
             except BaseException:
                 pass
         self.task = None
-        if self.heartbeat_task:
-            self.heartbeat_task.cancel()
-            try:
-                await self.heartbeat_task
-            except BaseException:
-                pass
-        self.heartbeat_task = None
         if self.rcon:
             try:
                 self.rcon.disconnect()
             except Exception:
                 pass
-
-    async def _heartbeat_loop(self):
-        """Independent liveness pulse so a hung RCON command cannot make the worker itself look dead."""
-        while not self._stop.is_set():
-            try:
-                if self.db.pool:
-                    await self.db.execute("""UPDATE hll_rcon_health SET heartbeat_at=NOW(),updated_at=NOW() WHERE id=$1""", self.health_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("[HLLV HEARTBEAT WRITE FAILED] slot=%s", self.server_slot)
-            await asyncio.sleep(RCON_HEARTBEAT_SECONDS)
 
     async def _health(self, connected: bool, error: str = ""):
         if not self.db.pool:
@@ -785,13 +758,13 @@ class HLLVTelemetryCollector:
             INSERT INTO hll_rcon_health(
                 id,enabled,connected,host,port,server_key,last_success_at,last_error_at,last_error,
                 last_server_name,last_map_name,last_game_mode,last_player_count,
-                last_players_filed,last_player_errors,last_partial_error,heartbeat_at,last_poll_finished_at,updated_at
+                last_players_filed,last_player_errors,last_partial_error,updated_at
             ) VALUES(
                 $8,$9,$1,$10,$11,$12,
                 CASE WHEN $1 THEN $2 ELSE NULL END,
                 CASE WHEN $1 THEN NULL ELSE $2 END,
                 CASE WHEN $1 THEN NULL ELSE $3 END,
-                $4,$5,$6,$7,$13,$14,$15,NOW(),NOW(),NOW()
+                $4,$5,$6,$7,$13,$14,$15,NOW()
             )
             ON CONFLICT(id) DO UPDATE SET
                 enabled=EXCLUDED.enabled,connected=EXCLUDED.connected,host=EXCLUDED.host,port=EXCLUDED.port,server_key=EXCLUDED.server_key,
@@ -801,7 +774,7 @@ class HLLVTelemetryCollector:
                 last_server_name=EXCLUDED.last_server_name,last_map_name=EXCLUDED.last_map_name,
                 last_game_mode=EXCLUDED.last_game_mode,last_player_count=EXCLUDED.last_player_count,
                 last_players_filed=EXCLUDED.last_players_filed,last_player_errors=EXCLUDED.last_player_errors,
-                last_partial_error=EXCLUDED.last_partial_error,heartbeat_at=NOW(),last_poll_finished_at=NOW(),updated_at=NOW()
+                last_partial_error=EXCLUDED.last_partial_error,updated_at=NOW()
         """, connected, now, error[:1000] if error else None,
              self.last_server.get("server_name"), self.last_server.get("map_name"),
              self.last_server.get("game_mode"), int(self.last_players or 0), self.health_id,
@@ -836,23 +809,16 @@ class HLLVTelemetryCollector:
     async def poll_once(self):
         if not self.rcon:
             raise RuntimeError("RCON client not initialized")
-        if self.db.pool:
-            try:
-                await self.db.execute("UPDATE hll_rcon_health SET last_poll_started_at=NOW(),heartbeat_at=NOW(),updated_at=NOW() WHERE id=$1", self.health_id)
-            except Exception:
-                log.exception("[HLLV POLL START HEALTH WRITE FAILED] slot=%s", self.server_slot)
         # The client reconnects as necessary. Connection is established explicitly
         # here so failures are reflected in hll_rcon_health immediately.
         try:
-            await asyncio.wait_for(self.rcon.connect(), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(f"RCON connect timed out after {RCON_COMMAND_TIMEOUT_SECONDS}s") from exc
+            await self.rcon.connect()
         except Exception:
             # Some hllrcon builds auto-connect on first command and may consider an
             # already-connected connect() harmless/invalid. Continue to commands.
             pass
-        session_response = await asyncio.wait_for(self.rcon.get_server_session(), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
-        players_response = await asyncio.wait_for(self.rcon.get_players(), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+        session_response = await self.rcon.get_server_session()
+        players_response = await self.rcon.get_players()
         # hllrcon 2.x patch releases have used both direct models and wrapped
         # response objects. Unwrap common shapes so a library serialization change
         # cannot make a healthy server appear empty.
@@ -1008,7 +974,7 @@ class HLLVTelemetryCollector:
         self._broadcast_generation += 1
         generation = self._broadcast_generation
         try:
-            await asyncio.wait_for(self.rcon.broadcast(text), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+            await self.rcon.broadcast(text)
         except Exception as exc:
             log.warning("[HLLV MANUAL BROADCAST FAILED] %s: %s", type(exc).__name__, exc)
             return {"ok": False, "error": f"Server broadcast failed: {type(exc).__name__}"}
@@ -1019,7 +985,7 @@ class HLLVTelemetryCollector:
             try:
                 await asyncio.sleep(seconds)
                 if self.rcon and generation == self._broadcast_generation:
-                    await asyncio.wait_for(self.rcon.broadcast(""), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+                    await self.rcon.broadcast("")
                     log.info("[HLLV MANUAL BROADCAST CLEARED]")
             except asyncio.CancelledError:
                 raise
@@ -1035,7 +1001,7 @@ class HLLVTelemetryCollector:
             return {"ok": False, "error": "HLL: Vietnam server connection is not currently available."}
         self._broadcast_generation += 1
         try:
-            await asyncio.wait_for(self.rcon.broadcast(""), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+            await self.rcon.broadcast("")
             log.info("[HLLV MANUAL BROADCAST CLEARED BY STAFF]")
             return {"ok": True}
         except Exception as exc:
@@ -1045,7 +1011,7 @@ class HLLVTelemetryCollector:
     async def _send_recruiting_broadcast(self):
         self._broadcast_generation += 1
         generation = self._broadcast_generation
-        await asyncio.wait_for(self.rcon.broadcast(RCON_RECRUITING_MESSAGE), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+        await self.rcon.broadcast(RCON_RECRUITING_MESSAGE)
         log.info("[HLLV RECRUITING BROADCAST] duration=%ss website=%s",
                  RCON_RECRUITING_DISPLAY_SECONDS, RCON_RECRUITING_WEBSITE)
 
@@ -1053,7 +1019,7 @@ class HLLVTelemetryCollector:
             try:
                 await asyncio.sleep(RCON_RECRUITING_DISPLAY_SECONDS)
                 if self.rcon and generation == self._broadcast_generation:
-                    await asyncio.wait_for(self.rcon.broadcast(""), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+                    await self.rcon.broadcast("")
                     log.info("[HLLV RECRUITING BROADCAST CLEARED]")
             except asyncio.CancelledError:
                 raise
@@ -1065,7 +1031,7 @@ class HLLVTelemetryCollector:
     async def _poll_weapon_logs(self, match_id: int):
         # RCON V2 GetAdminLog uses seconds, not minutes.  Keep a small overlap so
         # events near poll boundaries are not missed; event_key makes repeats safe.
-        response = await asyncio.wait_for(self.rcon.get_admin_log(max(20, RCON_POLL_SECONDS * 4)), timeout=RCON_COMMAND_TIMEOUT_SECONDS)
+        response = await self.rcon.get_admin_log(max(20, RCON_POLL_SECONDS * 4))
         entries = getattr(response, "entries", None)
         if entries is None:
             payload=_dump_model(response)

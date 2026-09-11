@@ -4390,8 +4390,6 @@ async def on_ready():
         credential_resend_watch.start()
     if not approved_recruit_watch.is_running():
         approved_recruit_watch.start()
-    if not accession_integrity_watch.is_running():
-        accession_integrity_watch.start()
     if not new_arrival_role_watch.is_running():
         new_arrival_role_watch.start()
     if not training_scheduler_watch.is_running():
@@ -6330,6 +6328,81 @@ async def before_new_arrival_role_watch():
     await bot.wait_until_ready()
 
 
+
+def _recruit_name_key(value: str | None) -> str:
+    import re
+    return re.sub(r'[^a-z0-9]+','',str(value or '').lower())
+
+
+def _unique_exact_recruit_match(guild: discord.Guild, case: dict):
+    wanted=[]
+    for raw in (case.get('discord_username_input'),case.get('discord_verified_username')):
+        key=_recruit_name_key(raw)
+        if key and key not in wanted: wanted.append(key)
+    if not wanted: return None,None
+    matches=[]
+    for m in guild.members:
+        if m.bot: continue
+        keys={_recruit_name_key(m.name),_recruit_name_key(m.display_name),_recruit_name_key(getattr(m,'global_name',None))}
+        keys.discard('')
+        if any(w in keys for w in wanted): matches.append(m)
+    # Automatic identity linkage is deliberately exact + unique only. Similar-name
+    # guesses stay unlinked so Clerk can never attach an application to the wrong person.
+    uniq={m.id:m for m in matches}
+    if len(uniq)==1:
+        member=next(iter(uniq.values()))
+        return member,'EXACT UNIQUE USERNAME / DISPLAY NAME'
+    return None,None
+
+
+async def reconcile_approved_unlinked_recruits(guild: discord.Guild):
+    try:
+        data=await web.request('GET','/internal/clerk/recruiting/unlinked-approved',params={'guild_id':guild.id})
+    except Exception as exc:
+        log.warning('[ASSISTED RECRUIT LINK WATCH FAILED] guild=%s error=%s',guild.id,exc); return
+    for case in data.get('cases',[]):
+        member,basis=_unique_exact_recruit_match(guild,case)
+        if not member: continue
+        try:
+            result=await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/assisted-discord-link",json={
+                'guild_id':guild.id,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name,'match_basis':basis
+            })
+            log.info('[ASSISTED RECRUIT LINK] case=%s member=%s result=%s',case.get('case_number'),member.id,result)
+        except Exception as exc:
+            log.warning('[ASSISTED RECRUIT LINK FAILED] case=%s member=%s error=%s',case.get('case_number'),member.id,exc)
+
+
+async def notify_staff_member_departure(member: discord.Member, purge_result: dict | None, purge_error: str | None = None):
+    role_names={'command staff','admin'}
+    recipients={}
+    for role in member.guild.roles:
+        if role.name.strip().lower() in role_names:
+            for target in role.members:
+                if not target.bot: recipients[target.id]=target
+    result=purge_result or {}
+    soldier=' '.join(x for x in [result.get('rank_code'),result.get('first_name'),result.get('last_name')] if x).strip()
+    if not soldier: soldier=member.display_name
+    assignment=' • '.join(str(x) for x in [result.get('unit_code'),result.get('platoon'),result.get('squad'),result.get('duty_position')] if x)
+    if purge_error:
+        cleanup=f"⚠️ Website departure cleanup FAILED after retries: {purge_error[:350]}"
+    elif result.get('purged'):
+        cleanup='✅ Active 201 File closed and website/personnel cleanup completed.'
+    elif result.get('linked') is False:
+        cleanup='ℹ️ No active website Soldier link was found; no 201 File purge was required.'
+    else:
+        cleanup='⚠️ Departure was recorded, but no completed personnel purge was confirmed.'
+    text=("**1/5 CAV — MEMBER DEPARTURE**\n\n"
+          f"**Soldier:** {soldier}\n"
+          f"**Discord:** {member.name} / {member.display_name} (`{member.id}`)\n"
+          + (f"**Battle Roster:** {result.get('service_number')}\n" if result.get('service_number') else '')
+          + (f"**Last Assignment:** {assignment}\n" if assignment else '')
+          + f"**Departure Time:** <t:{int(utc_now().timestamp())}:F>\n\n{cleanup}\n\n**BATTALION CLERK • PERSONNEL WATCH**")
+    for target in recipients.values():
+        try: await target.send(text)
+        except discord.Forbidden: log.warning('[DEPARTURE STAFF DM BLOCKED] target=%s member=%s',target.id,member.id)
+        except Exception as exc: log.warning('[DEPARTURE STAFF DM FAILED] target=%s member=%s error=%s',target.id,member.id,exc)
+
+
 @tasks.loop(seconds=10)
 async def approved_recruit_watch():
     """Near-immediate approval pipeline: join -> role -> provision -> credential DM."""
@@ -6338,57 +6411,24 @@ async def approved_recruit_watch():
         if GUILD_ID and guild.id != GUILD_ID:
             continue
         try:
+            await reconcile_approved_unlinked_recruits(guild)
+            # An approved, Discord-linked recruit must never remain without a 201 File.
+            missing=await web.request('GET','/internal/clerk/recruiting/approved-missing-personnel',params={'guild_id':guild.id})
+            for case in missing.get('cases',[]):
+                member=guild.get_member(int(case.get('discord_user_id') or 0))
+                if not member: continue
+                try:
+                    provision=await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/provision",json={
+                        'guild_id':guild.id,'discord_user_id':member.id,'username':member.name,'display_name':member.display_name,'ensure_credentials':True
+                    })
+                    log.info('[MISSING 201 REPAIR] case=%s member=%s personnel=%s',case.get('case_number'),member.id,provision.get('personnel_id'))
+                except Exception as exc:
+                    log.warning('[MISSING 201 REPAIR FAILED] case=%s member=%s error=%s',case.get('case_number'),member.id,exc)
             data=await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':guild.id})
             for case in data.get('cases',[]):
                 await process_approved_recruit_case(guild,case)
         except Exception as exc:
             log.warning('[APPROVED RECRUIT WATCH FAILED] guild=%s error=%s',guild.id,exc)
-
-
-
-@tasks.loop(seconds=30)
-async def accession_integrity_watch():
-    """Self-heal approved Discord accessions that are missing any part of the 201 File chain."""
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        return
-    for guild in bot.guilds:
-        if GUILD_ID and guild.id != GUILD_ID:
-            continue
-        try:
-            try:
-                repaired=await web.request('POST','/internal/clerk/recruiting/reconcile-intakes',json={'guild_id':guild.id})
-                if int(repaired.get('repaired') or 0):
-                    log.warning('[DISCORD INTAKE SELF-HEAL] recovered=%s',repaired.get('repaired'))
-            except Exception:
-                log.exception('[DISCORD INTAKE SELF-HEAL FAILED] guild=%s',guild.id)
-            data=await web.request('GET','/internal/clerk/recruiting/accession-integrity',params={'guild_id':guild.id})
-            cases=data.get('cases',[]) if data.get('ok',True) else []
-            if cases:
-                log.warning('[ACCESSION INTEGRITY] %s approved case(s) require safe 201 repair',len(cases))
-            for case in cases:
-                uid=int(case.get('discord_user_id') or 0)
-                if not uid:
-                    continue
-                member=guild.get_member(uid)
-                if not member:
-                    try:
-                        member=await guild.fetch_member(uid)
-                    except Exception:
-                        member=None
-                if not member:
-                    log.warning('[ACCESSION INTEGRITY HOLD] case=%s Discord member not present',case.get('case_number'))
-                    continue
-                try:
-                    ok=await process_approved_recruit_case(guild,case,member=member)
-                    log.info('[ACCESSION INTEGRITY REPAIR] case=%s member=%s delivered=%s',case.get('case_number'),uid,ok)
-                except Exception:
-                    log.exception('[ACCESSION INTEGRITY REPAIR FAILED] case=%s member=%s',case.get('case_number'),uid)
-        except Exception:
-            log.exception('[ACCESSION INTEGRITY WATCH FAILED] guild=%s',guild.id)
-
-@accession_integrity_watch.before_loop
-async def before_accession_integrity_watch():
-    await bot.wait_until_ready()
 
 
 @bot.event
@@ -6490,52 +6530,6 @@ async def on_member_join(member: discord.Member):
     log.info('[MEMBER JOIN] %s (%s)', member.display_name, member.id)
 
 
-
-async def notify_staff_member_departure(member: discord.Member, purge_result: dict | None = None, purge_error: str | None = None):
-    """DM Command Staff + Admin role holders once per recipient when a human member leaves."""
-    target_role_names={'command staff','admin'}
-    recipients={}
-    for role in member.guild.roles:
-        if role.name.strip().lower() not in target_role_names:
-            continue
-        for user in role.members:
-            if not user.bot:
-                recipients[user.id]=user
-    # The departing member is already out of the guild, so website purge results are
-    # the best source for authoritative personnel context when available.
-    result=purge_result or {}
-    soldier=result.get('soldier') or result.get('personnel') or {}
-    rank=soldier.get('rank_code') or result.get('rank_code') or ''
-    last=soldier.get('last_name') or result.get('last_name') or member.display_name
-    roster=result.get('roster_number') or soldier.get('roster_number') or 'NOT AVAILABLE'
-    assignment=result.get('assignment') or soldier.get('unit_code') or result.get('unit_code') or 'NOT AVAILABLE'
-    if isinstance(assignment,dict):
-        assignment=' • '.join(str(x) for x in (assignment.get('unit_code'),assignment.get('platoon'),assignment.get('squad')) if x) or 'NOT AVAILABLE'
-    cleanup='COMPLETE' if result.get('ok') and not purge_error else 'ATTENTION REQUIRED'
-    detail=(result.get('detail') or result.get('message') or result.get('error') or purge_error or '').strip()
-    message=(
-        "**1/5 CAV — MEMBER DEPARTURE NOTICE**\n\n"
-        f"**Member:** {rank+' ' if rank else ''}{last}\n"
-        f"**Discord:** {member.name} (`{member.id}`)\n"
-        f"**Battle Roster:** {roster}\n"
-        f"**Last Assignment:** {assignment}\n"
-        f"**Website / 201 Cleanup:** **{cleanup}**\n"
-        f"**Departure Time:** {utc_now().strftime('%d %b %Y %H%M UTC').upper()}\n"
-    )
-    if detail:
-        message += f"\n**System Note:** {detail[:500]}\n"
-    message += "\nBattalion Clerk has recorded the Discord departure."
-    sent=0; failed=0
-    for user in recipients.values():
-        try:
-            await user.send(message)
-            sent+=1
-        except Exception as exc:
-            failed+=1
-            log.warning('[DEPARTURE STAFF DM FAILED] recipient=%s departed=%s error=%s',user.id,member.id,exc)
-    log.info('[DEPARTURE STAFF DM] departed=%s recipients=%s sent=%s failed=%s',member.id,len(recipients),sent,failed)
-
-
 @bot.event
 async def on_member_remove(member: discord.Member):
     if GUILD_ID and member.guild.id != GUILD_ID:
@@ -6565,14 +6559,16 @@ async def on_member_remove(member: discord.Member):
 
     await collector.mark_member_left(member, now)
     if not member.bot:
-        # Discord departure is authoritative for active battalion membership.
+        # V90 — Discord departure is authoritative for active battalion membership.
         # Retry the website purge so a transient web/API error does not leave a ghost 201 File.
         departure_payload={'guild_id':member.guild.id,'discord_user_id':member.id,'reason':'member_left_discord'}
-        last_exc=None; purge_result={}
+        last_exc=None
+        purge_result=None
         for attempt in range(1,4):
             try:
-                purge_result=await web.request('POST','/internal/clerk/personnel/departure',json=departure_payload) or {}
-                log.info('[PERSONNEL DEPARTURE PURGE] member=%s attempt=%s result=%s',member.id,attempt,purge_result)
+                result=await web.request('POST','/internal/clerk/personnel/departure',json=departure_payload)
+                purge_result=result
+                log.info('[PERSONNEL DEPARTURE PURGE] member=%s attempt=%s result=%s',member.id,attempt,result)
                 last_exc=None
                 break
             except Exception as exc:
@@ -6584,8 +6580,8 @@ async def on_member_remove(member: discord.Member):
             log.error('[PERSONNEL DEPARTURE PURGE FAILED] member=%s after 3 attempts error=%s',member.id,last_exc)
         try:
             await notify_staff_member_departure(member,purge_result,str(last_exc) if last_exc else None)
-        except Exception:
-            log.exception('[DEPARTURE STAFF NOTIFICATION FAILED] member=%s',member.id)
+        except Exception as exc:
+            log.warning('[DEPARTURE STAFF NOTIFY FAILED] member=%s error=%s',member.id,exc)
     await collector.record_event('member_leave', {
         'guild_id': str(member.guild.id),
         'discord_user_id': str(member.id),
