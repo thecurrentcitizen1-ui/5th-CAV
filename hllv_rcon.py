@@ -1739,21 +1739,31 @@ class HLLVTelemetryCollector:
         person = await self._person_for_discord(guild_id, discord_user_id)
         if not person:
             return {"ok": False, "error": "No active Soldier Record is linked to this Discord account."}
+        # Never steal an identity from another Soldier and never silently replace
+        # a Soldier's existing identity. A correction must go through /unlink-game
+        # or the Command GAME IDENTITY REPAIR tool first.
+        existing_identity = await self.db.fetchrow("SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1 LIMIT 1", steam_id)
+        if existing_identity and str(existing_identity.get("personnel_id") or "") != str(person["personnel_id"]):
+            return {"ok": False, "error": "That SteamID64 is already linked to another Soldier Record. Command/S-1 must resolve the ownership conflict."}
+        owned_identity = await self.db.fetchrow("SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1 LIMIT 1", str(person["personnel_id"]))
+        if owned_identity and str(owned_identity.get("steam_id") or "") != steam_id:
+            return {"ok": False, "error": "Your Soldier Record still has a different game identity on file. Run /unlink-game first, then retry /link-game."}
         try:
-            await self.db.execute("""
-                INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,linked_by,verified,updated_at)
-                VALUES($1,$2,$3,$4,TRUE,NOW())
-                ON CONFLICT(steam_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,discord_user_id=EXCLUDED.discord_user_id,
-                    linked_by=EXCLUDED.linked_by,verified=TRUE,updated_at=NOW()
-            """, steam_id, person["personnel_id"], str(discord_user_id), linked_by)
-            # Backfill any telemetry collected before the Soldier linked their account.
-            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", person["personnel_id"], steam_id)
+            if existing_identity:
+                await self.db.execute("""UPDATE hll_personnel_links SET discord_user_id=$1,linked_by=$2,verified=TRUE,platform='STEAM',platform_user_id=$3,updated_at=NOW() WHERE steam_id=$3 AND personnel_id=$4""",
+                                      str(discord_user_id),linked_by,steam_id,str(person["personnel_id"]))
+            else:
+                await self.db.execute("""
+                    INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,platform,platform_user_id,linked_by,verified,updated_at)
+                    VALUES($1,$2,$3,'STEAM',$1,$4,TRUE,NOW())
+                """, steam_id, str(person["personnel_id"]), str(discord_user_id), linked_by)
+            # Backfill only unclaimed telemetry or telemetry already owned by this Soldier.
+            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), steam_id)
             try:
-                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", person["personnel_id"], steam_id)
+                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), steam_id)
             except Exception:
                 pass
         except Exception as exc:
-            # Unique personnel mapping means one Soldier cannot silently own two Steam IDs.
             return {"ok": False, "error": f"Link conflict: {exc}"}
         name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
         return {"ok": True, "personnel_id": person["personnel_id"], "soldier": name, "steam_id": steam_id}
@@ -1789,16 +1799,26 @@ class HLLVTelemetryCollector:
         player_key = str(row.get("steam_id") or "").strip()
         if not player_key:
             return {"ok": False, "error": "The server saw that player name but did not expose a stable platform identity. Try again while the player is currently in the server."}
+        existing_identity = await self.db.fetchrow("SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1 LIMIT 1", player_key)
+        if existing_identity and str(existing_identity.get("personnel_id") or "") != str(person["personnel_id"]):
+            return {"ok": False, "error": "That console identity is already linked to another Soldier Record. Command/S-1 must resolve the ownership conflict."}
+        owned_identity = await self.db.fetchrow("SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1 LIMIT 1", str(person["personnel_id"]))
+        if owned_identity and str(owned_identity.get("steam_id") or "") != player_key:
+            return {"ok": False, "error": "Your Soldier Record still has a different game identity on file. Run /unlink-game first, then retry /link-game."}
         try:
-            await self.db.execute("""
-                INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,hll_player_name,platform,platform_user_id,eos_id,linked_by,verified,updated_at)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,NOW())
-                ON CONFLICT(steam_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,discord_user_id=EXCLUDED.discord_user_id,
-                    hll_player_name=EXCLUDED.hll_player_name,platform=EXCLUDED.platform,platform_user_id=EXCLUDED.platform_user_id,eos_id=EXCLUDED.eos_id,
-                    linked_by=EXCLUDED.linked_by,verified=TRUE,updated_at=NOW()
-            """, player_key, person["personnel_id"], str(discord_user_id), row.get("player_name"), row.get("platform"), row.get("platform_user_id"), row.get("eos_id"), linked_by)
-            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2", person["personnel_id"], player_key)
-            await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2", person["personnel_id"], player_key)
+            if existing_identity:
+                await self.db.execute("""UPDATE hll_personnel_links SET discord_user_id=$1,hll_player_name=$2,platform=$3,platform_user_id=$4,eos_id=$5,linked_by=$6,verified=TRUE,updated_at=NOW() WHERE steam_id=$7 AND personnel_id=$8""",
+                                      str(discord_user_id),row.get("player_name"),row.get("platform"),row.get("platform_user_id"),row.get("eos_id"),linked_by,player_key,str(person["personnel_id"]))
+            else:
+                await self.db.execute("""
+                    INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,hll_player_name,platform,platform_user_id,eos_id,linked_by,verified,updated_at)
+                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,NOW())
+                """, player_key, str(person["personnel_id"]), str(discord_user_id), row.get("player_name"), row.get("platform"), row.get("platform_user_id"), row.get("eos_id"), linked_by)
+            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), player_key)
+            try:
+                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), player_key)
+            except Exception:
+                pass
         except Exception as exc:
             return {"ok": False, "error": f"Link conflict: {exc}"}
         name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
@@ -1913,21 +1933,38 @@ class HLLVTelemetryCollector:
         if result and not str(result).endswith(" 0"):
             changed = True
 
-        # A console self-link can exist only as a pending claim until the exact
-        # account is observed on the server. Clear that claim too so a corrected
-        # /link-game is not blocked by the old gamertag. Keep this compatibility
-        # safe for deployments that predate hll_identity_claims.
+        # Retire every active claim. Older builds only superseded PENDING claims,
+        # leaving VERIFIED/LINKED claims behind. The website could then resurrect
+        # the wrong gamertag after /unlink-game and block the corrected re-link.
         try:
-            pending = await self.db.execute("""
+            claims = await self.db.execute("""
                 UPDATE hll_identity_claims
-                SET status='SUPERSEDED', updated_at=NOW(),
+                SET status='SUPERSEDED', linked_player_key=NULL, linked_at=NULL, updated_at=NOW(),
                     error='UNLINKED BY SOLDIER BEFORE RE-LINK'
-                WHERE personnel_id=$1 AND status='PENDING'
+                WHERE personnel_id=$1 AND status IN ('PENDING','VERIFIED','LINKED')
             """, personnel_id)
-            if pending and not str(pending).endswith(" 0"):
+            if claims and not str(claims).endswith(" 0"):
                 changed = True
         except Exception as exc:
-            log.warning('[HLL UNLINK] pending-claim cleanup skipped personnel=%s error=%s', personnel_id, exc)
+            log.warning('[HLL UNLINK] active-claim cleanup skipped personnel=%s error=%s', personnel_id, exc)
+
+        # Preserve the original application identity for audit, but revoke it as
+        # an authority source so the website cannot treat the bad intake value as
+        # a current game link after the member intentionally unlinks it.
+        try:
+            cases = await self.db.execute("""
+                UPDATE recruiting_cases
+                SET game_identity_link_status='REVOKED',
+                    game_identity_link_error='UNLINKED BY SOLDIER BEFORE RE-LINK',
+                    game_identity_linked_at=NULL,updated_at=NOW()
+                WHERE personnel_id::text=$1
+                  AND COALESCE(NULLIF(TRIM(COALESCE(game_identity::text,steam_id64::text,'')),''),'')<>''
+                  AND UPPER(COALESCE(game_identity_link_status,'')) NOT IN ('REVOKED','SUPERSEDED','INVALID')
+            """, personnel_id)
+            if cases and not str(cases).endswith(" 0"):
+                changed = True
+        except Exception as exc:
+            log.warning('[HLL UNLINK] recruiting-case fallback cleanup skipped personnel=%s error=%s', personnel_id, exc)
 
         return changed
 
