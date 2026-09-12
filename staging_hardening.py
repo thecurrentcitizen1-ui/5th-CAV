@@ -53,4 +53,49 @@ replace_or_already(
     "cast RCON health timestamp/text parameters",
 )
 
+# Staging must be able to stay online for database/Website validation while its
+# Discord token and HLL RCON connections remain intentionally disabled. This
+# mode never calls bot.run(), never opens a Discord gateway, and only exercises
+# the staging database plus read-only Website Clerk endpoints.
+offline_block = '''if str(os.getenv("STAGING_OFFLINE_MODE", "")).strip().lower() in {"1","true","yes","on"}:
+    async def _staging_offline_main():
+        log.warning('[STAGING OFFLINE] Discord gateway disabled; running DB/Website validation only')
+        await collector.start()
+        db = collector.db
+        if not db.pool:
+            raise RuntimeError('STAGING OFFLINE: DATABASE_URL unavailable')
+        row = await db.fetchrow('SELECT NOW() AS database_time')
+        log.info('[STAGING OFFLINE] database ready time=%s', row.get('database_time') if row else None)
+
+        # Build/reconcile only staging-side Clerk/HLL tables. HLL collectors stay
+        # disconnected because Railway keeps both HLL_RCON_ENABLED flags false.
+        await ensure_clerk_settings_table()
+        await ensure_leadership_due_out_schema()
+        await hllv.ensure_schema()
+        await hllv2.ensure_schema()
+        log.info('[STAGING OFFLINE] Clerk/RCON schema validation complete')
+
+        # Exercise a supported read-only Website endpoint through the normal
+        # Clerk client so URL/auth drift is visible without touching Discord.
+        gid = GUILD_ID or TEST_GUILD_ID
+        if WEBSITE_BASE_URL and CLERK_SYNC_KEY and gid:
+            result = await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':gid})
+            log.info('[STAGING OFFLINE] Website Clerk probe ok cases=%s', len(result.get('cases') or []))
+        else:
+            log.warning('[STAGING OFFLINE] Website Clerk probe skipped: URL/key/guild missing')
+
+        # Stay alive so Railway reports healthy while remaining fully isolated.
+        while True:
+            await asyncio.sleep(300)
+
+    asyncio.run(_staging_offline_main())
+else:
+    bot.run(TOKEN)'''
+replace_or_already(
+    bot,
+    "bot.run(TOKEN)",
+    offline_block,
+    "enable staging offline validation mode",
+)
+
 print("[STAGING HARDENING] validation pass complete")
