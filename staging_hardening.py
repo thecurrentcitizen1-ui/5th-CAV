@@ -28,22 +28,6 @@ replace_or_already(
     "qualify squad handoff completed_at",
 )
 
-# Two recruiting probes exist in Clerk but do not have matching Website routes.
-# Do not hammer the Website with 404s while staging is isolated. The supported
-# approved-pending accession route remains active and authoritative.
-replace_or_already(
-    bot,
-    "data=await web.request('GET','/internal/clerk/recruiting/unlinked-approved',params={'guild_id':guild.id})",
-    "data={'cases':[]}",
-    "disable unsupported unlinked-approved probe",
-)
-replace_or_already(
-    bot,
-    "missing=await web.request('GET','/internal/clerk/recruiting/approved-missing-personnel',params={'guild_id':guild.id})",
-    "missing={'cases':[]}",
-    "disable unsupported approved-missing-personnel probe",
-)
-
 # asyncpg can infer CASE parameter types inconsistently when one branch is NULL.
 # Explicit casts make the health UPSERT agree with the TIMESTAMPTZ/TEXT schema.
 replace_or_already(
@@ -75,12 +59,17 @@ offline_block = '''if str(os.getenv("STAGING_OFFLINE_MODE", "")).strip().lower()
         await hllv2.ensure_schema()
         log.info('[STAGING OFFLINE] Clerk/RCON schema validation complete')
 
-        # Exercise a supported read-only Website endpoint through the normal
-        # Clerk client so URL/auth drift is visible without touching Discord.
+        # Exercise supported read-only Website endpoints through the normal Clerk
+        # client so URL/auth/route drift is visible without touching Discord.
         gid = GUILD_ID or TEST_GUILD_ID
         if WEBSITE_BASE_URL and CLERK_SYNC_KEY and gid:
-            result = await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':gid})
-            log.info('[STAGING OFFLINE] Website Clerk probe ok cases=%s', len(result.get('cases') or []))
+            approved = await web.request('GET','/internal/clerk/recruiting/approved-pending',params={'guild_id':gid})
+            unlinked = await web.request('GET','/internal/clerk/recruiting/unlinked-approved',params={'guild_id':gid})
+            missing = await web.request('GET','/internal/clerk/recruiting/approved-missing-personnel',params={'guild_id':gid})
+            tracking = await web.request('GET','/internal/clerk/tracking-health')
+            log.info('[STAGING OFFLINE] Website Clerk probes ok approved=%s unlinked=%s missing_personnel=%s tracking=%s',
+                     len(approved.get('cases') or []),len(unlinked.get('cases') or []),
+                     len(missing.get('cases') or []),tracking.get('overall'))
         else:
             log.warning('[STAGING OFFLINE] Website Clerk probe skipped: URL/key/guild missing')
 
