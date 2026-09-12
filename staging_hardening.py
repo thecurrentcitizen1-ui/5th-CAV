@@ -40,7 +40,7 @@ replace_or_already(
 # Staging must be able to stay online for database/Website validation while its
 # Discord token and HLL RCON connections remain intentionally disabled. This
 # mode never calls bot.run(), never opens a Discord gateway, and only exercises
-# the staging database plus read-only Website Clerk endpoints.
+# the staging database plus Website Clerk endpoints.
 offline_block = '''if str(os.getenv("STAGING_OFFLINE_MODE", "")).strip().lower() in {"1","true","yes","on"}:
     async def _staging_offline_main():
         log.warning('[STAGING OFFLINE] Discord gateway disabled; running DB/Website validation only')
@@ -58,6 +58,24 @@ offline_block = '''if str(os.getenv("STAGING_OFFLINE_MODE", "")).strip().lower()
         await hllv.ensure_schema()
         await hllv2.ensure_schema()
         log.info('[STAGING OFFLINE] Clerk/RCON schema validation complete')
+
+        # Execute the exact handoff auto-close SQL that previously failed with
+        # AmbiguousColumnError. Staging currently contains no live production
+        # personnel, so this is a compile/contract regression check only.
+        await db.execute("""UPDATE squad_handoff_tasks sht
+                          SET status='COMPLETE',completed_at=COALESCE(sht.completed_at,NOW())
+                          FROM welcome_packets wp
+                          WHERE wp.personnel_id=sht.recruit_personnel_id
+                            AND sht.status<>'COMPLETE'
+                            AND UPPER(COALESCE(wp.status,'')) IN ('COMPLETE','CLOSED','ARCHIVED')""")
+        log.info('[STAGING OFFLINE] squad handoff completed_at SQL regression check passed')
+
+        # Exercise the RCON health UPSERT without opening an RCON connection.
+        # This directly verifies the TIMESTAMPTZ/TEXT cast repair that production
+        # previously rejected during every poll.
+        await hllv._health(False, 'STAGING OFFLINE VALIDATION')
+        await hllv2._health(False, 'STAGING OFFLINE VALIDATION')
+        log.info('[STAGING OFFLINE] RCON health write regression check passed for both server slots')
 
         # Exercise supported read-only Website endpoints through the normal Clerk
         # client so URL/auth/route drift is visible without touching Discord.
