@@ -32,6 +32,8 @@ def render_path(node: ast.AST) -> str | None:
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 out.append(value.value)
             elif isinstance(value, ast.FormattedValue):
+                # Flask's current dynamic Clerk paths use string/UUID-like ids.
+                # A simple non-empty placeholder is enough for route matching.
                 out.append("1")
             else:
                 return None
@@ -61,44 +63,64 @@ for node in ast.walk(tree):
 
 headers = {"X-Battalion-Clerk-Key": KEY} if KEY else {}
 missing = []
+method_mismatch = []
 exists = []
 unknown = []
 
 for method, path in sorted(routes):
     url = BASE + path
     req = urllib.request.Request(url, method="OPTIONS", headers=headers)
+    status = None
+    allow_header = ""
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             status = int(resp.status)
+            allow_header = resp.headers.get("Allow", "") or ""
     except urllib.error.HTTPError as exc:
         status = int(exc.code)
+        allow_header = exc.headers.get("Allow", "") if exc.headers else ""
     except Exception as exc:
         unknown.append((method, path, type(exc).__name__, str(exc)[:180]))
         continue
 
+    allowed = {part.strip().upper() for part in allow_header.split(",") if part.strip()}
+
     if status == 404:
         missing.append((method, path, status))
-    elif status in {200, 204, 401, 403, 405} or 300 <= status < 400:
+        continue
+
+    # Flask's automatic OPTIONS response exposes the actual methods registered
+    # for the matched rule. This catches the subtler case where a path exists but
+    # Clerk calls it with POST while Website only registered GET (or vice versa).
+    if allowed and method not in allowed:
+        method_mismatch.append((method, path, status, ",".join(sorted(allowed))))
+        continue
+
+    if status in {200, 204, 401, 403, 405} or 300 <= status < 400:
         exists.append((method, path, status))
     else:
         unknown.append((method, path, status, "unexpected status"))
 
 print(
     f"[ROUTE AUDIT] discovered={len(routes)} exists={len(exists)} "
-    f"missing={len(missing)} unknown={len(unknown)} base={BASE}"
+    f"missing={len(missing)} method_mismatch={len(method_mismatch)} "
+    f"unknown={len(unknown)} base={BASE}"
 )
 
 for method, path, status in missing:
     print(f"[ROUTE AUDIT MISSING] {method} {path} status={status}")
 
+for method, path, status, allowed in method_mismatch:
+    print(f"[ROUTE AUDIT METHOD] {method} {path} status={status} allowed={allowed}")
+
 for row in unknown:
     print("[ROUTE AUDIT UNKNOWN] " + " | ".join(str(x) for x in row))
 
-if missing:
-    print("[ROUTE AUDIT] completed with missing Clerk routes")
+if missing or method_mismatch:
+    print("[ROUTE AUDIT] FAIL Clerk/Website route contract drift remains")
 elif unknown:
-    print("[ROUTE AUDIT] completed with no 404s but some inconclusive probes")
+    print("[ROUTE AUDIT] completed with no route/method mismatches but some inconclusive probes")
 else:
-    print("[ROUTE AUDIT] PASS all Clerk routes resolve on staging Website")
+    print("[ROUTE AUDIT] PASS all Clerk paths and HTTP methods resolve on staging Website")
 
 sys.exit(0)
