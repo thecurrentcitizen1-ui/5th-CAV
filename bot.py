@@ -1474,10 +1474,17 @@ async def get_order_routes(guild_id: int):
 def event_timestamp(value) -> Optional[datetime]:
     if not value:
         return None
+    text=str(value).strip()
     try:
-        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).astimezone(timezone.utc)
+        return datetime.fromisoformat(text.replace('Z', '+00:00')).astimezone(timezone.utc)
     except Exception:
-        return None
+        try:
+            parsed=parsedate_to_datetime(text)
+            if parsed.tzinfo is None:
+                parsed=parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
 
 
 def order_heading(event_type: str) -> str:
@@ -1766,7 +1773,12 @@ async def duty_announcement_watch():
                 continue
 
             seconds_to_start = (start - now).total_seconds()
-            if str(event.get('event_type') or '').upper()=='OPERATION' and seconds_to_start>0:
+            event_type_upper=str(event.get('event_type') or '').upper()
+            if event_type_upper=='MEETING' and str(event.get('audience') or '').upper()=='NCO':
+                # NCO meetings are intentionally private in notification scope.
+                # nco_meeting_watch handles all role-restricted notices.
+                continue
+            if event_type_upper=='OPERATION' and seconds_to_start>0:
                 try:
                     if not await operation_schedule_notice_was_sent(guild.id,event):
                         posted_channel_id=await post_operation_scheduled_notice(guild,event)
@@ -2229,6 +2241,38 @@ async def require_training_host(interaction: discord.Interaction) -> bool:
         return False
     return True
 
+NCO_MEETING_HOST_ROLE_NAMES = {
+    'NCO','Squad Leader','Assistant Squad Leader','Platoon Sergeant','First Sergeant',
+    'Company Commander','Battalion Commander','Battalion Executive Officer','Command Staff'
+}
+OPERATION_SCHEDULER_ROLE_NAMES = {
+    'S-3 Operations','S-3 OIC','S-3 NCOIC','Company Commander','First Sergeant',
+    'Battalion Commander','Battalion Executive Officer','Command Staff'
+}
+TRAINING_CANCEL_OVERRIDE_ROLE_NAMES = OPERATION_SCHEDULER_ROLE_NAMES | {'Platoon Sergeant'}
+
+
+def _member_has_any_role(member: discord.Member, names) -> bool:
+    return bool(set(member_role_names(member)) & set(names))
+
+
+async def require_nco_meeting_host(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message('Use this command inside the 1/5 Cav Discord.',ephemeral=True); return False
+    if interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or _member_has_any_role(interaction.user,NCO_MEETING_HOST_ROLE_NAMES):
+        return True
+    await interaction.response.send_message('NCO meeting scheduling is limited to the NCO Corps and Command.',ephemeral=True)
+    return False
+
+
+async def require_operation_scheduler(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message('Use this command inside the 1/5 Cav Discord.',ephemeral=True); return False
+    if interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or _member_has_any_role(interaction.user,OPERATION_SCHEDULER_ROLE_NAMES):
+        return True
+    await interaction.response.send_message('Operation scheduling is limited to S-3, Company leadership, and Command staff.',ephemeral=True)
+    return False
+
 def _parse_training_et(date_text: str, time_text: str) -> datetime:
     clean_date=str(date_text or '').strip()
     clean_time=str(time_text or '').strip().upper().replace(' ','')
@@ -2382,6 +2426,8 @@ async def training_events_command(interaction:discord.Interaction):
     data=await web.request('GET','/internal/clerk/training-events',params={'guild_id':interaction.guild_id})
     now=utc_now(); lines=[]
     for e in data.get('events') or []:
+        if str(e.get('status') or '').upper() in {'CANCELLED','CANCELED','CLOSED','COMPLETED'}:
+            continue
         try:
             raw=str(e.get('starts_at') or '')
             try: starts=datetime.fromisoformat(raw.replace('Z','+00:00'))
@@ -2424,6 +2470,163 @@ async def close_training_command(interaction:discord.Interaction,event_id:str):
         await interaction.followup.send(f"Training close failed: {result.get('error','unknown error')}",ephemeral=True); return
     summary=result.get('summary') or {}
     await interaction.followup.send(f"**TRAINING CLOSED**\nAttending RSVP: **{summary.get('attending',0)}**\nVerified on server: **{summary.get('verified',0)}**\nTotal verified training time: **{summary.get('minutes',0)} minutes**",ephemeral=True)
+
+@bot.tree.command(name='cancel-training',description='Cancel a scheduled training and stop reminders/attendance credit.')
+@app_commands.describe(event_id='Training event ID shown by /training-events',reason='Optional cancellation reason')
+async def cancel_training_command(interaction:discord.Interaction,event_id:str,reason:Optional[str]=None):
+    if not interaction.guild or not isinstance(interaction.user,discord.Member):
+        await interaction.response.send_message('Use this command inside the battalion server.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    event=await _fetch_training_event(event_id.strip())
+    if not event:
+        await interaction.followup.send('Training event not found.',ephemeral=True); return
+    host_id=int(event.get('host_discord_user_id') or 0)
+    elevated=(interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or
+              _member_has_any_role(interaction.user,TRAINING_CANCEL_OVERRIDE_ROLE_NAMES))
+    if interaction.user.id != host_id and not elevated:
+        await interaction.followup.send('Only the training host, S-3, senior leadership, or Command may cancel this training.',ephemeral=True); return
+    result=await web.request('POST',f"/internal/clerk/training-events/{event_id.strip()}/cancel",json={'reason':(reason or '')[:500]})
+    if not result.get('ok',True):
+        await interaction.followup.send(f"Training cancellation failed: {result.get('error','unknown error')}",ephemeral=True); return
+    cancelled=result.get('event') or event
+    cid=cancelled.get('discord_channel_id'); mid=cancelled.get('discord_message_id')
+    if cid and mid:
+        try:
+            ch=interaction.guild.get_channel(int(cid))
+            if isinstance(ch,discord.TextChannel):
+                msg=await ch.fetch_message(int(mid))
+                note='**TRAINING CANCELLED**' + (f" — {reason[:300]}" if reason else '')
+                await msg.edit(embed=_training_event_embed(cancelled,result.get('rsvps') or event.get('rsvps') or [],guild=interaction.guild,state_note=note),view=None)
+                await ch.send(f"**TRAINING CANCELLED — {cancelled.get('title') or 'TRAINING'}**" + (f"\nReason: {reason[:500]}" if reason else ''))
+        except Exception:
+            log.exception('[TRAINING CANCEL MESSAGE UPDATE FAILED] event=%s',event_id)
+    await interaction.followup.send(f"**TRAINING CANCELLED** — {cancelled.get('title') or event_id}",ephemeral=True)
+
+
+@bot.tree.command(name='schedule-nco-meeting',description='Schedule an NCO meeting and notify only the NCO Discord role.')
+@app_commands.describe(title='Meeting title',date='Date in YYYY-MM-DD',time='Eastern time, e.g. 20:00 or 8:00PM',duration_minutes='Meeting length in minutes',channel='Text channel for NCO-only meeting notices',notes='Optional meeting agenda / notes')
+async def schedule_nco_meeting(interaction:discord.Interaction,title:str,date:str,time:str,duration_minutes:app_commands.Range[int,15,360],channel:Optional[discord.TextChannel]=None,notes:Optional[str]=None):
+    if not await require_nco_meeting_host(interaction): return
+    post_channel=channel or (interaction.channel if isinstance(interaction.channel,discord.TextChannel) else None)
+    if not post_channel:
+        await interaction.response.send_message('Choose a text channel for the NCO meeting notice.',ephemeral=True); return
+    nco_role=discord.utils.get(interaction.guild.roles,name='NCO')
+    if not nco_role:
+        await interaction.response.send_message('The Discord role **NCO** was not found. Restore that role before scheduling an NCO meeting.',ephemeral=True); return
+    try: start_et=_parse_training_et(date,time)
+    except Exception as exc:
+        await interaction.response.send_message(f'Invalid date/time: **{exc}**. Use `YYYY-MM-DD` and `20:00` or `8:00PM`.',ephemeral=True); return
+    if start_et <= datetime.now(ZoneInfo(BATTALION_TIMEZONE))-timedelta(minutes=2):
+        await interaction.response.send_message('Meeting start time must be in the future.',ephemeral=True); return
+    end_et=start_et+timedelta(minutes=int(duration_minutes))
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await web.request('POST','/internal/clerk/events',json={
+        'guild_id':interaction.guild_id,'host_discord_user_id':interaction.user.id,'event_type':'MEETING',
+        'title':title[:120],'starts_at':start_et.astimezone(timezone.utc).isoformat(),'ends_at':end_et.astimezone(timezone.utc).isoformat(),
+        'channel_name':'MEETING','audience':'NCO','notes':(notes or '')[:1000],'discord_channel_id':post_channel.id,
+        'credit_threshold_minutes':int(duration_minutes)})
+    if not result.get('ok',True) or not result.get('event_id'):
+        await interaction.followup.send(f"NCO meeting could not be scheduled: {result.get('error','unknown error')}",ephemeral=True); return
+    event=result.get('event') or {}; start=event_timestamp(event.get('starts_at')) or start_et.astimezone(timezone.utc)
+    body=(f"{nco_role.mention}\n**1/5 CAV — NCO MEETING SCHEDULED**\n\n"
+          f"**{title.upper()}**\n"
+          f"When: <t:{int(start.timestamp())}:F> • <t:{int(start.timestamp())}:R>\n"
+          f"Duration: **{int(duration_minutes)} minutes**\n"
+          f"Host: **{interaction.user.display_name}**" + (f"\nAgenda: {notes[:900]}" if notes else '') +
+          "\n\n**NCO CORPS ONLY — Battalion Clerk will remind the NCO role before step-off.**")
+    await post_channel.send(body[:2000],allowed_mentions=discord.AllowedMentions(roles=[nco_role],users=False,everyone=False))
+    await interaction.followup.send(f'**NCO MEETING SCHEDULED** — {post_channel.mention}\nEvent ID: `{result["event_id"]}`',ephemeral=True)
+
+
+OPERATION_KIND_CHOICES = [
+    app_commands.Choice(name='Operation',value='OFFICIAL OPERATION'),
+    app_commands.Choice(name='Campaign',value='CAMPAIGN EVENT'),
+    app_commands.Choice(name='Special Event',value='SPECIAL EVENT'),
+]
+
+@bot.tree.command(name='schedule-operation',description='Schedule and publish an Operation, campaign, or special battalion event.')
+@app_commands.describe(title='Operation / event title',date='Date in YYYY-MM-DD',time='Eastern step-off time',duration_minutes='Planned duration in minutes',voice_channel='Discord voice channel used for official operation attendance',kind='Operation, campaign, or special event',area_of_operations='Optional area / map / campaign name',notes='Optional mission or event notes')
+@app_commands.choices(kind=OPERATION_KIND_CHOICES)
+async def schedule_operation_command(interaction:discord.Interaction,title:str,date:str,time:str,duration_minutes:app_commands.Range[int,45,720],voice_channel:discord.VoiceChannel,kind:Optional[app_commands.Choice[str]]=None,area_of_operations:Optional[str]=None,notes:Optional[str]=None):
+    if not await require_operation_scheduler(interaction): return
+    try: start_et=_parse_training_et(date,time)
+    except Exception as exc:
+        await interaction.response.send_message(f'Invalid date/time: **{exc}**. Use `YYYY-MM-DD` and `20:00` or `8:00PM`.',ephemeral=True); return
+    if start_et <= datetime.now(ZoneInfo(BATTALION_TIMEZONE))-timedelta(minutes=2):
+        await interaction.response.send_message('Operation step-off must be in the future.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    result=await web.request('POST','/internal/clerk/operations/schedule',json={
+        'title':title[:160],'starts_at':start_et.astimezone(timezone.utc).isoformat(),'duration_minutes':int(duration_minutes),
+        'channel_id':voice_channel.id,'channel_name':voice_channel.name,'area_of_operations':(area_of_operations or '')[:160],
+        'notes':(notes or '')[:2000],'requested_by':interaction.user.display_name,'operation_type':(kind.value if kind else 'OFFICIAL OPERATION'),
+        'credit_threshold_minutes':min(45,int(duration_minutes)),'reminder_minutes':'1440,120,30'})
+    if not result.get('ok',True):
+        await interaction.followup.send(f"Operation could not be scheduled: {result.get('error','unknown error')}",ephemeral=True); return
+    event=result.get('event') or {}
+    posted_channel_id=None
+    try:
+        posted_channel_id=await post_operation_scheduled_notice(interaction.guild,event)
+        if posted_channel_id:
+            await mark_operation_schedule_notice_sent(interaction.guild_id,event,posted_channel_id)
+    except Exception:
+        log.exception('[COMMAND OPERATION SCHEDULE NOTICE FAILED] operation=%s',result.get('operation_id'))
+    notice=(f'<#{posted_channel_id}>' if posted_channel_id else 'configured Operations notice channel when available')
+    await interaction.followup.send(
+        f"**OPERATION SCHEDULED — {result.get('operation_number') or 'FILED'}**\n"
+        f"**{title}** • <t:{int(start_et.timestamp())}:F>\n"
+        f"Operation Voice: {voice_channel.mention}\nNotice: {notice}\n"
+        "Attendance, reminders, HLL telemetry, M16 field-use tracking, and the website Operation record are armed.",ephemeral=True)
+
+
+@tasks.loop(minutes=1)
+async def nco_meeting_watch():
+    """Persistent NCO-only meeting reminders. Never posts to battalion-wide order channels."""
+    now=utc_now()
+    for guild in bot.guilds:
+        if GUILD_ID and guild.id!=GUILD_ID: continue
+        try:
+            data=await web.request('GET','/internal/clerk/events/status',params={'guild_id':guild.id})
+        except Exception as exc:
+            log.warning('[NCO MEETING WATCH] status failed guild=%s error=%s',guild.id,exc); continue
+        nco_role=discord.utils.get(guild.roles,name='NCO')
+        if not nco_role: continue
+        for event in data.get('events') or []:
+            if str(event.get('event_type') or '').upper()!='MEETING' or str(event.get('audience') or '').upper()!='NCO': continue
+            event_id=str(event.get('id') or '')
+            start=event_timestamp(event.get('starts_at')); end=event_timestamp(event.get('ends_at'))
+            if not event_id or not start: continue
+            cid=event.get('discord_channel_id')
+            try: channel=guild.get_channel(int(cid)) if cid else None
+            except Exception: channel=None
+            if not isinstance(channel,discord.TextChannel): continue
+            if end and now > end and not event.get('end_notice_sent_at'):
+                # Close the scheduler state quietly; no battalion-wide end notice is emitted.
+                try: await web.request('POST',f'/internal/clerk/events/{event_id}/notice',json={'phase':'END'})
+                except Exception: log.exception('[NCO MEETING CLOSE STATE FAILED] event=%s',event_id)
+                continue
+            seconds=(start-now).total_seconds(); phase=None; label=None
+            if 0 < seconds <= 61*60 and not event.get('reminder_60_sent_at'):
+                phase='REMINDER_60'; label='1 HOUR TO NCO MEETING'
+            if 0 < seconds <= 16*60 and not event.get('reminder_15_sent_at'):
+                phase='REMINDER_15'; label='15 MINUTES TO NCO MEETING'
+            if start <= now and (not end or now <= end) and not event.get('start_notice_sent_at'):
+                phase='START'; label='NCO MEETING STARTING NOW'
+            if not phase: continue
+            try:
+                body=(f"{nco_role.mention}\n**1/5 CAV — {label}**\n"
+                      f"**{str(event.get('title') or 'NCO MEETING').upper()}**\n"
+                      f"<t:{int(start.timestamp())}:F> • <t:{int(start.timestamp())}:R>" +
+                      (f"\nAgenda: {str(event.get('notes'))[:800]}" if event.get('notes') else ''))
+                await channel.send(body[:2000],allowed_mentions=discord.AllowedMentions(roles=[nco_role],users=False,everyone=False))
+                await web.request('POST',f'/internal/clerk/events/{event_id}/notice',json={'phase':phase})
+            except Exception as exc:
+                log.warning('[NCO MEETING NOTICE FAILED] guild=%s event=%s error=%s',guild.id,event_id,exc)
+
+
+@nco_meeting_watch.before_loop
+async def before_nco_meeting_watch():
+    await bot.wait_until_ready()
+
 
 @tasks.loop(minutes=1)
 async def training_scheduler_watch():
@@ -3999,7 +4202,7 @@ async def _build_battalion_brief(guild:discord.Guild,include_fund=True):
            '**PERSONNEL**',f"• New replacements: **{w.get('new_members',0)}**",f"• Promotions/orders: **{w.get('promotions',0)}**",'',
            '**RECOGNITION**',f"• Awards: **{w.get('awards',0)}**",f"• Ribbons earned: **{w.get('ribbons',0)}**",f"• Campaign medals: **{w.get('campaign_medals',0)}**",'',
            '**IN THE FIELD**',f"• Members with verified HLL activity: **{w.get('players',0)}**",f"• Combined verified server time: **{w.get('server_hours',0)} hours**",f"• Completed match records: **{w.get('operations',0)}**",'',
-           '**RECRUITING**',f"• Applications: **{w.get('applications',0)}**",f"• Accepted/converted: **{w.get('accepted',0)}**",f"• Recruits credited to members: **{w.get('recruits_credited',0)}**",'',
+           '**RECRUITING**',f"• Discord intakes: **{w.get('applications',0)}**",f"• Accepted/converted: **{w.get('accepted',0)}**",f"• Recruits credited to members: **{w.get('recruits_credited',0)}**",'',
            '**TRAINING / UPCOMING**',f"• Training events this week: **{w.get('training_events',0)}**"]
     upcoming=w.get('upcoming') or []
     if upcoming:
@@ -4394,6 +4597,8 @@ async def on_ready():
         new_arrival_role_watch.start()
     if not training_scheduler_watch.is_running():
         training_scheduler_watch.start()
+    if not nco_meeting_watch.is_running():
+        nco_meeting_watch.start()
     if not welcome_packet_watch.is_running():
         welcome_packet_watch.start()
     if not website_status_check_watch.is_running():
@@ -5298,22 +5503,6 @@ async def match_formation_setup(interaction:discord.Interaction,voice_channel:di
         interaction.guild_id,voice_channel.id,text_channel.id,side.value,active,done,interaction.user.id)
     await interaction.followup.send('Combat roster base configuration saved. Use `/combat-channel` for Infantry 1–3, Tank 1–3, and Helicopter 1–3.',ephemeral=True)
 
-@bot.tree.command(name='match-formation-status', description='Legacy alias for /combat-status.')
-async def match_formation_status(interaction:discord.Interaction):
-    await combat_status.callback(interaction)
-
-@bot.tree.command(name='match-formation-publish', description='Legacy alias for /combat-generate.')
-async def match_formation_publish(interaction:discord.Interaction):
-    await combat_generate.callback(interaction)
-
-@bot.tree.command(name='match-formation-disable', description='Legacy alias: turn combat-roster automation off.')
-async def match_formation_disable(interaction:discord.Interaction):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
-    await ensure_match_formation_schema()
-    await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=FALSE,updated_by=$2,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,interaction.user.id)
-    await interaction.response.send_message('**COMBAT ROSTER AUTOMATION: OFF**\nUse `/combat-toggle state:ON` to turn it back on. Existing channel bindings were preserved.',ephemeral=True)
-
 @bot.tree.command(name='activity-channel-add', description='Allow a voice channel to count toward Soldier activity.')
 @app_commands.describe(channel='Voice channel to count as activity')
 async def activity_channel_add(interaction: discord.Interaction, channel: discord.VoiceChannel):
@@ -5337,10 +5526,10 @@ async def activity_channel_status(interaction: discord.Interaction):
     await interaction.response.send_message('**QUALIFYING ACTIVITY VOICE CHANNELS**\n'+text+'\n\nActivity voice is attendance evidence only. Issued M16 field service and estimated expenditure come exclusively from verified HLL server telemetry.',ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# DISCORD-FIRST RECRUITING APPLICATION
+# DISCORD-FIRST RECRUITING INTAKE
 # Uses buttons + modals rather than message-content parsing, so Battalion Clerk
 # does not require the privileged Message Content intent. Each modal writes its
-# answers to the Website immediately, making the application resumable.
+# answers to the Website immediately, making the intake resumable.
 # ---------------------------------------------------------------------------
 
 RECRUIT_PLATFORM_ALIASES={
@@ -5369,11 +5558,11 @@ async def _recruit_save(user, step:int, answers:dict):
         'guild_id':gid,'discord_user_id':user.id,'current_step':step,'answers':answers
     })
     if not result or not result.get('ok',False):
-        raise RuntimeError((result or {}).get('error') or 'Website did not confirm the application section was saved')
+        raise RuntimeError((result or {}).get('error') or 'Website did not confirm the intake section was saved')
     return result
 
 
-class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1 of 3'):
+class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Discord Intake — Part 1 of 3'):
     age=discord.ui.TextInput(label='Age (optional)',required=False,max_length=2,placeholder='Leave blank if you prefer')
     timezone_name=discord.ui.TextInput(label='Time zone',max_length=60,placeholder='Example: Eastern / EDT')
     game_platform=discord.ui.TextInput(label='Platform',max_length=30,placeholder='STEAM, XBOX, or PS5')
@@ -5397,10 +5586,10 @@ class RecruitBasicsModal(discord.ui.Modal, title='1/5 CAV Application — Part 1
             })
             await interaction.response.send_message('**PART 1 FILED.** Continue with duty preferences.',view=RecruitPart2View(),ephemeral=_recruit_ephemeral(interaction))
         except Exception as exc:
-            await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
+            await interaction.response.send_message(f'Could not save your Discord intake: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — Part 2 of 3'):
+class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Discord Intake — Part 2 of 3'):
     role_interest=discord.ui.TextInput(label='Preferred duty / role',max_length=100,placeholder='Example: Rifleman / Infantry')
     looking_for=discord.ui.TextInput(label='Why do you want assignment to 1/5 CAV?',style=discord.TextStyle.paragraph,max_length=1000)
     play_style=discord.ui.TextInput(label='Preferred style of play',max_length=100,placeholder='Casual organized / Milsim / Competitive / Mixed')
@@ -5419,10 +5608,10 @@ class RecruitPreferencesModal(discord.ui.Modal, title='1/5 CAV Application — P
             })
             await interaction.response.send_message('**PART 2 FILED.** One final section remains.',view=RecruitPart3View(),ephemeral=_recruit_ephemeral(interaction))
         except Exception as exc:
-            await interaction.response.send_message(f'Could not save your application: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
+            await interaction.response.send_message(f'Could not save your Discord intake: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — Final Step'):
+class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Discord Intake — Final Step'):
     heard_about=discord.ui.TextInput(label='How did you hear about the 1/5 Cav?',max_length=120,placeholder='Discord / server / friend / Reddit / other')
     community_ack=discord.ui.TextInput(label='Respectful teamwork expected — agree?',max_length=8,placeholder='YES')
     applicant_notes=discord.ui.TextInput(label='Anything else HQ should know?',required=False,style=discord.TextStyle.paragraph,max_length=1000,placeholder='Optional')
@@ -5454,14 +5643,14 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
             result=await web.request('POST','/internal/clerk/recruiting/intake/submit',json={'guild_id':gid,'discord_user_id':interaction.user.id})
             case=result.get('case') or {}
             if result.get('existing_case'):
-                text=f"**APPLICATION ALREADY ON FILE — {case.get('case_number','RECRUITING CASE')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+                text=f"**RECRUITING CASE ALREADY ON FILE — {case.get('case_number','RECRUITING CASE')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
             elif result.get('updated_existing_case'):
                 text=(f"**DISCORD INTAKE FILED — {case.get('case_number','RECRUITING CASE')}**\n"
                       "Your Recruiting Case has been updated and returned to Battalion Headquarters for review.\n"
-                      "You do **not** need to submit another application on the website.")
+                      "You do **not** need to complete anything on the website.")
             else:
-                text=(f"**1/5 CAV — APPLICATION FILED**\nRecruiting Case **{case.get('case_number')}** has been forwarded to Battalion Headquarters.\n"
-                      f"Status: **AWAITING COMMAND REVIEW**\n\nYou do **not** need to submit another application on the website.")
+                text=(f"**1/5 CAV — DISCORD INTAKE FILED**\nRecruiting Case **{case.get('case_number')}** has been forwarded to Battalion Headquarters.\n"
+                      f"Status: **AWAITING COMMAND REVIEW**\n\nYou do **not** need to complete anything on the website.")
                 if result.get('status_url'): text+=f"\nCase status: {result['status_url']}"
             if self.recruiter_personnel_id:
                 text += f"\nRecruiter attribution: **FILED FOR {self.recruited_by}** — credit becomes verified when you reach Enlisted status."
@@ -5470,9 +5659,9 @@ class RecruitFinalDetailsModal(discord.ui.Modal, title='1/5 CAV Application — 
                 guild=bot.get_guild(gid); member=guild.get_member(interaction.user.id) if guild else None
                 if member: await ensure_recruit_status_role(member,approved=False)
             except Exception as exc:
-                log.warning('[DISCORD APPLICATION ROLE FAILED] user=%s error=%s',interaction.user.id,exc)
+                log.warning('[DISCORD INTAKE ROLE FAILED] user=%s error=%s',interaction.user.id,exc)
         except Exception as exc:
-            await interaction.followup.send(f'**APPLICATION NOT FILED**\n{str(exc)[:500]}\nYour completed sections were saved. Press **Begin / Resume Intake** again to retry.',ephemeral=_recruit_ephemeral(interaction))
+            await interaction.followup.send(f'**DISCORD INTAKE NOT FILED**\n{str(exc)[:500]}\nYour completed Discord intake sections were saved. Press **Begin / Resume Intake** again to retry.',ephemeral=_recruit_ephemeral(interaction))
 
 
 class RecruiterMemberSelect(discord.ui.UserSelect):
@@ -5549,10 +5738,10 @@ async def _begin_or_resume_recruit_application(interaction:discord.Interaction):
     except Exception as exc:
         await interaction.response.send_message(f'Recruiting intake is temporarily unavailable: {str(exc)[:300]}',ephemeral=_recruit_ephemeral(interaction)); return
     if data.get('existing_member'):
-        await interaction.response.send_message('Your Discord account is already linked to an active 1/5 Cavalry Soldier Record. No application is required.',ephemeral=_recruit_ephemeral(interaction)); return
+        await interaction.response.send_message('Your Discord account is already linked to an active 1/5 Cavalry Soldier Record. No recruiting intake is required.',ephemeral=_recruit_ephemeral(interaction)); return
     if data.get('existing_case'):
         case=data.get('case') or {}; url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL and case.get('public_token') else None
-        text=f"**APPLICATION ALREADY ON FILE — {case.get('case_number')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+        text=f"**RECRUITING CASE ALREADY ON FILE — {case.get('case_number')}**\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
         if url: text+=f"\n{url}"
         await interaction.response.send_message(text,ephemeral=_recruit_ephemeral(interaction)); return
     draft=data.get('draft') or {}; step=max(1,min(3,int(draft.get('current_step') or 1)))
@@ -5565,9 +5754,9 @@ async def _begin_or_resume_recruit_application(interaction:discord.Interaction):
         "If you have not linked your game account yet, run **`/link-game`** after this intake.",view=views[step](),ephemeral=_recruit_ephemeral(interaction))
 
 
-class RecruitExistingApplicationModal(discord.ui.Modal, title='Link Existing 1/5 CAV Application'):
-    case_number=discord.ui.TextInput(label='Application / Case Number',max_length=40,placeholder='Example: RC-...')
-    verification_code=discord.ui.TextInput(label='Verification Code',max_length=40,placeholder='Code shown on your website application receipt')
+class RecruitExistingApplicationModal(discord.ui.Modal, title='Link Existing 1/5 CAV Recruiting Case'):
+    case_number=discord.ui.TextInput(label='Recruiting Case Number',max_length=40,placeholder='Example: RC-...')
+    verification_code=discord.ui.TextInput(label='Verification Code',max_length=40,placeholder='Verification code from your legacy Recruiting Case receipt')
 
     async def on_submit(self, interaction:discord.Interaction):
         await interaction.response.defer(thinking=True,ephemeral=_recruit_ephemeral(interaction))
@@ -5579,22 +5768,22 @@ class RecruitExistingApplicationModal(discord.ui.Modal, title='Link Existing 1/5
             })
             case=result.get('case') or {}
             url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL and case.get('public_token') else None
-            text=f"**APPLICATION LOCATED — {case.get('case_number')}**\nYour Discord account is now attached to the existing Recruiting Case.\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
+            text=f"**RECRUITING CASE LOCATED — {case.get('case_number')}**\nYour Discord account is now attached to the existing Recruiting Case.\nStatus: **{str(case.get('status') or '').replace('_',' ')}**"
             if url: text+=f"\n{url}"
             await interaction.followup.send(text,ephemeral=_recruit_ephemeral(interaction))
             guild=bot.get_guild(gid); member=guild.get_member(interaction.user.id) if guild else None
             if member: await ensure_recruit_status_role(member,approved=False)
         except Exception as exc:
-            await interaction.followup.send(f"**APPLICATION COULD NOT BE LINKED**\n{str(exc)[:500]}\nCheck the case number and verification code from your website application receipt.",ephemeral=_recruit_ephemeral(interaction))
+            await interaction.followup.send(f"**RECRUITING CASE COULD NOT BE LINKED**\n{str(exc)[:500]}\nCheck the case number and verification code from your legacy Recruiting Case receipt.",ephemeral=_recruit_ephemeral(interaction))
 
 
 class RecruitApplicationStartView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='BEGIN APPLICATION',style=discord.ButtonStyle.success,custom_id='recruit_apply_start')
+    @discord.ui.button(label='BEGIN INTAKE',style=discord.ButtonStyle.success,custom_id='recruit_apply_start')
     async def start_application(self,interaction:discord.Interaction,button:discord.ui.Button):
         await _begin_or_resume_recruit_application(interaction)
 
-    @discord.ui.button(label='I ALREADY APPLIED',style=discord.ButtonStyle.secondary,custom_id='recruit_apply_existing')
+    @discord.ui.button(label='LINK EXISTING CASE',style=discord.ButtonStyle.secondary,custom_id='recruit_apply_existing')
     async def existing_application(self,interaction:discord.Interaction,button:discord.ui.Button):
         await interaction.response.send_modal(RecruitExistingApplicationModal())
 
@@ -5669,12 +5858,12 @@ async def test_recruit_intake(interaction:discord.Interaction, member:discord.Me
             f'**TEST DM FAILED**\n`{type(exc).__name__}: {str(exc)[:400]}`',ephemeral=True)
 
 
-@bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry enlistment application in Discord.')
+@bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry recruiting intake in Discord.')
 async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
 
 
-@bot.tree.command(name='application-system-check',description='Run a read-only health check of the Discord recruiting application pipeline.')
+@bot.tree.command(name='application-system-check',description='Run a read-only health check of the Discord recruiting intake pipeline.')
 async def application_system_check(interaction:discord.Interaction):
     if not await require_manage_guild(interaction):
         return
@@ -5715,7 +5904,7 @@ async def application_system_check(interaction:discord.Interaction):
         RecruitApplicationStartView, RecruitIntakePromptView,
         RecruitPart1View, RecruitPart2View, RecruitPart3View
     ))
-    checks.append(('PERSISTENT APPLICATION UI',persistent_ok,
+    checks.append(('PERSISTENT INTAKE UI',persistent_ok,
                    'REGISTERED IN BOT BUILD' if persistent_ok else 'MISSING VIEW CLASS'))
 
     failed=[c for c in checks if not c[1]]
@@ -5723,9 +5912,9 @@ async def application_system_check(interaction:discord.Interaction):
     if failed:
         footer=f"\n\n**RESULT: ATTENTION REQUIRED** — {len(failed)} check(s) failed. Review Railway variables/logs before asking recruits to apply."
     else:
-        footer="\n\n**RESULT: PASS** — the Discord application transport and Website endpoints are available."
+        footer="\n\n**RESULT: PASS** — the Discord intake transport and Website endpoints are available."
     await interaction.followup.send(
-        '**1/5 CAV — DISCORD APPLICATION SYSTEM CHECK**\n' + '\n'.join(lines) + footer,
+        '**1/5 CAV — DISCORD INTAKE SYSTEM CHECK**\n' + '\n'.join(lines) + footer,
         ephemeral=True
     )
 
@@ -5765,7 +5954,7 @@ async def _retroactive_accession_member(member: discord.Member, *, send_message:
         return {'status':'APPROVED REPLACEMENT','messaged':False}
 
     if not send_message:
-        return {'status':status or 'NO APPLICATION','messaged':False}
+        return {'status':status or 'NO INTAKE','messaged':False}
 
     if case:
         if status=='MORE_INFO_REQUIRED':
@@ -5774,22 +5963,22 @@ async def _retroactive_accession_member(member: discord.Member, *, send_message:
                  f"Recruiting Case **{case.get('case_number')}** needs additional information.\n"
                  f"Respond here: {status_url}")
         else:
-            msg=(f"**1/5 CAV — APPLICATION LOCATED**\n"
+            msg=(f"**1/5 CAV — RECRUITING CASE LOCATED**\n"
                  f"Recruiting Case **{case.get('case_number')}** is already on file and linked to your Discord account.\n"
                  f"Status: **{(status or 'COMMAND REVIEW').replace('_',' ')}**\n\n"
-                 "Do **not** submit another application. Battalion Clerk will notify you when Headquarters acts on your case.")
+                 "Do **not** start another intake. Battalion Clerk will notify you when Headquarters acts on your case.")
     else:
         app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else 'the battalion website — Enlist page'
         msg=("**1/5 CAV — REPORT TO RECRUITING**\n\n"
              "You are in the battalion Discord, but no linked Soldier Record or Recruiting Case was found for you.\n\n"
-             f"Complete your enlistment application here: {app_url}\n\n"
+             f"Start your enlistment in Discord with **/apply**. Recruiting information: {app_url}\n\n"
              "Once accepted, Battalion Clerk will assign the temporary Replacement access state until Command files your formation, then switch you to Member and issue your website access automatically.\n\n"
-             "If you already applied, do **not** apply again. Use **/apply** and choose **I ALREADY APPLIED** to attach your existing case.")
+             "If you have a legacy Recruiting Case, use **/apply** and choose **LINK EXISTING CASE** to attach it.")
     try:
         await member.send(msg)
-        return {'status':status or 'NO APPLICATION','messaged':True}
+        return {'status':status or 'NO INTAKE','messaged':True}
     except discord.Forbidden:
-        return {'status':status or 'NO APPLICATION','messaged':False,'dm_blocked':True}
+        return {'status':status or 'NO INTAKE','messaged':False,'dm_blocked':True}
 
 
 @bot.tree.command(name='accessions-backfill', description='Command: sweep existing Discord arrivals into the 1/5 Cav accession pipeline.')
@@ -5813,7 +6002,7 @@ async def accessions_backfill(interaction: discord.Interaction, send_messages: b
             if state=='LINKED SOLDIER': counts['linked']+=1
             elif state=='APPROVED REPLACEMENT': counts['approved']+=1
             elif state in {'DENIED','CLOSED','ENLISTED'}: counts['closed']+=1
-            elif state=='NO APPLICATION': counts['prospective']+=1
+            elif state=='NO INTAKE': counts['prospective']+=1
             else: counts['case']+=1
             if result.get('messaged'): counts['messaged']+=1
             if result.get('dm_blocked'): counts['blocked']+=1
@@ -5834,7 +6023,7 @@ async def accessions_backfill(interaction: discord.Interaction, send_messages: b
              f"Errors: **{counts['errors']}**")
     if errors:
         summary += "\n\nFirst errors:\n" + "\n".join(f"• {e}" for e in errors)
-    summary += "\n\nNo personnel records or duplicate applications were created by this sweep."
+    summary += "\n\nNo personnel records or duplicate Recruiting Cases were created by this sweep."
     await interaction.followup.send(summary[:1900],ephemeral=True)
 
 @bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
@@ -5849,9 +6038,9 @@ async def application_status(interaction: discord.Interaction):
             draft={}
         if draft.get('exists') and draft.get('draft'):
             step=max(1,min(3,int((draft.get('draft') or {}).get('current_step') or 1)))
-            await interaction.response.send_message(f"**APPLICATION DRAFT IN PROGRESS**\nResume at Part **{step} of 3** with **/apply**.",ephemeral=True); return
+            await interaction.response.send_message(f"**DISCORD INTAKE IN PROGRESS**\nResume at Part **{step} of 3** with **/apply**.",ephemeral=True); return
         app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website"
-        await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Use **/apply** here in Discord or apply at {app_url}",ephemeral=True); return
+        await interaction.response.send_message(f"No Recruiting Case is linked to your Discord account. Use **/apply** here in Discord. Recruiting information: {app_url}",ephemeral=True); return
     case=data.get('case') or {}
     status=str(case.get('status') or '').upper()
     if status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'}:
@@ -5925,7 +6114,7 @@ def build_recruit_credentials_message(case: dict, provision: dict, *, site: str 
     field_code=provision.get('field_code')
     site=site or WEBSITE_BASE_URL or 'the battalion website'
     return (
-        "**BATTALION HEADQUARTERS — APPLICATION ACCEPTED**\n"
+        "**BATTALION HEADQUARTERS — RECRUITING CASE ACCEPTED**\n"
         f"Recruiting Case **{case.get('case_number')}** has been accepted. You are now on the **Ready to Assign** roster with the Replacement Detachment.\n\n"
         "**WEBSITE ACCESS**\n"
         f"Website: <{site}>\n"
@@ -6134,7 +6323,7 @@ async def recruit_status_watch():
                              f"Recruiting Case **{case.get('case_number')}** was not approved at this time.")
                 else:
                     await ensure_recruit_status_role(member,approved=False)
-                    message=(f"**APPLICATION RECEIVED — 1/5 CAV**\n"
+                    message=(f"**DISCORD INTAKE RECEIVED — 1/5 CAV**\n"
                              f"Recruiting Case **{case.get('case_number')}** is linked to this Discord account and is awaiting Battalion Headquarters review.\n\n"
                              "No verification code is required. Battalion Clerk will notify you here when your case changes.")
                 try:
@@ -6347,7 +6536,7 @@ def _unique_exact_recruit_match(guild: discord.Guild, case: dict):
         keys.discard('')
         if any(w in keys for w in wanted): matches.append(m)
     # Automatic identity linkage is deliberately exact + unique only. Similar-name
-    # guesses stay unlinked so Clerk can never attach an application to the wrong person.
+    # guesses stay unlinked so Clerk can never attach an Recruiting Case to the wrong person.
     uniq={m.id:m for m in matches}
     if len(uniq)==1:
         member=next(iter(uniq.values()))
@@ -6481,14 +6670,14 @@ async def on_member_join(member: discord.Member):
                         msg=None
                     elif status=='MORE_INFO_REQUIRED':
                         status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL else "your Recruiting Case status page"
-                        msg=f"**1/5 CAV — BATTALION HEADQUARTERS**\nYour verified application requires more information. Respond at: {status_url}"
+                        msg=f"**1/5 CAV — BATTALION HEADQUARTERS**\nYour Recruiting Case requires more information. Respond at: {status_url}"
                     elif status in {'DENIED','CLOSED'}:
                         msg=f"**1/5 CAV — RECRUITING CASE CLOSED**\nRecruiting Case **{case.get('case_number')}** is closed. No battalion recruiting role has been assigned."
                     elif status=='ENLISTED':
                         msg=f"**1/5 CAV — PERSONNEL FILE LOCATED**\nRecruiting Case **{case.get('case_number')}** has already been converted to battalion personnel."
                     else:
-                        msg=(f"**1/5 CAV — APPLICATION LOCATED**\nRecruiting Case **{case.get('case_number')}** is linked to this Discord account. "
-                             "You now hold **Applicant — Awaiting Review** while Battalion Headquarters reviews your application. No verification code is required. You do not need to keep checking the website; Battalion Clerk will DM you when Command acts on your case.")
+                        msg=(f"**1/5 CAV — RECRUITING CASE LOCATED**\nRecruiting Case **{case.get('case_number')}** is linked to this Discord account. "
+                             "You now hold **Applicant — Awaiting Review** while Battalion Headquarters reviews your Recruiting Case. No verification code is required. You do not need to keep checking the website; Battalion Clerk will DM you when Command acts on your case.")
                 else:
                     msg=("**WELCOME TO THE 1/5 CAV — REPLACEMENT LINE**\n\n"
                          "You’ve hit the Replacement line. Keep it simple, trooper:\n\n"
@@ -6504,14 +6693,14 @@ async def on_member_join(member: discord.Member):
                     await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/status-notified",json={'status':status,'guild_id':member.guild.id})
             except discord.Forbidden:
                 log.warning('[RECRUIT DM BLOCKED] member=%s',member.id)
-                # Safe public fallback: never ask application questions in-channel; only
-                # tell the recruit how to open the private Discord application themselves.
+                # Safe public fallback: never ask intake questions in-channel; only
+                # tell the recruit how to open the private Discord intake themselves.
                 try:
                     welcome=await get_welcome_channel(member.guild)
                     if welcome:
                         app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else "the battalion website — Enlist page"
                         await welcome.send(
-                            f"{member.mention} Battalion Clerk could not open a private DM. Report to Recruiting here: {app_url}. If you already applied, use **/apply** and choose **I ALREADY APPLIED** to attach your existing case.",
+                            f"{member.mention} Battalion Clerk could not open a private DM. Report to Recruiting here: {app_url}. If you have a legacy Recruiting Case, use **/apply** and choose **LINK EXISTING CASE** to attach it.",
                             allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False),
                         )
                 except Exception as fallback_exc:
@@ -7528,6 +7717,40 @@ async def _linked_personnel_for_discord(guild_id:int,user_id:int):
              WHERE w.guild_id::text=$1 AND w.discord_user_id::text=$2
              LIMIT 1
         """, str(guild_id), str(user_id))
+
+
+@bot.tree.command(name='claim-recruit', description='File a recruit-credit claim for Command verification.')
+@app_commands.describe(member='Discord member you personally recruited into the 1/5 Cav', note='Optional note for Command verification')
+async def claim_recruit(interaction:discord.Interaction, member:discord.Member, note:str=''):
+    """Member self-service recruiter attribution; Command remains final authority."""
+    if not interaction.guild:
+        await interaction.response.send_message('Use this command inside the 1/5 Cavalry Discord server.',ephemeral=True); return
+    if member.id==interaction.user.id:
+        await interaction.response.send_message('You cannot claim recruiting credit for yourself.',ephemeral=True); return
+    if member.bot:
+        await interaction.response.send_message('Recruiting credit can only be filed for a real Discord member.',ephemeral=True); return
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    try:
+        result=await web.request('POST','/internal/clerk/recruiting/credit-claim',json={
+            'guild_id':interaction.guild.id,
+            'claimant_discord_user_id':interaction.user.id,
+            'recruited_discord_user_id':member.id,
+            'recruited_display_name':member.display_name,
+            'note':' '.join((note or '').split())[:500],
+        })
+    except Exception as exc:
+        await interaction.followup.send(f'Could not file recruit credit: {str(exc)[:400]}',ephemeral=True); return
+    if result.get('already_verified'):
+        await interaction.followup.send(f'**RECRUIT CREDIT ALREADY VERIFIED**\n{member.mention} is already credited to you on {result.get("case_number") or "their Recruiting Case"}.',ephemeral=True); return
+    if result.get('existing'):
+        await interaction.followup.send(f'**RECRUIT CREDIT ALREADY PENDING**\nYour claim for {member.mention} is already waiting on Command verification. Claim ID: `{result.get("claim_id")}`',ephemeral=True); return
+    await interaction.followup.send(
+        f'**RECRUIT CREDIT FILED**\nYour claim for {member.mention} was sent to the **Command Desk** for verification.\n'
+        f'Claim ID: `{result.get("claim_id")}`\n\n'
+        'Once Command approves it, the recruiter attribution is tied to the Recruiting Case. '
+        'Credit becomes official when that recruit reaches **Enlisted** status, and then counts toward recruiting statistics, ribbon progress, and other verified recruiting requirements.',
+        ephemeral=True)
+
 
 @bot.tree.command(name='commend', description='Recognize another 1/5 Cavalry Soldier for a positive contribution.')
 @app_commands.describe(member='Soldier receiving the commendation', category='Type of commendation', message='Short reason for the commendation')

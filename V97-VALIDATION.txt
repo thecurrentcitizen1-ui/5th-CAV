@@ -1,0 +1,32 @@
+V97 NCO MEETINGS / TRAINING CANCEL / OPERATION SCHEDULER — VALIDATION
+Date: 2026-09-13
+Baseline: Battalion Clerk V96
+Website companion: V300
+
+PASS — bot.py, database.py, config.py, collector.py, and hllv_rcon.py compile.
+PASS — Slash command names are unique.
+PASS — New commands present: /schedule-nco-meeting, /cancel-training, /schedule-operation.
+PASS — Discord top-level command budget: 97 / 100 (3 command slots remain).
+PASS — NCO meeting initial/reminder notices mention only the exact Discord role named NCO.
+PASS — AllowedMentions disables @everyone and direct-user pings for NCO meeting notifications.
+PASS — NCO meetings are tagged audience=NCO in the authoritative shared event scheduler.
+PASS — Battalion-wide duty-announcement worker explicitly skips NCO-only meetings.
+PASS — NCO reminders persist 60-minute, 15-minute, start, and quiet end-state markers across restarts.
+PASS — /cancel-training checks original host or elevated S-3/senior leadership/Command authority.
+PASS — /cancel-training uses the Website-authoritative cancellation endpoint and removes RSVP buttons.
+PASS — Cancelled/closed training events are excluded from /training-events.
+PASS — /schedule-operation calls the Website-authoritative operation scheduler, not a duplicate bot-only ledger.
+PASS — Operation kinds supported: Operation, Campaign, Special Event.
+PASS — Operation schedule notices use existing idempotency tracking.
+PASS — Event timestamp parsing accepts ISO and Flask/RFC timestamps.
+PASS — NCO meeting watcher is started automatically on bot ready.
+PASS — Targeted command/scheduler assertions: 12 / 12.
+
+COMMAND-BUDGET HOUSEKEEPING
+Removed legacy aliases only:
+- /match-formation-status -> current /combat-status remains
+- /match-formation-publish -> current /combat-generate remains
+- /match-formation-disable -> current /combat-toggle remains
+
+NOTE
+Static/source/package QA cannot execute live Discord interactions, PostgreSQL writes, or HLL RCON activity in this container. Production was not changed.

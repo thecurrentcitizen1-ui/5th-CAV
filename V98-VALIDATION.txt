@@ -1,0 +1,11 @@
+V98 VALIDATION — 2026-09-13
+Python compile: PASS (bot.py collector.py config.py database.py hllv_rcon.py)
+/claim-recruit: PRESENT
+/schedule-nco-meeting: PRESENT
+/cancel-training: PRESENT
+/schedule-operation: PRESENT
+Direct @bot.tree.command registrations: 95 (<100)
+Recruit-credit source check: member claim posts to Website authority endpoint; no direct recruit-credit database write in /claim-recruit.
+Self-credit guard: PASS
+Command-verification response: PASS
+Legacy website-application recruiting prompts: removed from active Discord recruiting responses; Discord Intake / Recruiting Case language used instead.

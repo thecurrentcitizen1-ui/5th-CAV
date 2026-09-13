@@ -90,3 +90,16 @@ Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with 
 - No self-commendations; same giver/recipient/category is limited to once per 24 hours; maximum five commendations per giver per day.
 - Commendations are recognition only and do not directly grant promotion points or ribbons.
 - V37 reliability fix: `/commend` no longer runs schema/backfill DDL inside the Discord interaction; database work is timeout-bounded and always resolves the deferred response instead of hanging on Thinking.
+
+## 2026-09-13 — V97 Scheduling Commands
+- `/schedule-nco-meeting` — schedules a persistent NCO meeting notice. Only the Discord role named `NCO` is mentioned; no `@everyone` or battalion-wide role mention is used. Battalion Clerk sends 60-minute, 15-minute, and start notices to the selected text channel.
+- `/cancel-training` — cancels a scheduled training by Event ID, stops future training automation, removes any event-specific training credit, and closes the RSVP buttons. The original host may cancel; S-3/senior leadership/Command may override.
+- `/schedule-operation` — creates the authoritative Website Operation record and shared Clerk duty event from Discord. Supports Operation, Campaign, and Special Event types, arms reminders, attendance, HLL telemetry, and M16 field-use tracking.
+- Three obsolete match-formation aliases were retired to preserve Discord slash-command headroom. Use `/combat-status`, `/combat-generate`, and `/combat-toggle` instead.
+
+## 2026-09-13 — V98 Member Recruit Credit
+- `/claim-recruit member:<member> note:<optional>` lets an active linked Soldier file recruiter attribution for Command review.
+- Members cannot approve their own credit. The claim is sent to the Website Command Desk.
+- Website V301 remains authoritative for approval, Recruiting Case attribution, ENLISTED verification, ribbon progress, and recruiter statistics.
+- If Command approves before the recruited member runs `/apply`, the approved claim waits and auto-attaches when the Recruiting Case appears.
+- Public recruiting remains Discord-first: join Discord → `/apply` → `/link-game` → assignment.
