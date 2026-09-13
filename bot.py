@@ -1362,24 +1362,16 @@ async def resolve_operation_notice_channel(guild:discord.Guild):
 async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
     channel=await resolve_operation_notice_channel(guild)
     if not isinstance(channel,discord.TextChannel): return False
-    start=event_timestamp(event.get('starts_at'))
-    end=event_timestamp(event.get('ends_at'))
-    title=event.get('title') or 'UNNAMED OPERATION'
-    duty_id=event.get('channel_id')
-    duty=f'<#{duty_id}>' if duty_id else 'AS DIRECTED'
-    credit_minutes=int(event.get('credit_threshold_minutes') or 45)
-    when=f"<t:{int(start.timestamp())}:F> • <t:{int(start.timestamp())}:R>" if start else "TIME TO BE ANNOUNCED"
-    ends=f"<t:{int(end.timestamp())}:t>" if end else "AS DIRECTED"
-    body=(f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
-          f"**OPERATION SCHEDULED**\n\n"
-          f"**{title.upper()}**\n"
-          f"Step-Off: {when}\n"
-          f"Estimated End: {ends}\n"
-          f"Operation Voice: {duty}\n"
-          f"Official Credit Requirement: **{credit_minutes} qualifying minutes**\n"
-          f"M16 Service: **tracked from verified HLL server activity while the rifle is issued**\n\n"
-          "Battalion Clerk has armed attendance, reminders, HLL telemetry, and issued-weapon tracking for this Operation.")
-    await channel.send(body[:2000])
+    event_id=str(event.get('id') or event.get('event_id') or '')
+    roster=await _scheduled_event_rsvps('OPERATION',event_id) if event_id else []
+    msg=await channel.send(
+        content='**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**',
+        embed=_scheduled_event_rsvp_embed('OPERATION',event,roster),
+        view=ScheduledEventRSVPView()
+    )
+    if event_id:
+        await _save_scheduled_event_message(guild_id=guild.id,message_id=msg.id,channel_id=channel.id,
+                                            event_kind='OPERATION',event_id=event_id,event=event,audience='BATTALION')
     return channel.id
 
 WELCOME_MESSAGE = """**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**
@@ -2287,6 +2279,183 @@ def _parse_training_et(date_text: str, time_text: str) -> datetime:
         raise ValueError('time must be HH:MM or 8:00PM')
     return datetime.combine(d,parsed,tzinfo=ZoneInfo(BATTALION_TIMEZONE))
 
+
+# ---------------------------------------------------------------------------
+# V99 — NCO MEETING + OPERATION RSVP ROSTERS
+# ---------------------------------------------------------------------------
+SCHEDULED_EVENT_RSVP_RESPONSES = {'ATTENDING','MAYBE','NO'}
+
+async def _ensure_scheduled_event_rsvp_tables():
+    db=getattr(collector,'db',None)
+    if not db or not getattr(db,'pool',None):
+        await collector.start(); db=collector.db
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_scheduled_event_messages(
+        guild_id TEXT NOT NULL,
+        message_id TEXT PRIMARY KEY,
+        channel_id TEXT,
+        event_kind TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        audience TEXT,
+        event_snapshot_json TEXT NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""")
+    await db.execute("""CREATE INDEX IF NOT EXISTS idx_clerk_scheduled_event_messages_event
+        ON clerk_scheduled_event_messages(event_kind,event_id)""")
+    await db.execute("""CREATE TABLE IF NOT EXISTS clerk_scheduled_event_rsvps(
+        event_kind TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        display_name TEXT,
+        response TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(event_kind,event_id,discord_user_id)
+    )""")
+    return db
+
+async def _save_scheduled_event_message(*,guild_id:int,message_id:int,channel_id:int,event_kind:str,event_id:str,event:dict,audience:str):
+    db=await _ensure_scheduled_event_rsvp_tables()
+    snapshot=json.dumps(event or {},default=str,separators=(',',':'))
+    await db.execute("""INSERT INTO clerk_scheduled_event_messages(
+        guild_id,message_id,channel_id,event_kind,event_id,audience,event_snapshot_json,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+        ON CONFLICT(message_id) DO UPDATE SET guild_id=EXCLUDED.guild_id,channel_id=EXCLUDED.channel_id,
+        event_kind=EXCLUDED.event_kind,event_id=EXCLUDED.event_id,audience=EXCLUDED.audience,
+        event_snapshot_json=EXCLUDED.event_snapshot_json,updated_at=NOW()""",
+        str(guild_id),str(message_id),str(channel_id),str(event_kind).upper(),str(event_id),str(audience).upper(),snapshot)
+
+async def _scheduled_event_message_link(guild_id:int,message_id:int):
+    db=await _ensure_scheduled_event_rsvp_tables()
+    row=await db.fetchrow("SELECT * FROM clerk_scheduled_event_messages WHERE guild_id=$1 AND message_id=$2",str(guild_id),str(message_id))
+    if not row: return None
+    item=dict(row)
+    try: item['event']=json.loads(item.get('event_snapshot_json') or '{}')
+    except Exception: item['event']={}
+    return item
+
+async def _scheduled_event_rsvps(event_kind:str,event_id:str):
+    db=await _ensure_scheduled_event_rsvp_tables()
+    rows=await db.fetch("""SELECT discord_user_id,display_name,response,updated_at
+        FROM clerk_scheduled_event_rsvps WHERE event_kind=$1 AND event_id=$2
+        ORDER BY CASE response WHEN 'ATTENDING' THEN 1 WHEN 'MAYBE' THEN 2 ELSE 3 END, LOWER(COALESCE(display_name,''))""",
+        str(event_kind).upper(),str(event_id))
+    return [dict(r) for r in rows]
+
+async def _file_scheduled_event_rsvp(*,event_kind:str,event_id:str,guild_id:int,member:discord.Member,response:str):
+    response=str(response or '').upper()
+    if response not in SCHEDULED_EVENT_RSVP_RESPONSES:
+        raise ValueError('invalid RSVP response')
+    db=await _ensure_scheduled_event_rsvp_tables()
+    await db.execute("""INSERT INTO clerk_scheduled_event_rsvps(
+        event_kind,event_id,guild_id,discord_user_id,display_name,response,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,NOW())
+        ON CONFLICT(event_kind,event_id,discord_user_id) DO UPDATE SET
+        display_name=EXCLUDED.display_name,response=EXCLUDED.response,updated_at=NOW()""",
+        str(event_kind).upper(),str(event_id),str(guild_id),str(member.id),member.display_name[:120],response)
+    return await _scheduled_event_rsvps(event_kind,event_id)
+
+def _scheduled_event_dt(value):
+    if isinstance(value,datetime): return value
+    text=str(value or '').strip()
+    if not text: return None
+    try: return datetime.fromisoformat(text.replace('Z','+00:00'))
+    except Exception:
+        try: return parsedate_to_datetime(text)
+        except Exception: return None
+
+def _scheduled_event_rsvp_embed(event_kind:str,event:dict,rsvps:list,*,state_note:Optional[str]=None) -> discord.Embed:
+    kind=str(event_kind or '').upper()
+    title=str(event.get('title') or ('NCO MEETING' if kind=='NCO_MEETING' else 'OPERATION')).strip()
+    start=_scheduled_event_dt(event.get('starts_at'))
+    end=_scheduled_event_dt(event.get('ends_at'))
+    start_ts=int(start.timestamp()) if start else 0
+    end_ts=int(end.timestamp()) if end else 0
+    if kind=='NCO_MEETING':
+        embed_title=f'1/5 CAV — NCO MEETING | {title}'
+        lines=[]
+        if start_ts: lines.append(f'**<t:{start_ts}:F>**  •  <t:{start_ts}:R>')
+        if end_ts: lines.append(f'Ends <t:{end_ts}:t>')
+        host=(f"<@{event.get('host_discord_user_id')}>" if event.get('host_discord_user_id') else str(event.get('host_display_name') or 'NCO Leadership'))
+        lines.append(f'**Host:** {host}  •  **Audience:** NCO CORPS ONLY')
+        if event.get('notes'): lines.append(f"**Agenda:** {str(event.get('notes'))[:700]}")
+        if state_note: lines.append(state_note)
+        footer='NCO Corps: choose ATTENDING, MAYBE, or NO. You can change your response before the meeting.'
+    else:
+        op_number=str(event.get('operation_number') or '').strip()
+        prefix=f'{op_number} — ' if op_number else ''
+        embed_title=f'1/5 CAV — OPERATION RSVP | {prefix}{title}'
+        lines=[]
+        if start_ts: lines.append(f'**Step-Off:** <t:{start_ts}:F>  •  <t:{start_ts}:R>')
+        if end_ts: lines.append(f'**Estimated End:** <t:{end_ts}:t>')
+        duty_id=event.get('channel_id')
+        duty=f'<#{duty_id}>' if duty_id else str(event.get('channel_name') or 'AS DIRECTED')
+        lines.append(f"**Type:** {str(event.get('operation_type') or event.get('event_type') or 'OFFICIAL OPERATION').replace('_',' ').title()}  •  **Audience:** BATTALION")
+        lines.append(f'**Operation Voice:** {duty}')
+        if event.get('area_of_operations'): lines.append(f"**AO:** {str(event.get('area_of_operations'))[:250]}")
+        if event.get('notes'): lines.append(f"**Orders:** {str(event.get('notes'))[:700]}")
+        credit=int(event.get('credit_threshold_minutes') or 45)
+        lines.append(f'**Official Credit Requirement:** {credit} qualifying minutes')
+        if state_note: lines.append(state_note)
+        footer='Members: choose ATTENDING, MAYBE, or NO. You can change your response before step-off.'
+    embed=discord.Embed(title=embed_title[:256],description='\n'.join(lines)[:4096])
+    groups={'ATTENDING':[],'MAYBE':[],'NO':[]}
+    for row in rsvps or []:
+        response=str(row.get('response') or '').upper()
+        if response not in groups: continue
+        uid=str(row.get('discord_user_id') or '').strip()
+        name=str(row.get('display_name') or '').strip()
+        groups[response].append(f'<@{uid}>' if uid.isdigit() else (name or 'Unknown'))
+    labels=[('ATTENDING','✅ ATTENDING'),('MAYBE','❔ MAYBE'),('NO','❌ NO')]
+    for key,label in labels:
+        vals=groups[key]
+        text='\n'.join(vals[:12]) if vals else '—'
+        if len(vals)>12: text+=f'\n+{len(vals)-12} more'
+        embed.add_field(name=f'{label}  ·  {len(vals)}',value=text[:1024],inline=True)
+    embed.set_footer(text=footer)
+    return embed
+
+class ScheduledEventRSVPView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def _rsvp(self,interaction:discord.Interaction,response:str):
+        if not interaction.guild or not isinstance(interaction.user,discord.Member) or not interaction.message:
+            await interaction.response.send_message('RSVP is unavailable here.',ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
+        try: link=await _scheduled_event_message_link(interaction.guild_id,interaction.message.id)
+        except Exception:
+            log.exception('[SCHEDULED EVENT RSVP LOOKUP FAILED] message=%s',interaction.message.id)
+            await interaction.followup.send('This RSVP roster could not be loaded right now.',ephemeral=True); return
+        if not link:
+            await interaction.followup.send('This RSVP post is no longer linked to an active Battalion Clerk event.',ephemeral=True); return
+        kind=str(link.get('event_kind') or '').upper()
+        event=link.get('event') or {}
+        start=_scheduled_event_dt(event.get('starts_at'))
+        if start:
+            if start.tzinfo is None: start=start.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= start.astimezone(timezone.utc):
+                await interaction.followup.send('RSVP is closed because this event has already started.',ephemeral=True); return
+        if kind=='NCO_MEETING':
+            roles=set(member_role_names(interaction.user))
+            eligible=('NCO' in roles or interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or _member_has_any_role(interaction.user,NCO_MEETING_HOST_ROLE_NAMES))
+            if not eligible:
+                await interaction.followup.send('This RSVP roster is restricted to the **NCO Corps**.',ephemeral=True); return
+        try:
+            roster=await _file_scheduled_event_rsvp(event_kind=kind,event_id=str(link.get('event_id')),guild_id=interaction.guild_id,member=interaction.user,response=response)
+            await interaction.message.edit(embed=_scheduled_event_rsvp_embed(kind,event,roster),view=self)
+        except Exception:
+            log.exception('[SCHEDULED EVENT RSVP FAILED] kind=%s event=%s',kind,link.get('event_id'))
+            await interaction.followup.send('Your RSVP could not be filed right now.',ephemeral=True); return
+        label={'ATTENDING':'ATTENDING','MAYBE':'MAYBE','NO':'NO'}[response]
+        await interaction.followup.send(f'RSVP filed: **{label}**.',ephemeral=True)
+
+    @discord.ui.button(label='ATTENDING',style=discord.ButtonStyle.success,custom_id='scheduled_event_rsvp_attending')
+    async def attending(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'ATTENDING')
+    @discord.ui.button(label='MAYBE',style=discord.ButtonStyle.secondary,custom_id='scheduled_event_rsvp_maybe')
+    async def maybe(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'MAYBE')
+    @discord.ui.button(label='NO',style=discord.ButtonStyle.danger,custom_id='scheduled_event_rsvp_no')
+    async def no(self,interaction:discord.Interaction,button:discord.ui.Button): await self._rsvp(interaction,'NO')
+
 def _training_event_embed(event: dict, rsvps: list, *, guild: Optional[discord.Guild]=None, state_note: Optional[str]=None) -> discord.Embed:
     """Compact training order that remains readable on desktop and Discord mobile."""
     title=str(event.get('title') or 'TRAINING')
@@ -2527,15 +2696,21 @@ async def schedule_nco_meeting(interaction:discord.Interaction,title:str,date:st
         'credit_threshold_minutes':int(duration_minutes)})
     if not result.get('ok',True) or not result.get('event_id'):
         await interaction.followup.send(f"NCO meeting could not be scheduled: {result.get('error','unknown error')}",ephemeral=True); return
-    event=result.get('event') or {}; start=event_timestamp(event.get('starts_at')) or start_et.astimezone(timezone.utc)
-    body=(f"{nco_role.mention}\n**1/5 CAV — NCO MEETING SCHEDULED**\n\n"
-          f"**{title.upper()}**\n"
-          f"When: <t:{int(start.timestamp())}:F> • <t:{int(start.timestamp())}:R>\n"
-          f"Duration: **{int(duration_minutes)} minutes**\n"
-          f"Host: **{interaction.user.display_name}**" + (f"\nAgenda: {notes[:900]}" if notes else '') +
-          "\n\n**NCO CORPS ONLY — Battalion Clerk will remind the NCO role before step-off.**")
-    await post_channel.send(body[:2000],allowed_mentions=discord.AllowedMentions(roles=[nco_role],users=False,everyone=False))
-    await interaction.followup.send(f'**NCO MEETING SCHEDULED** — {post_channel.mention}\nEvent ID: `{result["event_id"]}`',ephemeral=True)
+    event=result.get('event') or {}
+    event.setdefault('title',title[:120]); event.setdefault('starts_at',start_et.astimezone(timezone.utc).isoformat())
+    event.setdefault('ends_at',end_et.astimezone(timezone.utc).isoformat()); event.setdefault('notes',(notes or '')[:1000])
+    event.setdefault('host_discord_user_id',interaction.user.id); event['host_display_name']=interaction.user.display_name
+    event_id=str(result.get('event_id') or event.get('id') or '')
+    roster=await _scheduled_event_rsvps('NCO_MEETING',event_id)
+    msg=await post_channel.send(
+        content=nco_role.mention,
+        embed=_scheduled_event_rsvp_embed('NCO_MEETING',event,roster),
+        view=ScheduledEventRSVPView(),
+        allowed_mentions=discord.AllowedMentions(roles=[nco_role],users=False,everyone=False)
+    )
+    await _save_scheduled_event_message(guild_id=interaction.guild_id,message_id=msg.id,channel_id=post_channel.id,
+                                        event_kind='NCO_MEETING',event_id=event_id,event=event,audience='NCO')
+    await interaction.followup.send(f'**NCO MEETING SCHEDULED** — {post_channel.mention}\nEvent ID: `{result["event_id"]}`\nRSVP roster: **ATTENDING / MAYBE / NO**',ephemeral=True)
 
 
 OPERATION_KIND_CHOICES = [
@@ -2563,6 +2738,12 @@ async def schedule_operation_command(interaction:discord.Interaction,title:str,d
     if not result.get('ok',True):
         await interaction.followup.send(f"Operation could not be scheduled: {result.get('error','unknown error')}",ephemeral=True); return
     event=result.get('event') or {}
+    # Preserve the richer command context in the Discord RSVP board even though
+    # the shared battalion event row intentionally stores only attendance fields.
+    event['operation_number']=result.get('operation_number') or event.get('operation_number')
+    event['operation_type']=(kind.value if kind else 'OFFICIAL OPERATION')
+    event['area_of_operations']=(area_of_operations or '')[:160] or None
+    event['notes']=(notes or '')[:2000] or event.get('notes')
     posted_channel_id=None
     try:
         posted_channel_id=await post_operation_scheduled_notice(interaction.guild,event)
@@ -4623,6 +4804,7 @@ async def on_ready():
         bot.add_view(RecruiterMemberSelectView())
         bot.add_view(RecruitIntakePromptView())
         bot.add_view(TrainingRSVPView())
+        bot.add_view(ScheduledEventRSVPView())
         bot._helpdesk_views_registered = True
 
     if not collector_started:

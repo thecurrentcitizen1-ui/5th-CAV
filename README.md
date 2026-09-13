@@ -103,3 +103,10 @@ Battalion Clerk now stores the RCON V2 session Allied/Axis faction indexes with 
 - Website V301 remains authoritative for approval, Recruiting Case attribution, ENLISTED verification, ribbon progress, and recruiter statistics.
 - If Command approves before the recruited member runs `/apply`, the approved claim waits and auto-attaches when the Recruiting Case appears.
 - Public recruiting remains Discord-first: join Discord → `/apply` → `/link-game` → assignment.
+
+## 2026-09-13 — V99 NCO Meeting / Operation RSVP Rosters
+- `/schedule-nco-meeting` posts a persistent **ATTENDING / MAYBE / NO** RSVP roster.
+- NCO meeting RSVPs are restricted to the NCO Corps / authorized leadership; only the `NCO` role is pinged by the scheduled meeting notice.
+- `/schedule-operation` posts the same persistent RSVP roster for the battalion audience.
+- RSVP names/counts update on the original Discord post and persist in PostgreSQL across bot restarts.
+- Members may change RSVP status until the scheduled event start time.

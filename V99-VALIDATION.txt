@@ -1,0 +1,15 @@
+V99 VALIDATION — 2026-09-13
+
+PASS — scheduled event RSVP view
+PASS — attending button
+PASS — maybe button
+PASS — no button
+PASS — NCO meeting uses RSVP view
+PASS — operation uses RSVP view
+PASS — persistent view registration
+PASS — NCO role gate
+PASS — RSVP closes at start
+
+PASS — Python AST / py_compile
+PASS — persistent custom_id uniqueness (17 ids / 17 unique)
+PASS — direct slash command decorators: 95
