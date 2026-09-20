@@ -63,12 +63,14 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 collector = DataCollector()
-hllv = HLLVTelemetryCollector(collector, server_slot=1)
-# Server #2 is telemetry-only: career stats flow into the same PostgreSQL
-# personnel tables, while VIP/manual RCON administration remains anchored to
-# Server #1. The secondary collector activates automatically when the _2
-# Railway variables are present.
-hllv2 = HLLVTelemetryCollector(collector, server_slot=2, telemetry_only=True)
+# V101 server migration: the currently active official 1/5 Cav server is stored
+# in Railway's _2 RCON variables. Treat that slot as the operational primary so
+# seeding calls, VIP/admin RCON actions, identity verification, recruiting
+# broadcasts, and every full telemetry path follow the live server.
+hllv = HLLVTelemetryCollector(collector, server_slot=2, telemetry_only=False)
+# Retain the legacy slot only as a passive compatibility collector. Railway has
+# HLL_RCON_ENABLED=false for slot 1, so the retired server is not polled.
+hllv2 = HLLVTelemetryCollector(collector, server_slot=1, telemetry_only=True)
 collector_started = False
 commands_synced = False
 
