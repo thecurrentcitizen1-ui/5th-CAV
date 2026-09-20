@@ -50,3 +50,23 @@ replace_all_required(
     "app_commands.Choice(name='Xbox / Microsoft Store PC', value='XBOX'),",
     'clarify Microsoft platform choices',
 )
+
+
+replace_required(
+    bot,
+    '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
+    '        try:\n'
+    '            restored=await web.request(\'POST\',\'/internal/clerk/personnel/rejoin\',json={\'guild_id\':member.guild.id,\'discord_user_id\':member.id,\'reason\':\'member_rejoined_discord\'})\n'
+    '            if restored.get(\'restored\'):\n'
+    '                log.info(\'[PERSONNEL REJOIN RESTORED] member=%s personnel=%s\',member.id,restored.get(\'personnel_id\'))\n'
+    '        except Exception as exc:\n'
+    '            log.warning(\'[PERSONNEL REJOIN RESTORE FAILED] member=%s error=%s\',member.id,exc)\n'
+    '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
+    'restore temporary Discord departure hold on rejoin',
+)
+replace_required(
+    bot,
+    "        cleanup='✅ Active 201 File closed and website/personnel cleanup completed.'\n",
+    "        cleanup='✅ 201 File temporarily closed; member access disabled; Soldier removed from active roster and Recruiting Control until Discord rejoin.'\n",
+    'clarify temporary Discord departure closure',
+)
