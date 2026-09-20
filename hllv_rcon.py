@@ -1602,7 +1602,7 @@ class HLLVTelemetryCollector:
     async def status(self) -> dict:
         if not self.db.pool:
             return {"configured": self.configured, "connected": False, "error": "DATABASE_URL unavailable"}
-        row = await self.db.fetchrow("SELECT * FROM hll_rcon_health WHERE id=1")
+        row = await self.db.fetchrow("SELECT * FROM hll_rcon_health WHERE id=$1", self.health_id)
         return {
             "configured": self.configured,
             "connected": bool(row and row.get("connected")),
