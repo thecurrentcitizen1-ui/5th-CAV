@@ -6757,7 +6757,7 @@ async def notify_staff_member_departure(member: discord.Member, purge_result: di
     if purge_error:
         cleanup=f"⚠️ Website departure cleanup FAILED after retries: {purge_error[:350]}"
     elif result.get('purged'):
-        cleanup='✅ Active 201 File closed and website/personnel cleanup completed.'
+        cleanup='✅ 201 File temporarily closed; member login disabled; active roster and Recruiting Control visibility removed. Service history is preserved for restoration on rejoin.'
     elif result.get('linked') is False:
         cleanup='ℹ️ No active website Soldier link was found; no 201 File purge was required.'
     else:
@@ -6808,6 +6808,27 @@ async def on_member_join(member: discord.Member):
         return
     await collector.upsert_member(member)
     if not member.bot:
+        # V99 — if this Discord identity previously left the battalion, lift the
+        # reversible 201 File hold before normal join/recruiting synchronization.
+        # The website restores the exact prior personnel/recruiting state and
+        # re-enables member access; brand-new arrivals simply return restored=False.
+        rejoin_payload={'guild_id':member.guild.id,'discord_user_id':member.id,'reason':'member_rejoined_discord'}
+        rejoin_result=None
+        last_rejoin_exc=None
+        for attempt in range(1,4):
+            try:
+                rejoin_result=await web.request('POST','/internal/clerk/personnel/rejoin',json=rejoin_payload)
+                log.info('[PERSONNEL REJOIN RESTORE] member=%s attempt=%s result=%s',member.id,attempt,rejoin_result)
+                last_rejoin_exc=None
+                break
+            except Exception as exc:
+                last_rejoin_exc=exc
+                log.warning('[PERSONNEL REJOIN RESTORE RETRY] member=%s attempt=%s error=%s',member.id,attempt,exc)
+                if attempt<3:
+                    await asyncio.sleep(2*attempt)
+        if last_rejoin_exc is not None:
+            log.error('[PERSONNEL REJOIN RESTORE FAILED] member=%s after 3 attempts error=%s',member.id,last_rejoin_exc)
+
         # Temporary seven-day visual marker, independent of recruiting/member status.
         await _apply_new_arrival_role(member, reason='Battalion Clerk — new Discord arrival')
         # Public reception notice is independent of recruiting status and is posted once on guild join.
@@ -6930,8 +6951,8 @@ async def on_member_remove(member: discord.Member):
 
     await collector.mark_member_left(member, now)
     if not member.bot:
-        # V90 — Discord departure is authoritative for active battalion membership.
-        # Retry the website purge so a transient web/API error does not leave a ghost 201 File.
+        # V99 — Discord departure is authoritative for active battalion membership.
+        # Retry the reversible website hold so a transient web/API error does not leave a ghost active 201 File.
         departure_payload={'guild_id':member.guild.id,'discord_user_id':member.id,'reason':'member_left_discord'}
         last_exc=None
         purge_result=None
@@ -6939,16 +6960,16 @@ async def on_member_remove(member: discord.Member):
             try:
                 result=await web.request('POST','/internal/clerk/personnel/departure',json=departure_payload)
                 purge_result=result
-                log.info('[PERSONNEL DEPARTURE PURGE] member=%s attempt=%s result=%s',member.id,attempt,result)
+                log.info('[PERSONNEL DEPARTURE HOLD] member=%s attempt=%s result=%s',member.id,attempt,result)
                 last_exc=None
                 break
             except Exception as exc:
                 last_exc=exc
-                log.warning('[PERSONNEL DEPARTURE PURGE RETRY] member=%s attempt=%s error=%s',member.id,attempt,exc)
+                log.warning('[PERSONNEL DEPARTURE HOLD RETRY] member=%s attempt=%s error=%s',member.id,attempt,exc)
                 if attempt<3:
                     await asyncio.sleep(2*attempt)
         if last_exc is not None:
-            log.error('[PERSONNEL DEPARTURE PURGE FAILED] member=%s after 3 attempts error=%s',member.id,last_exc)
+            log.error('[PERSONNEL DEPARTURE HOLD FAILED] member=%s after 3 attempts error=%s',member.id,last_exc)
         try:
             await notify_staff_member_departure(member,purge_result,str(last_exc) if last_exc else None)
         except Exception as exc:
