@@ -52,21 +52,32 @@ replace_all_required(
 )
 
 
-replace_required(
-    bot,
-    '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
-    '        try:\n'
-    '            restored=await web.request(\'POST\',\'/internal/clerk/personnel/rejoin\',json={\'guild_id\':member.guild.id,\'discord_user_id\':member.id,\'reason\':\'member_rejoined_discord\'})\n'
-    '            if restored.get(\'restored\'):\n'
-    '                log.info(\'[PERSONNEL REJOIN RESTORED] member=%s personnel=%s\',member.id,restored.get(\'personnel_id\'))\n'
-    '        except Exception as exc:\n'
-    '            log.warning(\'[PERSONNEL REJOIN RESTORE FAILED] member=%s error=%s\',member.id,exc)\n'
-    '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
-    'restore temporary Discord departure hold on rejoin',
-)
-replace_required(
-    bot,
-    "        cleanup='✅ Active 201 File closed and website/personnel cleanup completed.'\n",
-    "        cleanup='✅ 201 File temporarily closed; member access disabled; Soldier removed from active roster and Recruiting Control until Discord rejoin.'\n",
-    'clarify temporary Discord departure closure',
-)
+# The rejoin/temporary-departure behavior is now native in bot.py. Keep these
+# runtime guards only for older images so production remains restart-safe.
+_bot_text=bot.read_text(encoding='utf-8')
+if "[PERSONNEL REJOIN RESTORE] member=%s attempt=%s result=%s" in _bot_text:
+    print('[PRODUCTION HARDENING] already applied: restore temporary Discord departure hold on rejoin')
+else:
+    replace_required(
+        bot,
+        '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
+        '        try:\n'
+        '            restored=await web.request(\'POST\',\'/internal/clerk/personnel/rejoin\',json={\'guild_id\':member.guild.id,\'discord_user_id\':member.id,\'reason\':\'member_rejoined_discord\'})\n'
+        '            if restored.get(\'restored\'):\n'
+        '                log.info(\'[PERSONNEL REJOIN RESTORED] member=%s personnel=%s\',member.id,restored.get(\'personnel_id\'))\n'
+        '        except Exception as exc:\n'
+        '            log.warning(\'[PERSONNEL REJOIN RESTORE FAILED] member=%s error=%s\',member.id,exc)\n'
+        '        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")\n',
+        'restore temporary Discord departure hold on rejoin',
+    )
+
+_bot_text=bot.read_text(encoding='utf-8')
+if "201 File temporarily closed; member login disabled; active roster and Recruiting Control visibility removed." in _bot_text:
+    print('[PRODUCTION HARDENING] already applied: clarify temporary Discord departure closure')
+else:
+    replace_required(
+        bot,
+        "        cleanup='✅ Active 201 File closed and website/personnel cleanup completed.'\n",
+        "        cleanup='✅ 201 File temporarily closed; member access disabled; Soldier removed from active roster and Recruiting Control until Discord rejoin.'\n",
+        'clarify temporary Discord departure closure',
+    )
