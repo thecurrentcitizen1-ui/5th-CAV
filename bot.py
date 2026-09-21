@@ -4843,6 +4843,14 @@ async def on_ready():
         except Exception:
             log.exception('[COMMAND SYNC FAILED]')
 
+    # V103: /apply must also be usable from a direct chat with Battalion Clerk.
+    # Guild command sync cannot publish DM commands, so upsert this one public
+    # recruiting command globally while leaving staff/admin commands guild-only.
+    try:
+        await _ensure_global_apply_command()
+    except Exception:
+        log.exception('[GLOBAL APPLY SYNC FAILED]')
+
     if not flush_duty_chunks.is_running():
         flush_duty_chunks.change_interval(seconds=VOICE_FLUSH_SECONDS)
         flush_duty_chunks.start()
@@ -6043,8 +6051,63 @@ async def test_recruit_intake(interaction:discord.Interaction, member:discord.Me
 
 
 @bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry recruiting intake in Discord.')
+@app_commands.allowed_contexts(guilds=True,dms=True,private_channels=True)
+@app_commands.allowed_installs(guilds=True,users=False)
 async def discord_apply(interaction:discord.Interaction):
     await _begin_or_resume_recruit_application(interaction)
+
+
+async def _ensure_global_apply_command() -> bool:
+    """Expose only /apply globally so it works in the Battalion Clerk DM.
+
+    The rest of Battalion Clerk's command tree remains guild-scoped.  A single
+    global command is upserted through Discord's documented application-command
+    endpoint instead of bulk-syncing every staff command into DMs.
+    """
+    app_id=getattr(bot,'application_id',None)
+    if not app_id or not TOKEN:
+        log.warning('[GLOBAL APPLY SYNC] skipped: application id/token unavailable')
+        return False
+
+    payload={
+        'name':'apply',
+        'description':'Begin or resume your 1/5 Cavalry recruiting intake in Discord.',
+        'type':1,
+        # 0 = guild, 1 = bot DM, 2 = private channel.
+        'contexts':[0,1,2],
+        # 0 = guild-installed application. Recruits can DM Battalion Clerk after
+        # joining the battalion Discord without requiring a separate user install.
+        'integration_types':[0],
+    }
+    url=f'https://discord.com/api/v10/applications/{app_id}/commands'
+    headers={'Authorization':f'Bot {TOKEN}','Content-Type':'application/json'}
+    timeout=aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(headers=headers,timeout=timeout) as session:
+        existing=None
+        async with session.get(url) as response:
+            data=await response.json(content_type=None)
+            if response.status>=400:
+                raise RuntimeError(f'Discord global-command list failed HTTP {response.status}: {str(data)[:300]}')
+            for row in data if isinstance(data,list) else []:
+                if str(row.get('name') or '')=='apply' and int(row.get('type') or 1)==1:
+                    existing=row
+                    break
+
+        current_contexts=sorted(existing.get('contexts') or []) if existing else []
+        current_installs=sorted(existing.get('integration_types') or []) if existing else []
+        if (existing and str(existing.get('description') or '')==payload['description']
+                and current_contexts==payload['contexts']
+                and current_installs==payload['integration_types']):
+            log.info('[GLOBAL APPLY SYNC] already current id=%s contexts=%s',existing.get('id'),current_contexts)
+            return True
+
+        async with session.post(url,json=payload) as response:
+            data=await response.json(content_type=None)
+            if response.status>=400:
+                raise RuntimeError(f'Discord /apply upsert failed HTTP {response.status}: {str(data)[:500]}')
+            log.info('[GLOBAL APPLY SYNC] /apply available in guild + Battalion Clerk DM id=%s',data.get('id'))
+            return True
 
 
 @bot.tree.command(name='application-system-check',description='Run a read-only health check of the Discord recruiting intake pipeline.')
