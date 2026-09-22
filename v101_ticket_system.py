@@ -151,16 +151,6 @@ async def _ensure_schema():
             )
             """
         )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS discord_support_ticket_panels(
-                guild_id BIGINT PRIMARY KEY,
-                channel_id BIGINT NOT NULL,
-                message_id BIGINT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
 
 
 async def _ticket_for_channel(channel_id: int):
@@ -412,66 +402,6 @@ def _support_panel_embed() -> discord.Embed:
     embed.add_field(name="LIMIT", value=f"Maximum {MAX_OPEN_TICKETS} open tickets per member.", inline=True)
     embed.set_footer(text="Battalion Clerk • Support Desk")
     return embed
-
-
-async def _ensure_support_panel(bot: commands.Bot):
-    await bot.wait_until_ready()
-    guild = bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if bot.guilds else None)
-    if not guild:
-        log.warning("%s could not auto-post ticket panel: guild unavailable", VERSION)
-        return
-
-    channel = discord.utils.get(guild.text_channels, name="help-desk")
-    if channel is None:
-        recruiting = discord.utils.get(guild.categories, name="RECRUITING")
-        try:
-            channel = await guild.create_text_channel(
-                "help-desk",
-                category=recruiting,
-                reason="Battalion Clerk — member support desk",
-            )
-        except Exception:
-            log.exception("%s could not create #help-desk", VERSION)
-            return
-
-    pool = await _db()
-    row = await pool.fetchrow(
-        "SELECT channel_id,message_id FROM discord_support_ticket_panels WHERE guild_id=$1",
-        guild.id,
-    )
-    message = None
-    if row and int(row["channel_id"]) == channel.id:
-        try:
-            message = await channel.fetch_message(int(row["message_id"]))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            message = None
-
-    try:
-        if message is None:
-            message = await channel.send(embed=_support_panel_embed(), view=TicketPanelView())
-        else:
-            await message.edit(embed=_support_panel_embed(), view=TicketPanelView())
-
-        try:
-            if not message.pinned:
-                await message.pin(reason="Battalion Clerk — permanent support desk panel")
-        except (discord.Forbidden, discord.HTTPException):
-            log.warning("%s ticket panel posted but could not be pinned", VERSION)
-
-        await pool.execute(
-            """
-            INSERT INTO discord_support_ticket_panels(guild_id,channel_id,message_id,updated_at)
-            VALUES($1,$2,$3,NOW())
-            ON CONFLICT(guild_id) DO UPDATE SET
-                channel_id=EXCLUDED.channel_id,
-                message_id=EXCLUDED.message_id,
-                updated_at=NOW()
-            """,
-            guild.id, channel.id, message.id,
-        )
-        log.info("%s support panel ready in #%s message_id=%s", VERSION, channel.name, message.id)
-    except Exception:
-        log.exception("%s could not maintain support panel in #%s", VERSION, channel.name)
 
 
 class TicketPanelView(discord.ui.View):
@@ -730,9 +660,8 @@ async def install(bot: commands.Bot):
             return
         await _ensure_schema()
         await _install_commands(bot)
-        asyncio.create_task(_ensure_support_panel(bot))
         _installed_bots.add(key)
-        log.info("%s installed: persistent Battalion Clerk support ticket system ready; #help-desk panel maintenance enabled", VERSION)
+        log.info("%s installed: persistent Battalion Clerk support ticket system ready", VERSION)
 
 
 _original_setup_hook = commands.Bot.setup_hook
