@@ -157,7 +157,7 @@ RECRUITING_STATUS_ROLE_BLUEPRINT = [
 LEGACY_RECRUITING_STATUS_ROLE_NAMES = {"Approved Replacement", "Prospective Replacement", "Replacement Depot"}
 
 APPOINTMENT_ROLE_BLUEPRINT = [
-    "Battalion Commander", "Battalion Executive Officer",
+    "Battalion Commander", "Battalion Executive Officer", "Battalion Sergeant Major",
     "S-1 OIC", "S-1 NCOIC", "S-3 OIC", "S-3 NCOIC", "S-4 OIC", "S-4 NCOIC",
     "Company Commander", "Company Executive Officer", "First Sergeant",
     "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader",
@@ -2019,8 +2019,10 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
         if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
         if role.name=='5th Cavalry Regiment' and not (is_member or discord.utils.get(member.roles,name='Replacement')): remove.append(role)
 
-    # Separated/archived Soldiers retain protected Discord roles only.
-    managed_appointment_names={'Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
+    # Separated/archived Soldiers retain protected/manual Discord roles only.
+    # Every Battalion Clerk-managed appointment is reconstructed from the
+    # authoritative Website personnel record when the Soldier is active.
+    managed_appointment_names=set(APPOINTMENT_ROLE_BLUEPRINT)
     if lifecycle in {'SEPARATED','ARCHIVED'}:
         for role in member.roles:
             if role.name in managed_appointment_names or _managed_role_category(role.name) in {'COMPANY','PLATOON','SQUAD','MEMBERSHIP'}:
@@ -2050,17 +2052,42 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
         desired_appointment_names=set(result.get('appointment_roles') or []) & managed_appointment_names
         for role in member.roles:
             if role.name in managed_appointment_names and role.name not in desired_appointment_names: remove.append(role)
-        for role in member.guild.roles:
-            if role.name in desired_appointment_names: desired.append(role)
+        for role_name in desired_appointment_names:
+            role=_role_by_name(member.guild,role_name)
+            if not role:
+                role=await _ensure_dynamic_role(member.guild,role_name)
+                if role: created.append(role.name)
+            if role: desired.append(role)
 
-        # NCO is an authority/access role, not a rank mirror. It follows an active
-        # line-leadership billet so promotions alone do not grant leadership access.
-        nco_billet_names={'First Sergeant','Platoon Sergeant','Squad Leader','Assistant Squad Leader','Team Leader'}
-        has_nco_billet=bool(set(result.get('appointment_roles') or []) & nco_billet_names)
-        nco_role=discord.utils.get(member.guild.roles,name='NCO')
-        if has_nco_billet:
+        # Staff access is reconstructed from authoritative structural appointments.
+        # These are access mirrors, never independent sources of personnel authority.
+        appointment_access_map={
+            'Battalion Commander':'Command Staff',
+            'Battalion Executive Officer':'Command Staff',
+            'Battalion Sergeant Major':'Command Staff',
+            'S-1 OIC':'S-1 Personnel','S-1 NCOIC':'S-1 Personnel',
+            'S-3 OIC':'S-3 Operations','S-3 NCOIC':'S-3 Operations',
+            'S-4 OIC':'S-4 Supply','S-4 NCOIC':'S-4 Supply',
+        }
+        desired_staff={appointment_access_map[x] for x in desired_appointment_names if x in appointment_access_map}
+        for staff_name in STAFF_ACCESS_ROLE_BLUEPRINT:
+            staff_role=_role_by_name(member.guild,staff_name)
+            if staff_name in desired_staff:
+                if not staff_role:
+                    staff_role=await _ensure_dynamic_role(member.guild,staff_name)
+                    if staff_role: created.append(staff_role.name)
+                if staff_role: desired.append(staff_role)
+            elif staff_role and staff_role in member.roles:
+                remove.append(staff_role)
+
+        # Battalion policy: CPL and every higher NCO/enlisted leadership rank receives
+        # the NCO Discord role. This is rank-derived and survives leave/rejoin.
+        nco_rank_codes={'CPL','SGT','SSG','SFC','MSG','1SG','SGM'}
+        nco_role=_role_by_name(member.guild,'NCO')
+        if str(rank or '').upper() in nco_rank_codes:
             if not nco_role:
                 nco_role=await _ensure_dynamic_role(member.guild,'NCO')
+                if nco_role: created.append(nco_role.name)
             if nco_role: desired.append(nco_role)
         elif nco_role and nco_role in member.roles:
             remove.append(nco_role)
@@ -6898,7 +6925,31 @@ async def on_member_join(member: discord.Member):
         await _apply_new_arrival_role(member, reason='Battalion Clerk — new Discord arrival')
         # Public reception notice is independent of recruiting status and is posted once on guild join.
         await post_public_welcome(member)
-        existing=await sync_personnel_identity(member,create_if_missing=False,reason="member_join")
+        # Rejoin safeguard: Discord removes guild roles when a member leaves.
+        # After the reversible Website hold is lifted, rebuild the complete managed
+        # Discord identity from the authoritative personnel record. Retry because the
+        # Website restore and Discord gateway event can complete a few seconds apart.
+        existing=None
+        restore_attempts=4 if (rejoin_result and rejoin_result.get('restored')) else 1
+        for restore_attempt in range(1,restore_attempts+1):
+            existing=await sync_personnel_identity(
+                member,
+                create_if_missing=False,
+                reason="member_rejoin_role_restore" if restore_attempts>1 else "member_join",
+                deliver_credentials=False if restore_attempts>1 else True,
+            )
+            if existing and existing.get('linked'):
+                log.info(
+                    '[REJOIN ROLE SAFEGUARD] member=%s attempt=%s rank=%s mos=%s unit=%s appointments=%s roles=%s',
+                    member.id,restore_attempt,existing.get('rank_code'),existing.get('mos_code'),
+                    existing.get('unit_code'),existing.get('appointment_roles'),member_role_names(member),
+                )
+                break
+            if restore_attempt<restore_attempts:
+                await asyncio.sleep(2*restore_attempt)
+        if restore_attempts>1 and not (existing and existing.get('linked')):
+            log.error('[REJOIN ROLE SAFEGUARD FAILED] member=%s no authoritative linked personnel result after %s attempts',member.id,restore_attempts)
+
         if not (existing and existing.get('linked')):
             # Every brand-new Discord arrival receives the entry-rank PVT role immediately.
             # This is presentation/intake only: Website approval remains required before a
