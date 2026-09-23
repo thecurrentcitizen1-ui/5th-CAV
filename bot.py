@@ -45,6 +45,9 @@ WEBSITE_STATUS_CHECK_REPEAT_DAYS = max(7, int(os.getenv('WEBSITE_STATUS_CHECK_RE
 GAME_LINK_REMINDER_DAYS = max(1, int(os.getenv('GAME_LINK_REMINDER_DAYS','3') or 3))
 NEW_ARRIVAL_ROLE_NAME = os.getenv('NEW_ARRIVAL_ROLE_NAME', 'NEW ARRIVAL').strip() or 'NEW ARRIVAL'
 NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
+# V107 — manual Discord role management. Website/personnel state remains authoritative
+# for records, but Battalion Clerk does not mutate member roles automatically.
+AUTO_ROLE_SYNC_ENABLED = str(os.getenv('AUTO_ROLE_SYNC_ENABLED','false')).strip().lower() in {'1','true','yes','on','enabled'}
 
 # Canonical public publication channels. Stored Command routes always win; these
 # are regression-safe fallbacks so a lost/missing route cannot silently stop
@@ -806,6 +809,9 @@ async def recruiting_status_for(member: discord.Member):
         return {'ok':False,'exists':False}
 
 async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
+    if not AUTO_ROLE_SYNC_ENABLED:
+        log.info('[AUTO ROLE SYNC DISABLED] recruit status role unchanged member=%s', member.id)
+        return
     # Approved applicants use the temporary Replacement access role and are recognized immediately as
     # members of the 5th Cavalry Regiment. Formation/rank/MOS roles still wait for the
     # authoritative Website assignment after Command files the Soldier formation.
@@ -832,6 +838,9 @@ async def ensure_recruit_status_role(member: discord.Member, approved: bool=Fals
 
 
 async def clear_recruit_status_roles(member: discord.Member):
+    if not AUTO_ROLE_SYNC_ENABLED:
+        log.info('[AUTO ROLE SYNC DISABLED] recruit status roles preserved member=%s', member.id)
+        return
     roles=[discord.utils.get(member.guild.roles,name=name) for name in [*RECRUITING_STATUS_ROLE_BLUEPRINT,*LEGACY_RECRUITING_STATUS_ROLE_NAMES]]
     roles=[role for role in roles if role and role in member.roles]
     if not roles: return
@@ -1971,6 +1980,9 @@ async def reconcile_member_roles_from_canonical(member: discord.Member, result: 
     """Mirror the authoritative website record into Discord and report exactly what changed."""
     if not result.get('linked'):
         return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
+    if not AUTO_ROLE_SYNC_ENABLED:
+        log.info('[AUTO ROLE SYNC DISABLED] canonical Discord roles not changed member=%s', member.id)
+        return {'ok':True,'manual_mode':True,'added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
     rank=result.get('rank_code'); mos=result.get('mos_code')
     lifecycle=str(result.get('lifecycle_state') or '').upper()
     unit=str(result.get('unit_code') or '').upper().strip()
@@ -6710,6 +6722,8 @@ async def _ensure_new_arrival_role(guild: discord.Guild) -> Optional[discord.Rol
 
 
 async def _apply_new_arrival_role(member: discord.Member, *, reason: str) -> bool:
+    if not AUTO_ROLE_SYNC_ENABLED:
+        return False
     if member.bot:
         return False
     joined_at = await _first_discord_join_at(member)
@@ -6732,6 +6746,8 @@ async def _apply_new_arrival_role(member: discord.Member, *, reason: str) -> boo
 
 
 async def _remove_expired_new_arrival_roles(guild: discord.Guild) -> int:
+    if not AUTO_ROLE_SYNC_ENABLED:
+        return 0
     role = _role_by_name(guild, NEW_ARRIVAL_ROLE_NAME)
     if not role:
         return 0
@@ -6954,15 +6970,16 @@ async def on_member_join(member: discord.Member):
             # Every brand-new Discord arrival receives the entry-rank PVT role immediately.
             # This is presentation/intake only: Website approval remains required before a
             # new personnel record is provisioned, so the role cannot bypass recruiting.
-            pvt_role=_role_by_name(member.guild,'PVT') or await _ensure_dynamic_role(member.guild,'PVT')
-            if pvt_role and pvt_role not in member.roles:
-                try:
-                    role_sync_suppressed_members.add((member.guild.id,member.id))
-                    await member.add_roles(pvt_role,reason='Battalion Clerk — new arrival entry rank')
-                except discord.Forbidden:
-                    log.warning('[PVT ARRIVAL ROLE BLOCKED] member=%s',member.id)
-                finally:
-                    role_sync_suppressed_members.discard((member.guild.id,member.id))
+            if AUTO_ROLE_SYNC_ENABLED:
+                pvt_role=_role_by_name(member.guild,'PVT') or await _ensure_dynamic_role(member.guild,'PVT')
+                if pvt_role and pvt_role not in member.roles:
+                    try:
+                        role_sync_suppressed_members.add((member.guild.id,member.id))
+                        await member.add_roles(pvt_role,reason='Battalion Clerk — new arrival entry rank')
+                    except discord.Forbidden:
+                        log.warning('[PVT ARRIVAL ROLE BLOCKED] member=%s',member.id)
+                    finally:
+                        role_sync_suppressed_members.discard((member.guild.id,member.id))
             recruit=await recruiting_status_for(member)
             case=recruit.get('case') if recruit and recruit.get('exists') else None
             if case:
