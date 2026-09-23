@@ -557,6 +557,42 @@ class TicketCloseModal(discord.ui.Modal, title="Close Support Ticket"):
         await _close_ticket(interaction, str(self.reason))
 
 
+class TicketAddMemberSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Select a member to add to this ticket", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
+            await interaction.response.send_message("Battalion staff authorization required.", ephemeral=True)
+            return
+        row = await _ticket_for_channel(interaction.channel_id)
+        if not row or row["status"] == "CLOSED" or not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("Use this control inside an open Battalion Clerk ticket.", ephemeral=True)
+            return
+        member = self.values[0]
+        await interaction.channel.set_permissions(
+            member,
+            view_channel=True, send_messages=True, read_message_history=True,
+            reason=f"Battalion Clerk ticket #{int(row['id']):04d} participant added",
+        )
+        pool = await _db()
+        await pool.execute(
+            """
+            INSERT INTO discord_support_ticket_members(ticket_id,discord_user_id,added_by_user_id)
+            VALUES($1,$2,$3)
+            ON CONFLICT(ticket_id,discord_user_id) DO NOTHING
+            """,
+            row["id"], member.id, interaction.user.id,
+        )
+        await interaction.response.send_message(f"{member.mention} added to this ticket.", ephemeral=True)
+
+
+class TicketAddMemberView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(TicketAddMemberSelect())
+
+
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -568,6 +604,13 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="ESCALATE TO COMMAND", style=discord.ButtonStyle.primary, custom_id="battalion-clerk:ticket:escalate")
     async def escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _escalate(interaction)
+
+    @discord.ui.button(label="ADD MEMBER", style=discord.ButtonStyle.secondary, custom_id="battalion-clerk:ticket:add-member")
+    async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
+            await interaction.response.send_message("This control is for Battalion staff.", ephemeral=True)
+            return
+        await interaction.response.send_message("Choose the member to add.", view=TicketAddMemberView(), ephemeral=True)
 
     @discord.ui.button(label="CLOSE", style=discord.ButtonStyle.danger, custom_id="battalion-clerk:ticket:close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -599,38 +642,7 @@ async def _install_commands(bot: commands.Bot):
         await interaction.channel.send(embed=_support_panel_embed(), view=TicketPanelView())
         await interaction.response.send_message("Support panel posted.", ephemeral=True)
 
-    @app_commands.command(name="ticket-add", description="Add a member to the current support ticket.")
-    @app_commands.describe(member="Member to add to this ticket")
-    async def ticket_add(interaction: discord.Interaction, member: discord.Member):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
-            await interaction.response.send_message("Battalion staff authorization required.", ephemeral=True)
-            return
-        row = await _ticket_for_channel(interaction.channel_id)
-        if not row or row["status"] == "CLOSED" or not isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_message("Use this command inside an open Battalion Clerk ticket.", ephemeral=True)
-            return
-        await interaction.channel.set_permissions(
-            member,
-            view_channel=True, send_messages=True, read_message_history=True,
-            reason=f"Battalion Clerk ticket #{int(row['id']):04d} participant added",
-        )
-        pool = await _db()
-        await pool.execute(
-            """
-            INSERT INTO discord_support_ticket_members(ticket_id,discord_user_id,added_by_user_id)
-            VALUES($1,$2,$3)
-            ON CONFLICT(ticket_id,discord_user_id) DO NOTHING
-            """,
-            row["id"], member.id, interaction.user.id,
-        )
-        await interaction.response.send_message(f"{member.mention} added to this ticket.")
-
-    @app_commands.command(name="ticket-close", description="Close the current Battalion Clerk ticket.")
-    @app_commands.describe(reason="Resolution or reason for closing")
-    async def ticket_close(interaction: discord.Interaction, reason: str):
-        await _close_ticket(interaction, reason)
-
-    commands_to_add = [ticket, ticket_panel, ticket_add, ticket_close]
+    commands_to_add = [ticket, ticket_panel]
     for command in commands_to_add:
         try:
             if guild_obj:
