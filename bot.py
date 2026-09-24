@@ -115,7 +115,7 @@ pending_personnel_sync: Dict[Tuple[int, int], asyncio.Task] = {}
 role_sync_suppressed_members = set()
 
 RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","WO1","CW2","CW3","CW4","2LT","1LT","CPT","MAJ","LTC"}
-MOS_ROLE_CODES = {"00C","11L","11R","11G","11M","91M","12E","76S","11S","11N","19C","19K","67L","67P","67C","67G","11O","11A","11T"}
+MOS_ROLE_CODES = {"00C","11L","11R","11G","11M","91M","12E","76S","11S","11N","19C","19K","67L","67F","11O","11A","11T"}
 RANK_ROLE_ALIASES = {
     "PRIVATE":"PVT","PRIVATE FIRST CLASS":"PFC","CORPORAL":"CPL","SERGEANT":"SGT",
     "STAFF SERGEANT":"SSG","SERGEANT FIRST CLASS":"SFC","MASTER SERGEANT":"MSG",
@@ -185,9 +185,7 @@ MOS_ROLE_BLUEPRINT = [
     "19C — Armor Commander",
     "19K — Armor Crewman",
     "67L — Aviation Logistics",
-    "67P — Rotary-Wing Pilot",
-    "67C — Helicopter Crew Chief",
-    "67G — Aerial Door Gunner",
+    "67F — Rotary-Wing Pilot",
     "11O — Mortar Observer",
     "11A — Mortar Ammunition Bearer",
     "11T — Mortar Gunner",
