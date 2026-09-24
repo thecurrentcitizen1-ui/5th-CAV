@@ -48,6 +48,11 @@ NEW_ARRIVAL_DAYS = max(1, int(os.getenv('NEW_ARRIVAL_DAYS', '7') or 7))
 # V107 — manual Discord role management. Website/personnel state remains authoritative
 # for records, but Battalion Clerk does not mutate member roles automatically.
 AUTO_ROLE_SYNC_ENABLED = str(os.getenv('AUTO_ROLE_SYNC_ENABLED','false')).strip().lower() in {'1','true','yes','on','enabled'}
+# V102 — assignment-only Discord formation automation. This is intentionally
+# independent of AUTO_ROLE_SYNC_ENABLED so rank, MOS, appointments, staff access,
+# membership, recruiting status, qualifications and special/manual roles remain
+# untouched. Only a website assignment/transfer lifecycle event may use it.
+ASSIGNMENT_ROLE_SYNC_ENABLED = str(os.getenv('ASSIGNMENT_ROLE_SYNC_ENABLED','false')).strip().lower() in {'1','true','yes','on','enabled'}
 
 # Canonical public publication channels. Stored Command routes always win; these
 # are regression-safe fallbacks so a lost/missing route cannot silently stop
@@ -1974,6 +1979,134 @@ async def _ensure_dynamic_role(guild: discord.Guild, name: str) -> discord.Role 
     except discord.Forbidden:
         log.warning('[FORMATION ROLE CREATE BLOCKED] guild=%s role=%s',guild.id,name)
         return None
+
+
+def _assignment_sync_reason(reason: str) -> bool:
+    """Return True only for website events that represent formation placement lifecycle."""
+    text=" ".join(str(reason or "").upper().strip().split())
+    if not text:
+        return False
+    exact_prefixes=(
+        "ASSIGNMENT ",
+        "ASSIGNMENT ->",
+        "ASSIGNMENT ARTIFACT RECONCILE",
+        "PLATOON ASSIGNMENT",
+        "FORMATION ASSIGNMENT CONTROL",
+        "ATOMIC REASSIGNMENT",
+        "UNASSIGNED FROM FORMATION",
+    )
+    return any(text.startswith(prefix) for prefix in exact_prefixes)
+
+
+def _assignment_managed_role_name(name: str) -> bool:
+    """Strict allowlist for roles assignment automation is permitted to mutate."""
+    n=_normalized_role_name(name)
+    if n in {"HHC","A COMPANY","B COMPANY","C COMPANY","RESERVE PLATOON"}:
+        return True
+    # Current live naming convention, including numbered and Combat Support squads.
+    if re.fullmatch(r"[ABC] COMPANY • .+ PLATOON", n):
+        return True
+    if re.fullmatch(r"[ABC] COMPANY • .+ PLATOON • .+ SQUAD", n):
+        return True
+    return False
+
+
+def _assignment_company_role(unit_code: str) -> str | None:
+    unit=_normalized_role_name(unit_code)
+    aliases={
+        "A/1-5 CAV":"A Company","A COMPANY":"A Company","ALPHA COMPANY":"A Company",
+        "B/1-5 CAV":"B Company","B COMPANY":"B Company","BRAVO COMPANY":"B Company",
+        "C/1-5 CAV":"C Company","C COMPANY":"C Company","CHARLIE COMPANY":"C Company",
+        "HHC/1-5 CAV":"HHC","HHC":"HHC","HEADQUARTERS & HEADQUARTERS COMPANY":"HHC",
+    }
+    return aliases.get(unit)
+
+
+async def reconcile_assignment_roles_from_canonical(member: discord.Member, result: dict):
+    """Synchronize ONLY current Company/Platoon/Squad/Reserve formation roles.
+
+    Never mutates rank, NCO, MOS, appointments, staff/admin, qualifications,
+    Member/5th Cavalry Regiment/Replacement/NEW ARRIVAL, Server Booster,
+    Veteran, Community Liaison, or any other custom/manual Discord role.
+    """
+    if not result.get('linked'):
+        return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
+    if not ASSIGNMENT_ROLE_SYNC_ENABLED:
+        return {'ok':True,'manual_mode':True,'scope':'ASSIGNMENT_ONLY_DISABLED','added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
+
+    reason=str(result.get('reason') or '')
+    if not _assignment_sync_reason(reason):
+        log.info('[ASSIGNMENT ROLE SYNC SKIP] member=%s reason=%s',member.id,reason)
+        return {'ok':True,'manual_mode':True,'scope':'NON_ASSIGNMENT_IGNORED','added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
+
+    unit=str(result.get('unit_code') or '').strip()
+    platoon=str(result.get('platoon') or '').strip()
+    squad=str(result.get('squad') or '').strip()
+    unit_norm=_normalized_role_name(unit)
+    platoon_norm=_normalized_role_name(platoon)
+    field_status=_normalized_role_name(result.get('field_status') or '')
+
+    desired_names=[]
+    # Reserve is a terminal formation in the current Discord structure.
+    is_reserve=(
+        unit_norm in {'RESERVE','RESERVE/1-5 CAV','RESERVE COMPANY'}
+        or 'RESERVE' in platoon_norm
+        or field_status=='RESERVE'
+    )
+    if is_reserve:
+        desired_names=['Reserve Platoon']
+    else:
+        company=_assignment_company_role(unit)
+        # HHC and Company Command remain manual. This automation activates only
+        # when a Soldier has an actual squad assignment.
+        if company in {'A Company','B Company','C Company'} and platoon and squad:
+            desired_names=[
+                company,
+                f"{company} • {platoon}",
+                f"{company} • {platoon} • {squad}",
+            ]
+
+    desired_norm={_normalized_role_name(x) for x in desired_names}
+    remove=[
+        role for role in member.roles
+        if _assignment_managed_role_name(role.name)
+        and _normalized_role_name(role.name) not in desired_norm
+    ]
+
+    desired=[]; created=[]
+    for role_name in desired_names:
+        role=_role_by_name(member.guild,role_name)
+        if not role:
+            role=await _ensure_dynamic_role(member.guild,role_name)
+            if role:
+                created.append(role.name)
+        if role:
+            desired.append(role)
+
+    removed_names=[]; added_names=[]
+    try:
+        actual_remove=[r for r in remove if r in member.roles]
+        if actual_remove:
+            role_sync_suppressed_members.add((member.guild.id,member.id))
+            await member.remove_roles(*actual_remove,reason='Battalion Clerk — website squad assignment synchronization')
+            removed_names=[r.name for r in actual_remove]
+        add=[r for r in desired if r not in member.roles]
+        if add:
+            role_sync_suppressed_members.add((member.guild.id,member.id))
+            await member.add_roles(*add,reason='Battalion Clerk — website squad assignment synchronization')
+            added_names=[r.name for r in add]
+    except discord.Forbidden:
+        log.warning('[ASSIGNMENT ROLE SYNC BLOCKED] member=%s bot role hierarchy/permissions',member.id)
+        return {'ok':False,'error':'Battalion Clerk role hierarchy/permissions blocked assignment synchronization','added':added_names,'removed':removed_names,'created':created}
+    finally:
+        role_sync_suppressed_members.discard((member.guild.id,member.id))
+
+    log.info('[ASSIGNMENT ROLE SYNC] member=%s reason=%s added=%s removed=%s',member.id,reason,added_names,removed_names)
+    return {
+        'ok':True,'scope':'ASSIGNMENT_ONLY','added':added_names,'removed':removed_names,'created':created,
+        'actual_roles':member_role_names(member),
+        'expected':{'unit_code':unit,'platoon':platoon,'squad':squad,'reserve':is_reserve,'formation_roles':desired_names},
+    }
 
 
 async def reconcile_member_roles_from_canonical(member: discord.Member, result: dict):
@@ -3994,7 +4127,17 @@ async def canonical_role_sync_watch():
                         except Exception: member=None
                     if not member:
                         raise RuntimeError('Discord member not found in guild')
-                    recon=await reconcile_member_roles_from_canonical(member,item)
+                    if ASSIGNMENT_ROLE_SYNC_ENABLED and _assignment_sync_reason(item.get('reason')):
+                        recon=await reconcile_assignment_roles_from_canonical(member,item)
+                    elif AUTO_ROLE_SYNC_ENABLED:
+                        recon=await reconcile_member_roles_from_canonical(member,item)
+                    else:
+                        # Manual mode for every non-assignment event: consume the queue
+                        # without mutating Discord so stale rank/MOS/admin jobs cannot
+                        # accumulate or later replay if settings change.
+                        recon={'ok':True,'manual_mode':True,'scope':'NON_ASSIGNMENT_IGNORED',
+                               'added':[],'removed':[],'created':[],'actual_roles':member_role_names(member),
+                               'expected':{'role_sync':'manual','reason':item.get('reason')}}
                     ok=bool((recon or {}).get('ok',True))
                     error=(recon or {}).get('error')
                     await web.request('POST','/internal/clerk/personnel/sync-observation',json={
