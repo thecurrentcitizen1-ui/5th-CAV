@@ -1817,7 +1817,12 @@ class WebsiteClient:
 
     async def start(self):
         if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+            # Website cold-start currently includes one shared generated-asset build.
+            # Normal Clerk endpoints return in milliseconds, but deploy cutovers can
+            # legitimately take ~30-35 seconds. A 45-second total timeout prevents
+            # false 499/cancellation noise during healthy Railway releases without
+            # changing any polling cadence or retry semantics.
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45, connect=10))
 
     async def close(self):
         if self.session and not self.session.closed:
