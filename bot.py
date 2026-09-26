@@ -1947,12 +1947,16 @@ async def _sync_command_tree_if_changed():
         log.warning("[COMMAND SYNC] remote read failed scope=%s error=%s", scope_key, exc)
 
     remote_matches = bool(remote_commands) and _command_fingerprint(remote_commands) == local_fp
-    first_install_outline_match = (
-        state is None
-        and bool(remote_commands)
-        and _command_outline(remote_commands) == _command_outline(local_commands)
+    local_names = {str(getattr(cmd, "name", "") or "") for cmd in local_commands}
+    remote_names = {str(getattr(cmd, "name", "") or "") for cmd in remote_commands}
+    missing_names = sorted(name for name in (local_names - remote_names) if name)
+    extra_names = sorted(name for name in (remote_names - local_names) if name)
+    first_install_name_match = state is None and bool(remote_commands) and not missing_names and not extra_names
+    log.info(
+        "[COMMAND SYNC CHECK] scope=%s local=%s remote=%s missing=%s extra=%s",
+        scope_key, len(local_commands), len(remote_commands), missing_names, extra_names,
     )
-    if remote_matches or first_install_outline_match:
+    if remote_matches or first_install_name_match:
         await collector.db.execute(
             """
             INSERT INTO clerk_command_sync_state(scope_key,fingerprint,command_count,synced_at)
@@ -5163,14 +5167,19 @@ async def on_ready():
     if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
         hll_vip_sync_watch.start()
 
-    # V110: one persistent, fingerprint-based command publisher. Ticket commands
-    # are registered before this point but no longer run their own bulk sync.
+    # V110: one persistent, fingerprint-based command publisher. Publication runs
+    # in the background so a Discord bulk-command rate limit can never block Clerk
+    # startup, RCON, recruiting, tickets, or personnel automation.
     if not commands_synced:
-        try:
-            await _sync_command_tree_if_changed()
-            commands_synced = True
-        except Exception:
-            log.exception('[COMMAND SYNC FAILED]')
+        commands_synced = True
+
+        async def _background_command_sync():
+            try:
+                await _sync_command_tree_if_changed()
+            except Exception:
+                log.exception('[COMMAND SYNC FAILED]')
+
+        asyncio.create_task(_background_command_sync(), name="command-tree-sync")
 
     # V103: /apply must also be usable from a direct chat with Battalion Clerk.
     # Guild command sync cannot publish DM commands, so upsert this one public
