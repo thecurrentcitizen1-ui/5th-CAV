@@ -1872,6 +1872,166 @@ RETIRED_SLASH_COMMANDS = {
 }
 
 
+# V112 — compact command surface. Existing callbacks/checks are preserved; only
+# publication hierarchy changes. Member-facing commands remain easy to discover,
+# while administrative controls live under functional groups.
+COMMAND_GROUP_LAYOUT = {
+    "setup": {
+        "description": "Discord structure, permissions, welcome routing, and recovery setup.",
+        "commands": {
+            "setup-roles": "roles",
+            "setup-channels": "channels",
+            "battalion-setup": "battalion",
+            "structure-status": "status",
+            "structure-repair": "repair",
+            "permissions-repair": "permissions",
+            "reset-battalion-roles": "reset-roles",
+            "welcome-channel": "welcome-channel",
+            "welcome-channel-status": "welcome-status",
+            "welcome-channel-clear": "welcome-clear",
+            "welcome-preview": "welcome-preview",
+            "discord-routing-reset": "routing-reset",
+            "discord-routing-status": "routing-status",
+            "discord-routing-resume": "routing-resume",
+        },
+    },
+    "operations": {
+        "description": "Operations, duty periods, reminders, orders, and server messaging.",
+        "commands": {
+            "schedule-operation": "schedule",
+            "schedule-nco-meeting": "nco-meeting",
+            "operation-reminder-channel": "reminder-channel",
+            "operation-reminder-times": "reminder-times",
+            "operation-reminder-status": "reminder-status",
+            "operation-duty-channel": "duty-channel",
+            "operation-duty-status": "duty-channel-status",
+            "publish-operation-duty": "publish-duty",
+            "orders-channel": "orders-channel",
+            "orders-channel-status": "orders-status",
+            "duty-channel": "voice-channel",
+            "duty-channel-status": "voice-status",
+            "duty-status": "duty-status",
+            "close-duty": "close-duty",
+            "server-message": "server-message",
+            "server-message-clear": "clear-message",
+            "post-operation-report-channel": "report-channel",
+        },
+    },
+    "personnel": {
+        "description": "Personnel health, identity, progression, orders, and accountability controls.",
+        "commands": {
+            "personnel-status": "status",
+            "personnel-reprocess": "reprocess",
+            "personnel-health": "health",
+            "reissue-login": "reissue-login",
+            "personnel-orders-channel": "orders-channel",
+            "personnel-orders-status": "orders-status",
+            "personnel-orders-clear": "orders-clear",
+            "activity-channel-add": "activity-add",
+            "activity-channel-remove": "activity-remove",
+            "activity-channel-status": "activity-status",
+            "first30-channel": "first30-channel",
+            "first30-status": "first30-status",
+            "inactivity-report-channel": "inactivity-channel",
+            "inactivity-thresholds": "inactivity-thresholds",
+            "suspense-channel": "suspense-channel",
+            "progression-audit": "progression-audit",
+            "promotion-report-channel": "promotion-channel",
+            "nco-accountability-channel": "nco-accountability",
+            "unlink-member-game": "unlink-game",
+            "hll-link-soldier": "link-game",
+        },
+    },
+    "training": {
+        "description": "Training scheduling, rosters, attendance credit, and closeout.",
+        "commands": {
+            "schedule-training": "schedule",
+            "training-events": "events",
+            "training-roster": "roster",
+            "training-credit": "credit",
+            "close-training": "close",
+            "cancel-training": "cancel",
+        },
+    },
+    "recruiting": {
+        "description": "Recruiting intake health, applicant status, and recruiting credit.",
+        "commands": {
+            "recruit-intake-health": "health",
+            "application-system-check": "system-check",
+            "application-status": "status",
+            "claim-recruit": "claim",
+        },
+    },
+    "helpdesk": {
+        "description": "Help Desk routing, panel publication, archives, and status.",
+        "commands": {
+            "request-channel": "request-channel",
+            "request-channel-status": "request-status",
+            "helpdesk-panel": "panel",
+            "helpdesk-archive": "archive",
+            "helpdesk-status": "status",
+        },
+    },
+    "brief": {
+        "description": "Weekly Battalion Brief setup, preview, posting, and status.",
+        "commands": {
+            "battalionbrief-setup": "setup",
+            "battalionbrief-status": "status",
+            "battalionbrief-preview": "preview",
+            "battalionbrief-post": "post",
+            "battalionbrief-off": "off",
+        },
+    },
+    "combat": {
+        "description": "Ready Room combat-roster generation, routing, and diagnostics.",
+        "commands": {
+            "combat-setup": "setup",
+            "combat-channel": "channel",
+            "combat-toggle": "toggle",
+            "combat-side": "side",
+            "combat-status": "status",
+            "combat-system-check": "check",
+            "combat-generate": "generate",
+            "combat-return": "return",
+        },
+    },
+}
+
+
+def _consolidate_slash_command_groups():
+    moved=[]
+    for group_name, spec in COMMAND_GROUP_LAYOUT.items():
+        existing=bot.tree.get_command(group_name)
+        if existing is not None and not isinstance(existing, app_commands.Group):
+            log.warning("[COMMAND GROUP SKIP] root name already occupied group=%s", group_name)
+            continue
+        group=existing or app_commands.Group(name=group_name, description=spec["description"])
+        added_group=existing is None
+
+        for root_name, sub_name in spec["commands"].items():
+            cmd=bot.tree.remove_command(root_name)
+            if cmd is None:
+                continue
+            try:
+                cmd.name=sub_name
+                group.add_command(cmd, override=True)
+                moved.append(f"{root_name}->{group_name} {sub_name}")
+            except Exception:
+                log.exception("[COMMAND GROUP MOVE FAILED] command=%s group=%s sub=%s", root_name, group_name, sub_name)
+                try:
+                    cmd.name=root_name
+                    bot.tree.add_command(cmd, override=True)
+                except Exception:
+                    log.exception("[COMMAND GROUP RESTORE FAILED] command=%s", root_name)
+
+        if added_group and len(group.commands):
+            bot.tree.add_command(group, override=True)
+
+    if moved:
+        log.info("[COMMAND GROUPS] consolidated %s root commands: %s", len(moved), ", ".join(moved))
+    return moved
+
+
 def _retire_obsolete_slash_commands():
     retired=[]
     for name in sorted(RETIRED_SLASH_COMMANDS):
@@ -1934,6 +2094,7 @@ def _command_outline(commands):
 async def _sync_command_tree_if_changed():
     """One canonical Discord command publisher, persisted across bot restarts."""
     _retire_obsolete_slash_commands()
+    _consolidate_slash_command_groups()
     await collector.start()
     await collector.db.execute(
         """
@@ -2004,6 +2165,67 @@ async def _sync_command_tree_if_changed():
             scope_key, len(local_commands),
         )
         return local_commands
+
+    # V112 recovery path: if Discord has only a fragment of the guild tree,
+    # publish each current root command through the create/upsert route instead of
+    # repeatedly hammering the bulk-overwrite PUT bucket. Discord treats a create
+    # using an existing command name as an overwrite, so this safely repairs a
+    # partially-published tree while preserving each command's callback/checks.
+    severe_partial = bool(guild_obj) and len(remote_commands) <= 5 and len(local_commands) > len(remote_commands) + 5
+    if severe_partial:
+        application_id=int(getattr(bot, "application_id", 0) or (bot.user.id if bot.user else 0))
+        if not application_id:
+            raise RuntimeError("Discord application ID unavailable for incremental command recovery")
+        post_route=discord.http.Route(
+            "POST",
+            "/applications/{application_id}/guilds/{guild_id}/commands",
+            application_id=application_id,
+            guild_id=int(COMMAND_GUILD_ID),
+        )
+        published=0
+        for cmd in local_commands:
+            payload=_command_definition(cmd)
+            await bot.http.request(post_route, json=payload)
+            published += 1
+
+        refreshed=list(await bot.tree.fetch_commands(guild=guild_obj))
+        refreshed_names={str(getattr(cmd,"name","") or "") for cmd in refreshed}
+        stale=[cmd for cmd in refreshed if str(getattr(cmd,"name","") or "") not in local_names]
+        for cmd in stale:
+            command_id=int(getattr(cmd,"id",0) or 0)
+            if not command_id:
+                continue
+            delete_route=discord.http.Route(
+                "DELETE",
+                "/applications/{application_id}/guilds/{guild_id}/commands/{command_id}",
+                application_id=application_id,
+                guild_id=int(COMMAND_GUILD_ID),
+                command_id=command_id,
+            )
+            await bot.http.request(delete_route)
+
+        final_remote=list(await bot.tree.fetch_commands(guild=guild_obj))
+        final_names={str(getattr(cmd,"name","") or "") for cmd in final_remote}
+        missing_after=sorted(name for name in (local_names-final_names) if name)
+        if missing_after:
+            raise RuntimeError(f"Incremental Discord command recovery incomplete; missing={missing_after}")
+
+        await collector.db.execute(
+            """
+            INSERT INTO clerk_command_sync_state(scope_key,fingerprint,command_count,synced_at)
+            VALUES($1,$2,$3,NOW())
+            ON CONFLICT(scope_key) DO UPDATE SET
+                fingerprint=EXCLUDED.fingerprint,
+                command_count=EXCLUDED.command_count,
+                synced_at=NOW()
+            """,
+            scope_key, local_fp, len(final_remote),
+        )
+        log.info(
+            "[COMMAND SYNC] incremental recovery complete scope=%s published=%s remote=%s",
+            scope_key, published, len(final_remote),
+        )
+        return final_remote
 
     synced = await bot.tree.sync(guild=guild_obj)
     await collector.db.execute(
