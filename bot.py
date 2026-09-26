@@ -1197,12 +1197,65 @@ async def get_orders_channel_id(guild_id: int) -> Optional[int]:
     return int(value) if value else (HEADQUARTERS_ORDERS_CHANNEL_ID or None)
 
 
-def _canonical_publication_channel(guild: discord.Guild, kind: str):
-    """Resolve the canonical public channel by stable ID first, then name.
+def _publication_name_tokens(value: str):
+    return set(re.findall(r"[a-z0-9]+", str(value or "").lower()))
 
-    This never bypasses the persistent routing pause. Callers must check pause before
-    using it. The name fallback makes the repair survive a future channel recreation.
-    """
+
+def _semantic_publication_channel(guild: discord.Guild, kind: str):
+    """Resolve only a unique, high-confidence battalion publication channel."""
+    kind=(kind or '').upper()
+    scored=[]
+    for channel in guild.text_channels:
+        name=_publication_name_tokens(channel.name)
+        category=_publication_name_tokens(channel.category.name if channel.category else "")
+        # Official battalion publications must never fall into company/platoon/squad spaces.
+        if {"company","platoon","squad"} & category:
+            continue
+        score=0
+        if "battalion" in category and "headquarters" in category:
+            score += 25
+        elif "headquarters" in category:
+            score += 12
+
+        if kind in {'AWARD','PROMOTION'}:
+            if {"promotions","awards"} <= name or {"promotion","award"} <= name:
+                score += 50
+            elif "honors" in name:
+                score += 30
+            elif "awards" in name or "promotions" in name:
+                score += 18
+        else:
+            if {"personnel","orders"} <= name:
+                score += 55
+            elif {"battalion","orders"} <= name:
+                score += 35
+            elif {"headquarters","orders"} <= name:
+                score += 35
+            elif "orders" in name and "personnel" in category:
+                score += 25
+
+        if score >= 35:
+            scored.append((score,channel))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item:item[0],reverse=True)
+    if len(scored)>1 and scored[0][0]==scored[1][0]:
+        log.warning(
+            '[PUBLICATION ROUTE AMBIGUOUS] kind=%s candidates=%s',
+            kind,','.join(f'{ch.name}:{score}' for score,ch in scored[:5]),
+        )
+        return None
+    score,channel=scored[0]
+    log.info(
+        '[PUBLICATION ROUTE RECOVERED] kind=%s channel=%s category=%s score=%s',
+        kind,channel.name,channel.category.name if channel.category else 'NONE',score,
+    )
+    return channel
+
+
+def _canonical_publication_channel(guild: discord.Guild, kind: str):
+    """Resolve the canonical public channel by stable ID, exact name, then semantics."""
     kind=(kind or '').upper()
     if kind in {'AWARD','PROMOTION'}:
         cid=HONORS_PROMOTIONS_CHANNEL_ID; name=HONORS_PROMOTIONS_CHANNEL_NAME
@@ -1211,7 +1264,10 @@ def _canonical_publication_channel(guild: discord.Guild, kind: str):
     channel=guild.get_channel(cid) if cid else None
     if isinstance(channel, discord.TextChannel):
         return channel
-    return discord.utils.get(guild.text_channels, name=name)
+    channel=discord.utils.get(guild.text_channels, name=name)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return _semantic_publication_channel(guild,kind)
 
 
 async def resolve_personnel_order_channel(guild: discord.Guild, kind: str, routes: dict):
