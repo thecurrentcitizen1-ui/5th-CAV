@@ -4720,11 +4720,25 @@ async def system_health_summary(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True,thinking=True)
     try:
         data=await web.request('GET','/internal/clerk/system-health',params={'guild_id':interaction.guild_id})
-        state=str(data.get('overall') or 'UNKNOWN').upper(); icon={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(state,'⚪')
+        state=str(data.get('overall') or 'UNKNOWN').upper()
+        local_warnings=[]
+        blocked_count=len(_recruit_auto_join_backoff)
+        if blocked_count:
+            local_warnings.append(
+                f"🟠 **RECRUIT AUTO-JOIN** — WARN\n{blocked_count} recruit(s) are blocked on Discord OAuth `guilds.join`; retries are throttled to once every 30 minutes and manual guild joins reconcile immediately."
+            )
+        if not HLL_VIP_SYNC_ENABLED:
+            local_warnings.append(
+                "🟠 **HLL VIP SYNC** — DISABLED\nReserved-slot/VIP mirroring is intentionally disabled because the installed HLL: Vietnam RCON build does not expose the required VIP command. Normal match telemetry remains active."
+            )
+        if local_warnings and state == 'OK':
+            state='WARN'
+        icon={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(state,'⚪')
         lines=[f'**{icon} BATTALION SYSTEM HEALTH — {state}**']
-        for c in data.get('checks') or []:
-            st=str(c.get('status') or 'UNKNOWN').upper(); e={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(st,'⚪')
-            lines.append(f"{e} **{c.get('name') or 'SYSTEM'}** — {st}\n{c.get('detail') or 'No detail.'}")
+        for check in data.get('checks') or []:
+            st=str(check.get('status') or 'UNKNOWN').upper(); e={'OK':'🟢','WARN':'🟠','FAIL':'🔴'}.get(st,'⚪')
+            lines.append(f"{e} **{check.get('name') or 'SYSTEM'}** — {st}\n{check.get('detail') or 'No detail.'}")
+        lines.extend(local_warnings)
         await interaction.followup.send(('\n\n'.join(lines))[:1950],ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f'🔴 **SYSTEM HEALTH UNAVAILABLE**\nWebsite health endpoint could not be reached: `{str(exc)[:300]}`',ephemeral=True)
