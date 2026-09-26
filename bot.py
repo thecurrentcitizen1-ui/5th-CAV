@@ -2107,15 +2107,13 @@ async def _sync_command_tree_if_changed():
         """
     )
 
-    if COMMAND_GUILD_ID:
-        guild_obj = discord.Object(id=COMMAND_GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
-        local_commands = list(bot.tree.get_commands(guild=guild_obj))
-        scope_key = f"GUILD:{COMMAND_GUILD_ID}"
-    else:
-        guild_obj = None
-        local_commands = list(bot.tree.get_commands())
-        scope_key = "GLOBAL"
+    # V113: publish the canonical command tree globally. The production guild
+    # command bucket has been repeatedly throttled by Discord after historical
+    # bulk overwrites. Global application commands use a separate publication route
+    # and remain available in the 5th Cav guild; guild-only checks still enforce use.
+    guild_obj = None
+    local_commands = list(bot.tree.get_commands())
+    scope_key = "GLOBAL"
 
     local_fp = _command_fingerprint(local_commands)
     state = await collector.db.fetchrow(
@@ -2171,17 +2169,24 @@ async def _sync_command_tree_if_changed():
     # repeatedly hammering the bulk-overwrite PUT bucket. Discord treats a create
     # using an existing command name as an overwrite, so this safely repairs a
     # partially-published tree while preserving each command's callback/checks.
-    severe_partial = bool(guild_obj) and len(remote_commands) <= 5 and len(local_commands) > len(remote_commands) + 5
+    severe_partial = len(remote_commands) <= 5 and len(local_commands) > len(remote_commands) + 5
     if severe_partial:
         application_id=int(getattr(bot, "application_id", 0) or (bot.user.id if bot.user else 0))
         if not application_id:
             raise RuntimeError("Discord application ID unavailable for incremental command recovery")
-        post_route=discord.http.Route(
-            "POST",
-            "/applications/{application_id}/guilds/{guild_id}/commands",
-            application_id=application_id,
-            guild_id=int(COMMAND_GUILD_ID),
-        )
+        if guild_obj:
+            post_route=discord.http.Route(
+                "POST",
+                "/applications/{application_id}/guilds/{guild_id}/commands",
+                application_id=application_id,
+                guild_id=int(COMMAND_GUILD_ID),
+            )
+        else:
+            post_route=discord.http.Route(
+                "POST",
+                "/applications/{application_id}/commands",
+                application_id=application_id,
+            )
         published=0
         for cmd in local_commands:
             payload=_command_definition(cmd)
@@ -2195,13 +2200,21 @@ async def _sync_command_tree_if_changed():
             command_id=int(getattr(cmd,"id",0) or 0)
             if not command_id:
                 continue
-            delete_route=discord.http.Route(
-                "DELETE",
-                "/applications/{application_id}/guilds/{guild_id}/commands/{command_id}",
-                application_id=application_id,
-                guild_id=int(COMMAND_GUILD_ID),
-                command_id=command_id,
-            )
+            if guild_obj:
+                delete_route=discord.http.Route(
+                    "DELETE",
+                    "/applications/{application_id}/guilds/{guild_id}/commands/{command_id}",
+                    application_id=application_id,
+                    guild_id=int(COMMAND_GUILD_ID),
+                    command_id=command_id,
+                )
+            else:
+                delete_route=discord.http.Route(
+                    "DELETE",
+                    "/applications/{application_id}/commands/{command_id}",
+                    application_id=application_id,
+                    command_id=command_id,
+                )
             await bot.http.request(delete_route)
 
         final_remote=list(await bot.tree.fetch_commands(guild=guild_obj))
@@ -2239,7 +2252,7 @@ async def _sync_command_tree_if_changed():
         """,
         scope_key, local_fp, len(synced),
     )
-    source = "TEST_GUILD_ID" if (COMMAND_GUILD_ID and TEST_GUILD_ID) else ("GUILD_ID" if COMMAND_GUILD_ID else "GLOBAL")
+    source = ("TEST_GUILD_ID" if TEST_GUILD_ID else "GUILD_ID") if guild_obj else "GLOBAL"
     log.info(
         "[COMMAND SYNC] published changed tree scope=%s synced=%s source=%s",
         scope_key, len(synced), source,

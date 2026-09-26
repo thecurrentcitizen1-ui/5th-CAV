@@ -621,9 +621,13 @@ class TicketControlView(discord.ui.View):
 
 
 async def _install_commands(bot: commands.Bot):
-    guild_obj = discord.Object(id=GUILD_ID) if GUILD_ID else None
+    # V113: register ticket commands in the global application tree. They remain
+    # guild-only at interaction time, but no longer depend on the throttled guild
+    # command publication bucket.
+    guild_obj = None
 
     @app_commands.command(name="ticket", description="Open a private Battalion Clerk support ticket.")
+    @app_commands.guild_only()
     async def ticket(interaction: discord.Interaction):
         await interaction.response.send_message(
             "Choose the support category that best matches your issue.",
@@ -632,6 +636,7 @@ async def _install_commands(bot: commands.Bot):
         )
 
     @app_commands.command(name="ticket-panel", description="Post the Battalion Clerk support ticket panel.")
+    @app_commands.guild_only()
     async def ticket_panel(interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member) or not _is_command(interaction.user):
             await interaction.response.send_message("Battalion Command authorization required.", ephemeral=True)
