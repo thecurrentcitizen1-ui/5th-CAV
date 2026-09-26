@@ -2012,7 +2012,7 @@ def fmt_duration(total_seconds: int) -> str:
 def begin_session(member: discord.Member, channel: discord.abc.GuildChannel, started_at: datetime, recovered: bool = False):
     voice_sessions[(member.guild.id, member.id)] = {
         'started_at': started_at,
-        'channel_id': str(channel.id),
+        'channel_id': int(channel.id),
         'channel_name': channel.name,
         'recovered': recovered,
     }
