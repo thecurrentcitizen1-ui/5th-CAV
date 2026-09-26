@@ -60,8 +60,8 @@ ASSIGNMENT_ROLE_SYNC_ENABLED = str(os.getenv('ASSIGNMENT_ROLE_SYNC_ENABLED','fal
 # awards, promotions, or Headquarters orders from reaching their public channels.
 HONORS_PROMOTIONS_CHANNEL_ID = int(os.getenv('HONORS_PROMOTIONS_CHANNEL_ID', '1537242629131993159') or 0)
 HEADQUARTERS_ORDERS_CHANNEL_ID = int(os.getenv('HEADQUARTERS_ORDERS_CHANNEL_ID', '1534357136858157157') or 0)
-HONORS_PROMOTIONS_CHANNEL_NAME = os.getenv('HONORS_PROMOTIONS_CHANNEL_NAME', 'honors-and-promotions').strip() or 'honors-and-promotions'
-HEADQUARTERS_ORDERS_CHANNEL_NAME = os.getenv('HEADQUARTERS_ORDERS_CHANNEL_NAME', 'orders-from-headquarters').strip() or 'orders-from-headquarters'
+HONORS_PROMOTIONS_CHANNEL_NAME = os.getenv('HONORS_PROMOTIONS_CHANNEL_NAME', 'promotions-and-awards').strip() or 'promotions-and-awards'
+HEADQUARTERS_ORDERS_CHANNEL_NAME = os.getenv('HEADQUARTERS_ORDERS_CHANNEL_NAME', 'personnel-orders').strip() or 'personnel-orders'
 
 
 intents = discord.Intents.none()
@@ -101,6 +101,9 @@ announcement_reminder_sent = set()
 training_event_message_cache = {}  # (guild_id, message_id) -> training event id
 announcement_start_sent = set()
 announcement_end_sent = set()
+# Missing publication routes are actionable configuration faults, not per-document
+# faults. Throttle duplicate warnings so one missing route cannot flood Railway logs.
+personnel_order_route_warning_at: Dict[Tuple[int, str], datetime] = {}
 
 # Live Match Formation state is persisted in PostgreSQL; this in-memory set only
 # prevents overlapping work inside one bot process.
@@ -1611,7 +1614,7 @@ async def before_clerk_health_watch():
 
 @tasks.loop(seconds=60)
 async def personnel_orders_watch():
-    """Post newly filed personnel orders to the Discord channels selected by command."""
+    """Post pending personnel orders without flooding Discord after route recovery."""
     for guild in bot.guilds:
         if GUILD_ID and guild.id != GUILD_ID: continue
         try:
@@ -1619,11 +1622,21 @@ async def personnel_orders_watch():
                 continue
             routes = await get_order_routes(guild.id)
             payload = await web.request('GET','/internal/clerk/orders/pending',params={'guild_id':guild.id})
-            for order in payload.get('orders',[]):
+            orders = list(payload.get('orders') or [])
+            posted_this_pass = 0
+            for order in orders:
                 kind = str(order.get('document_type') or '').upper()
                 channel = await resolve_personnel_order_channel(guild, kind, routes)
                 if not isinstance(channel, discord.TextChannel):
-                    log.warning('[PERSONNEL ORDERS] no channel resolved guild=%s type=%s',guild.id,kind)
+                    key=(guild.id,kind)
+                    now=utc_now()
+                    last=personnel_order_route_warning_at.get(key)
+                    if not last or (now-last).total_seconds() >= 1800:
+                        personnel_order_route_warning_at[key]=now
+                        log.warning(
+                            '[PERSONNEL ORDERS ROUTE MISSING] guild=%s type=%s pending_window=%s expected=%s',
+                            guild.id,kind,len(orders),HEADQUARTERS_ORDERS_CHANNEL_NAME,
+                        )
                     continue
                 soldier = f"{order.get('rank_code') or ''} {order.get('first_name') or ''} {order.get('last_name') or ''}".strip()
                 body = (f"**HEADQUARTERS — 1ST BATTALION, 5TH CAVALRY REGIMENT**\n"
@@ -1635,8 +1648,12 @@ async def personnel_orders_watch():
                         f"**{order.get('authority') or 'BY ORDER OF THE BATTALION COMMANDER'}**")
                 await channel.send(body[:2000])
                 await web.request('POST',f"/internal/clerk/orders/{order['id']}/posted",json={'guild_id':guild.id})
+                posted_this_pass += 1
+                if posted_this_pass >= 3:
+                    log.info('[PERSONNEL ORDERS] backlog drain capped guild=%s posted=%s pending_window=%s',guild.id,posted_this_pass,len(orders))
+                    break
         except Exception as exc:
-            log.warning('[PERSONNEL ORDERS] guild=%s error=%s',guild.id,exc)
+            log.warning('[PERSONNEL ORDERS] guild=%s error=%r type=%s',guild.id,exc,type(exc).__name__)
 
 @tasks.loop(minutes=10)
 async def operation_maintenance_watch():
@@ -4133,7 +4150,7 @@ async def repair_publication_routing(interaction: discord.Interaction):
     if not await require_manage_guild(interaction): return
     if await discord_routing_is_paused(interaction.guild_id):
         await interaction.response.send_message(
-            'Discord routing is currently **PAUSED**. Run `/discord-routing-resume confirm:RESUME DISCORD ROUTING` first; this repair will not bypass the safety switch.',
+            'Discord routing is currently **PAUSED**. Run `/setup routing-resume confirm:RESUME DISCORD ROUTING` first; this repair will not bypass the safety switch.',
             ephemeral=True,
         )
         return
@@ -4153,7 +4170,7 @@ async def repair_publication_routing(interaction: discord.Interaction):
     for kind in ('REPLACEMENT','ASSIGNMENT','APPOINTMENT','LEAVE','RETURN','SEPARATION','TOUR EXTENSION','TRAINING','QUALIFICATION'):
         await set_order_route(interaction.guild_id,kind,orders.id)
     await interaction.response.send_message(
-        f'**PUBLICATION ROUTING REPAIRED**\nAwards + promotions → {honors.mention}\nHeadquarters/personnel orders → {orders.mention}\n\nCustom per-type routes can still be changed afterward with `/personnel-orders-channel`.',
+        f'**PUBLICATION ROUTING REPAIRED**\nAwards + promotions → {honors.mention}\nHeadquarters/personnel orders → {orders.mention}\n\nCustom per-type routes can still be changed afterward with `/personnel orders-channel`.',
         ephemeral=True,
     )
 
@@ -8483,7 +8500,7 @@ async def progression_reconcile_watch():
                      result.get('ribbons_rechecked'),result.get('ribbons_awarded'),
                      result.get('promotion_paths_rechecked'))
     except Exception as exc:
-        log.warning('[PROGRESSION RECONCILE FAILED] error=%s',exc)
+        log.warning('[PROGRESSION RECONCILE FAILED] error=%r type=%s',exc,type(exc).__name__)
 
 @progression_reconcile_watch.before_loop
 async def before_progression_reconcile_watch():
@@ -8537,7 +8554,14 @@ async def promotion_eligibility_watch():
                     except discord.Forbidden: pass
                 ch=await get_report_channel(guild,'PROMOTION_ELIGIBILITY')
                 if ch: await ch.send(text)
-        except Exception as exc: log.warning('[PROMOTION ELIGIBILITY WATCH FAILED] guild=%s error=%s',guild.id,exc)
+        except Exception as exc: log.warning('[PROMOTION ELIGIBILITY WATCH FAILED] guild=%s error=%r type=%s',guild.id,exc,type(exc).__name__)
+
+@promotion_eligibility_watch.before_loop
+async def before_promotion_eligibility_watch():
+    await bot.wait_until_ready()
+    # Avoid colliding with the roster-wide 5-minute progression reconciliation.
+    await asyncio.sleep(90)
+
 
 @bot.tree.command(name='post-operation-report-channel', description='Assign where automatic post-operation processing summaries are posted.')
 async def post_operation_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):

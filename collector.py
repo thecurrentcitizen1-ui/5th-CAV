@@ -76,7 +76,7 @@ class DataCollector:
                     discord_user_id BIGINT NOT NULL,
                     username TEXT,
                     display_name TEXT,
-                    channel_id TEXT,
+                    channel_id BIGINT,
                     channel_name TEXT,
                     started_at TIMESTAMPTZ NOT NULL,
                     ended_at TIMESTAMPTZ NOT NULL,
@@ -95,6 +95,22 @@ class DataCollector:
             await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS close_reason TEXT")
             await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS recovered_after_restart BOOLEAN NOT NULL DEFAULT FALSE")
             await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+            # Normalize legacy TEXT channel IDs to Discord snowflake BIGINTs. Empty
+            # legacy values become NULL; valid Discord IDs are preserved exactly.
+            await self.db.execute("""
+                DO $
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='voice_sessions'
+                          AND column_name='channel_id' AND data_type <> 'bigint'
+                    ) THEN
+                        ALTER TABLE voice_sessions
+                        ALTER COLUMN channel_id TYPE BIGINT
+                        USING NULLIF(BTRIM(channel_id::text),'')::bigint;
+                    END IF;
+                END $;
+            """)
             await self.db.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_member ON voice_sessions(guild_id,discord_user_id,ended_at DESC)")
             await self.db.execute("""CREATE TABLE IF NOT EXISTS activity_voice_channels (guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, channel_name TEXT, added_by BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,channel_id))""")
             log.info("[SCHEMA READY] discord_members and voice_sessions verified")
@@ -116,7 +132,7 @@ class DataCollector:
                     VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz,$8::timestamptz,$9,$10,$11)
                 """, int(payload.get("guild_id")), int(payload.get("discord_user_id")),
                      payload.get("username"), payload.get("display_name"),
-                     str(payload.get("channel_id") or ""), payload.get("channel_name"),
+                     int(payload.get("channel_id") or 0), payload.get("channel_name"),
                      payload.get("started_at"), payload.get("ended_at"),
                      int(payload.get("duration_seconds") or 0), payload.get("close_reason"),
                      bool(payload.get("recovered_after_restart")))
