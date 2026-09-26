@@ -3520,7 +3520,7 @@ async def before_training_scheduler_watch():
 async def setup_roles(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
     if not confirm:
-        await interaction.response.send_message('No changes made. Run `/setup-roles confirm:True` when ready.',ephemeral=True); return
+        await interaction.response.send_message('No changes made. Run `/setup roles confirm:True` when ready.',ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     try:
         result=await build_battalion_roles(interaction.guild)
@@ -3538,7 +3538,7 @@ async def setup_roles(interaction: discord.Interaction, confirm: bool):
 async def setup_channels(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
     if not confirm:
-        await interaction.response.send_message('No changes made. Run `/setup-channels confirm:True` when ready.',ephemeral=True); return
+        await interaction.response.send_message('No changes made. Run `/setup channels confirm:True` when ready.',ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     try:
         # Access overwrites depend on the roles existing, so make sure the role blueprint exists first.
@@ -3757,7 +3757,7 @@ async def organization_cleanup_command(interaction: discord.Interaction, confirm
 async def battalion_setup(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
     if not confirm:
-        await interaction.response.send_message('No changes made. Run `/battalion-setup confirm:True` when you are ready to construct the server.',ephemeral=True); return
+        await interaction.response.send_message('No changes made. Run `/setup battalion confirm:True` when you are ready to construct the server.',ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     try:
         roles=await build_battalion_roles(interaction.guild)
@@ -3801,7 +3801,7 @@ async def structure_status(interaction: discord.Interaction):
 async def structure_repair(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
     if not confirm:
-        await interaction.response.send_message('No changes made. Run `/structure-repair confirm:True` to repair missing structure.',ephemeral=True); return
+        await interaction.response.send_message('No changes made. Run `/setup repair confirm:True` to repair missing structure.',ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     roles=await build_battalion_roles(interaction.guild)
     channels=await build_battalion_channels(interaction.guild)
@@ -3816,7 +3816,7 @@ async def structure_repair(interaction: discord.Interaction, confirm: bool):
 async def permissions_repair(interaction: discord.Interaction, confirm: bool):
     if not await require_manage_guild(interaction): return
     if not confirm:
-        await interaction.response.send_message('No changes made. Run `/permissions-repair confirm:True` when ready.', ephemeral=True); return
+        await interaction.response.send_message('No changes made. Run `/setup permissions confirm:True` when ready.', ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     roles=await build_battalion_roles(interaction.guild)
     channels=await build_battalion_channels(interaction.guild)
@@ -3860,14 +3860,14 @@ async def reset_battalion_roles_command(interaction: discord.Interaction, confir
     if not await require_manage_guild(interaction): return
     if confirmation.strip().upper() != 'RESET ROLES':
         await interaction.response.send_message(
-            'No changes made. To confirm the destructive reset, run `/reset-battalion-roles confirmation:RESET ROLES`.',
+            'No changes made. To confirm the destructive reset, run `/setup reset-roles confirmation:RESET ROLES`.',
             ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     result=await reset_battalion_roles(interaction.guild)
     msg=(f"**MANAGED ROLE RESET COMPLETE**\nDeleted: **{len(result['deleted'])}**\n"
          f"Skipped above Clerk: **{len(result['skipped'])}**\nFailures: **{len(result['failed'])}**\n\n"
          "Only Battalion Clerk blueprint roles/dividers were targeted. Categories and channels were left in place. "
-         "Run `/battalion-setup confirm:True` next to recreate the roles and reapply all strict access permissions.")
+         "Run `/setup battalion confirm:True` next to recreate the roles and reapply all strict access permissions.")
     if result['failed']:
         msg += "\n\n**Review:**\n" + "\n".join(f"• {x}" for x in result['failed'][:10])
     await interaction.followup.send(msg, ephemeral=True)
@@ -4015,7 +4015,7 @@ async def discord_routing_reset_command(interaction:discord.Interaction, confirm
             'Cleared: welcome channel, battalion orders, operation reminders, S-3 duty-roster route, personnel-order routes, report/helpdesk routes, seeding route, and Training/Operation/Meeting duty-channel bindings.\n\n'
             '**NOT TOUCHED:** Website personnel records, 201 Files, ranks, assignments, Discord links, roles, HLL telemetry, ribbons, promotions, credentials, or existing Discord channels.\n\n'
             'You may now move/rename channels and reassign routes with the normal setup commands. '
-            'When finished, run `/discord-routing-status` and then `/discord-routing-resume confirm:RESUME DISCORD ROUTING`.',ephemeral=True)
+            'When finished, run `/setup routing-status` and then `/setup routing-resume confirm:RESUME DISCORD ROUTING`.',ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f'Discord routing reset failed: `{str(exc)[:600]}`',ephemeral=True)
 
@@ -5079,7 +5079,7 @@ async def battalionbrief_setup(interaction:discord.Interaction,channel:discord.T
 async def battalionbrief_status(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     cfg=await _brief_config(interaction.guild_id)
-    if not cfg: await interaction.response.send_message('Weekly Battalion Brief is not configured. Run `/battalionbrief-setup`.',ephemeral=True); return
+    if not cfg: await interaction.response.send_message('Weekly Battalion Brief is not configured. Run `/brief setup`.',ephemeral=True); return
     ch=interaction.guild.get_channel(int(cfg.get('channel_id') or 0)); role=interaction.guild.get_role(int(cfg.get('mention_role_id') or 0)) if cfg.get('mention_role_id') else None
     day=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][int(cfg.get('weekday') or 0)]
     await interaction.response.send_message(f"**WEEKLY BATTALION BRIEF**\nChannel: {ch.mention if ch else 'MISSING'}\nSchedule: {day} {int(cfg.get('hour') or 0):02d}:{int(cfg.get('minute') or 0):02d} ({BATTALION_TIMEZONE})\nAutomatic posting: **{'ON' if cfg.get('enabled') else 'OFF'}**\nMention: {role.mention if role else 'None'}\nBattalion Fund: **{'INCLUDED' if cfg.get('include_fund') else 'HIDDEN'}**",ephemeral=True)
@@ -5100,7 +5100,7 @@ async def battalionbrief_post(interaction:discord.Interaction):
     ch=interaction.guild.get_channel(int((cfg or {}).get('channel_id') or 0)) if cfg else None
     if not isinstance(ch,discord.TextChannel):
         ch=await get_report_channel(interaction.guild,'WEEKLY_BATTALION_REPORT')
-    if not ch: await interaction.followup.send('No Battalion Brief channel is configured. Run `/battalionbrief-setup`.',ephemeral=True); return
+    if not ch: await interaction.followup.send('No Battalion Brief channel is configured. Run `/brief setup`.',ephemeral=True); return
     body=await _build_battalion_brief(interaction.guild,bool((cfg or {}).get('include_fund',True)))
     role=interaction.guild.get_role(int((cfg or {}).get('mention_role_id') or 0)) if (cfg or {}).get('mention_role_id') else None
     await ch.send(((role.mention+'\n') if role else '')+body)
@@ -5117,7 +5117,7 @@ async def weekly_battalion_report_channel(interaction:discord.Interaction, chann
     if not await require_manage_guild(interaction): return
     await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
     await _save_brief_config(interaction.guild_id,channel_id=channel.id,enabled=True)
-    await interaction.response.send_message(f'Weekly Battalion Brief channel set to {channel.mention}. Use `/battalionbrief-setup` to change the schedule.',ephemeral=True)
+    await interaction.response.send_message(f'Weekly Battalion Brief channel set to {channel.mention}. Use `/brief setup` to change the schedule.',ephemeral=True)
 
 @bot.tree.command(name='nco-accountability-channel', description='Set the channel for the weekly NCO/company member-attention rollup.')
 async def nco_accountability_channel(interaction:discord.Interaction, channel:discord.TextChannel):
@@ -5602,9 +5602,13 @@ async def on_ready():
         for member in guild.members:
             await collector.upsert_member(member)
             if not member.bot:
-                await sync_personnel_identity(member,create_if_missing=False,
-                    reason="guild_sync",deliver_credentials=False)
-                schedule_personnel_role_sync(member, reason="guild_roles_settled")
+                existing = await sync_personnel_identity(
+                    member,create_if_missing=False,reason="guild_sync",deliver_credentials=False
+                )
+                # Existing linked Soldiers have already completed their canonical sync.
+                # Only unresolved identities need the delayed accession/creation gate.
+                if not (existing and existing.get("linked")):
+                    schedule_personnel_role_sync(member, reason="guild_roles_settled")
             synced_members += 1
 
         # Retroactive/restart-safe seven-day NEW ARRIVAL role backfill.
@@ -6195,7 +6199,7 @@ async def combat_setup(interaction:discord.Interaction,ready_room:discord.VoiceC
           updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
         interaction.guild_id,ready_room.id,roster_channel.id,active,done,interaction.user.id)
     await collector.db.execute("UPDATE clerk_match_formation_config SET auto_side=TRUE,activation_baseline_match_id=NULL,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id)
-    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum roster muster: **6**\nAutomatic voice movement: **7+ eligible players**\nParticipation gate: **READY ROOM + LIVE HLL SERVER**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat-channel`.',ephemeral=True)
+    await interaction.followup.send(f'**COMBAT ROSTER ENABLED**\nReady Room: {ready_room.mention}\nRoster posts: {roster_channel.mention}\nMinimum roster muster: **6**\nAutomatic voice movement: **7+ eligible players**\nParticipation gate: **READY ROOM + LIVE HLL SERVER**\nSide detection: **AUTOMATIC FROM LIVE HLL SERVER**\n\nIf a match is already underway, Battalion Clerk will wait for it to end and will not move anyone until the next match.\n\nNow bind the 9 squad voice channels with `/combat channel`.',ephemeral=True)
 
 COMBAT_ELEMENT_CHOICES=[app_commands.Choice(name=k.replace('_',' ').title(),value=k) for k in COMBAT_ELEMENT_KEYS]
 @bot.tree.command(name='combat-channel', description='Bind one randomized combat element to its Discord voice channel.')
@@ -6207,7 +6211,7 @@ async def combat_channel(interaction:discord.Interaction,element:app_commands.Ch
     await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT combat_channels_json FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
+        await interaction.response.send_message('Run `/combat setup` first.',ephemeral=True); return
     bindings=_combat_bindings(dict(row)); bindings[element.value]=channel.id
     await collector.db.execute("UPDATE clerk_match_formation_config SET combat_channels_json=$2::jsonb,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,json.dumps(bindings),interaction.user.id)
     await interaction.response.send_message(f'**{element.name.upper()}** → {channel.mention}\nVoice routing saved.',ephemeral=True)
@@ -6221,7 +6225,7 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
     await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT guild_id FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.response.send_message('Run `/combat-setup` first.',ephemeral=True); return
+        await interaction.response.send_message('Run `/combat setup` first.',ephemeral=True); return
     enabled = state.value == 'ON'
     await collector.db.execute("UPDATE clerk_match_formation_config SET enabled=$2,activation_baseline_match_id=CASE WHEN $2 THEN NULL ELSE activation_baseline_match_id END,updated_by=$3,updated_at=NOW() WHERE guild_id=$1",interaction.guild_id,enabled,interaction.user.id)
     if enabled:
@@ -6231,7 +6235,7 @@ async def combat_toggle(interaction:discord.Interaction,state:app_commands.Choic
     else:
         msg=('**COMBAT ROSTER AUTOMATION: OFF**\n'
              'Battalion Clerk will not automatically generate rosters or move members when HLL rounds start/end.\n'
-             'Existing channel bindings and settings are preserved. `/combat-return` remains available if you need to bring everyone back manually.')
+             'Existing channel bindings and settings are preserved. `/combat return` remains available if you need to bring everyone back manually.')
     await interaction.response.send_message(msg,ephemeral=True)
 
 @bot.tree.command(name='combat-side', description='Choose automatic HLL side detection or a manual fallback.')
@@ -6253,7 +6257,7 @@ async def combat_side(interaction:discord.Interaction,side:app_commands.Choice[s
 async def combat_status(interaction:discord.Interaction):
     await ensure_match_formation_schema(); row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.response.send_message('Combat roster is not configured. Use `/combat-setup`.',ephemeral=True); return
+        await interaction.response.send_message('Combat roster is not configured. Use `/combat setup`.',ephemeral=True); return
     cfg=dict(row); ready=interaction.guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=interaction.guild.get_channel(int(cfg.get('text_channel_id') or 0)); bindings=_combat_bindings(cfg)
     lines=[]
     for key in COMBAT_ELEMENT_KEYS:
@@ -6273,7 +6277,7 @@ async def combat_system_check(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.followup.send('**COMBAT SYSTEM CHECK — NOT CONFIGURED**\nRun `/combat-setup` first.',ephemeral=True); return
+        await interaction.followup.send('**COMBAT SYSTEM CHECK — NOT CONFIGURED**\nRun `/combat setup` first.',ephemeral=True); return
     cfg=dict(row); guild=interaction.guild
     pending_id=cfg.get('pending_match_id'); pending_error=cfg.get('pending_last_error')
     ready=guild.get_channel(int(cfg.get('voice_channel_id') or 0)); text=guild.get_channel(int(cfg.get('text_channel_id') or 0))
@@ -6339,7 +6343,7 @@ async def combat_generate(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.followup.send('Run `/combat-setup` first.',ephemeral=True); return
+        await interaction.followup.send('Run `/combat setup` first.',ephemeral=True); return
     result=await _publish_match_formation(interaction.guild,dict(row),match_id=await _latest_active_hll_match_id(),automatic=False)
     if not result.get('ok'):
         await interaction.followup.send(result.get('error','Unable to build combat roster.'),ephemeral=True); return
@@ -6352,7 +6356,7 @@ async def combat_return(interaction:discord.Interaction):
     await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
     row=await collector.db.fetchrow("SELECT * FROM clerk_match_formation_config WHERE guild_id=$1",interaction.guild_id)
     if not row:
-        await interaction.followup.send('Run `/combat-setup` first.',ephemeral=True); return
+        await interaction.followup.send('Run `/combat setup` first.',ephemeral=True); return
     result=await _return_combat_members(interaction.guild,dict(row))
     await interaction.followup.send(f"Returned **{result['moved']}** member(s) to the Ready Room."+(f" Failures: {', '.join(result['failures'][:5])}" if result['failures'] else ''),ephemeral=True)
 
@@ -6370,7 +6374,7 @@ async def match_formation_setup(interaction:discord.Interaction,voice_channel:di
         ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=EXCLUDED.voice_channel_id,text_channel_id=EXCLUDED.text_channel_id,
           side_mode=EXCLUDED.side_mode,enabled=TRUE,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
         interaction.guild_id,voice_channel.id,text_channel.id,side.value,active,done,interaction.user.id)
-    await interaction.followup.send('Combat roster base configuration saved. Use `/combat-channel` for Infantry 1–3, Tank 1–3, and Helicopter 1–3.',ephemeral=True)
+    await interaction.followup.send('Combat roster base configuration saved. Use `/combat channel` for Infantry 1–3, Tank 1–3, and Helicopter 1–3.',ephemeral=True)
 
 @bot.tree.command(name='activity-channel-add', description='Allow a voice channel to count toward Soldier activity.')
 @app_commands.describe(channel='Voice channel to count as activity')
@@ -8987,7 +8991,7 @@ async def unlink_member_game(interaction:discord.Interaction, member:discord.Mem
             '**NO ACTIVE GAME IDENTITY FOUND**\n'
             f'Soldier: {member.mention}\n\n'
             'No verified HLL identity or pending console claim is currently filed for that Soldier. '
-            'They can use `/link-game`, or staff can use `/hll-link-soldier`.',
+            'They can use `/link-game`, or staff can use `/personnel link-game`.',
             ephemeral=True
         )
         return
@@ -8998,7 +9002,7 @@ async def unlink_member_game(interaction:discord.Interaction, member:discord.Mem
         f'Filed by: {interaction.user.mention}\n\n'
         'The Soldier’s current verified Steam/console link and any pending console claim were cleared. '
         '**Their Soldier Record and historical telemetry were preserved.**\n\n'
-        'Next step: have the Soldier run `/link-game`, or use `/hll-link-soldier` to file the correct identity for them.',
+        'Next step: have the Soldier run `/link-game`, or use `/personnel link-game` to file the correct identity for them.',
         ephemeral=True
     )
 
@@ -9261,7 +9265,7 @@ bot.tree.add_command(hll_group)
 _top_level_command_count = len(bot.tree.get_commands())
 if _top_level_command_count > 100:
     raise RuntimeError(f'Discord global slash-command budget exceeded: {_top_level_command_count}/100. Consolidate related commands into app_commands.Group before deploy.')
-log.info('[COMMAND BUDGET] top_level=%s/100 headroom=%s', _top_level_command_count, 100-_top_level_command_count)
+log.info('[COMMAND REGISTRY] raw_roots=%s/100; V112 publication grouping is applied after module registration', _top_level_command_count)
 
 if not TOKEN:
     raise RuntimeError('Discord bot token is not set. Add DISCORD_TOKEN in Railway Variables (DISCORD_BOT_TOKEN or BOT_TOKEN are also accepted).')
