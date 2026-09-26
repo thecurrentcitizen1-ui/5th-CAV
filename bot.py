@@ -1855,6 +1855,36 @@ web = WebsiteClient()
 
 _COMMAND_SYNC_VOLATILE_KEYS = {"id", "application_id", "guild_id", "version"}
 
+# V111 — keep Discord's slash-command surface limited to current workflows.
+# These commands are retained in source for compatibility/recovery but are no longer
+# published because they are legacy aliases, completed migration/setup utilities,
+# testing-only controls, or a feature currently unsupported by HLL: Vietnam RCON.
+RETIRED_SLASH_COMMANDS = {
+    "weekly-battalion-report-channel",  # legacy alias -> battalionbrief-setup
+    "match-formation-setup",            # legacy alias -> combat-setup
+    "hll-unlink",                       # legacy alias -> unlink-game
+    "hll-vip-sync",                     # unsupported by current HLLV RCON build
+    "test-recruit-intake",              # test-only
+    "accessions-backfill",              # one-time migration/backfill
+    "strict-access-rebuild",            # completed Discord structure migration
+    "reset-roster",                     # superseded by website-authoritative personnel state
+    "organization-cleanup",             # completed duplicate-role migration utility
+}
+
+
+def _retire_obsolete_slash_commands():
+    retired=[]
+    for name in sorted(RETIRED_SLASH_COMMANDS):
+        try:
+            removed=bot.tree.remove_command(name)
+            if removed is not None:
+                retired.append(name)
+        except Exception:
+            log.exception("[COMMAND RETIRE FAILED] name=%s", name)
+    if retired:
+        log.info("[COMMAND RETIRE] removed obsolete commands from publication: %s", ", ".join(retired))
+    return retired
+
 
 def _command_definition(value):
     """Return a stable Discord command definition without server-generated IDs."""
@@ -1903,6 +1933,7 @@ def _command_outline(commands):
 
 async def _sync_command_tree_if_changed():
     """One canonical Discord command publisher, persisted across bot restarts."""
+    _retire_obsolete_slash_commands()
     await collector.start()
     await collector.db.execute(
         """
