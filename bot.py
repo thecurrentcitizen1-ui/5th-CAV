@@ -1267,7 +1267,15 @@ def _canonical_publication_channel(guild: discord.Guild, kind: str):
     channel=discord.utils.get(guild.text_channels, name=name)
     if isinstance(channel, discord.TextChannel):
         return channel
-    return _semantic_publication_channel(guild,kind)
+    channel=_semantic_publication_channel(guild,kind)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    # Promotion/award documents are still official battalion orders. If the
+    # dedicated honors channel does not exist, use the same unique HQ orders
+    # channel proven safe for assignment/replacement paperwork.
+    if kind in {'AWARD','PROMOTION'}:
+        return _semantic_publication_channel(guild,'GENERAL')
+    return None
 
 
 async def resolve_personnel_order_channel(guild: discord.Guild, kind: str, routes: dict):
