@@ -86,6 +86,15 @@ class DataCollector:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            # Existing Railway databases may already have the original voice_sessions
+            # table. CREATE TABLE IF NOT EXISTS does not add columns introduced later,
+            # so reconcile every additive metadata column before voice events can fire.
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS username TEXT")
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS display_name TEXT")
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS channel_name TEXT")
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS close_reason TEXT")
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS recovered_after_restart BOOLEAN NOT NULL DEFAULT FALSE")
+            await self.db.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
             await self.db.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_member ON voice_sessions(guild_id,discord_user_id,ended_at DESC)")
             await self.db.execute("""CREATE TABLE IF NOT EXISTS activity_voice_channels (guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL, channel_name TEXT, added_by BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(guild_id,channel_id))""")
             log.info("[SCHEMA READY] discord_members and voice_sessions verified")
