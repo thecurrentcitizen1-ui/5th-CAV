@@ -6490,17 +6490,36 @@ async def _fetch_guild_member(guild: discord.Guild, user_id: int) -> Optional[di
         return None
 
 
+_recruit_auto_join_backoff: dict[str, datetime] = {}
+
+
 async def auto_join_approved_recruit(guild: discord.Guild, case: dict) -> Optional[discord.Member]:
     user_id=int(case.get('discord_user_id') or 0)
     if not user_id:
         return None
+    case_key=str(case.get('id') or case.get('case_number') or user_id)
+
+    # Presence in the guild always wins. A recruit who joins manually should be
+    # reconciled immediately even if an earlier OAuth auto-join attempt was blocked.
     existing=await _fetch_guild_member(guild,user_id)
     if existing:
+        _recruit_auto_join_backoff.pop(case_key,None)
         try:
             await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/join-status",json={'joined':True,'guild_id':guild.id})
         except Exception:
             pass
         return existing
+
+    # Missing guilds.join is a permanent authorization state until the recruit
+    # reconnects Discord. Do not hammer Website/Discord every 10 seconds. Retry
+    # only after a quiet 30-minute backoff, while still allowing manual guild join
+    # to clear the block immediately above.
+    now=utc_now()
+    retry_at=_recruit_auto_join_backoff.get(case_key)
+    if retry_at and retry_at>now:
+        return None
+    _recruit_auto_join_backoff.pop(case_key,None)
+
     try:
         auth=await web.request('GET',f"/internal/clerk/recruiting/{case.get('id')}/join-authorization")
         access_token=auth.get('access_token')
@@ -6522,9 +6541,17 @@ async def auto_join_approved_recruit(guild: discord.Guild, case: dict) -> Option
         log.info('[RECRUIT AUTO-JOINED] case=%s member=%s guild=%s',case.get('case_number'),user_id,guild.id)
         return member
     except Exception as exc:
-        log.warning('[RECRUIT AUTO-JOIN FAILED] case=%s user=%s error=%s',case.get('case_number'),user_id,exc)
+        error=str(exc)
+        if 'guilds.join' in error.lower():
+            _recruit_auto_join_backoff[case_key]=utc_now()+timedelta(minutes=30)
+            log.warning(
+                '[RECRUIT AUTO-JOIN BLOCKED] case=%s user=%s reason=missing guilds.join retry_after=30m',
+                case.get('case_number'),user_id,
+            )
+        else:
+            log.warning('[RECRUIT AUTO-JOIN FAILED] case=%s user=%s error=%s',case.get('case_number'),user_id,exc)
         try:
-            await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/join-status",json={'joined':False,'guild_id':guild.id,'error':str(exc)[:500]})
+            await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/join-status",json={'joined':False,'guild_id':guild.id,'error':error[:500]})
         except Exception:
             pass
         return None
