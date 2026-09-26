@@ -706,6 +706,11 @@ class HLLVTelemetryCollector:
     async def start(self):
         await self.collector.start()
         await self.ensure_schema()
+        # A disabled legacy collector exists only as a compatibility shell. It must
+        # not rerun roster-wide historical repairs before discovering it is disabled.
+        if not self.configured:
+            log.info("[HLLV RCON INACTIVE] slot=%s enabled=%s host=%s password=%s", self.server_slot, self.enabled, bool(self.host), bool(self.password))
+            return False
         try:
             credit=await self.reconcile_kill_round_credits()
             log.info("[HLL KILL ROUND BACKFILL] matches=%s players=%s rounds_applied=%s",credit.get("matches"),credit.get("players"),credit.get("rounds"))
@@ -716,9 +721,6 @@ class HLLVTelemetryCollector:
             log.info("[HLL COMMANDER RETROACTIVE REPAIR] filed=%s verified=%s pending=%s",commander.get("filed"),commander.get("verified"),commander.get("pending"))
         except Exception:
             log.exception("[HLL COMMANDER RETROACTIVE REPAIR FAILED]")
-        if not self.configured:
-            log.warning("[HLLV RCON DISABLED] slot=%s enabled=%s host=%s password=%s", self.server_slot, self.enabled, bool(self.host), bool(self.password))
-            return False
         if self.task and not self.task.done():
             return True
         try:
