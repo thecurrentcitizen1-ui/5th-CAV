@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import io
 import json
+import hashlib
 import random
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
@@ -1850,6 +1851,143 @@ class WebsiteClient:
 
 
 web = WebsiteClient()
+
+
+_COMMAND_SYNC_VOLATILE_KEYS = {"id", "application_id", "guild_id", "version"}
+
+
+def _command_definition(value):
+    """Return a stable Discord command definition without server-generated IDs."""
+    try:
+        raw = value.to_dict(bot.tree)
+    except TypeError:
+        raw = value.to_dict()
+    except Exception:
+        raw = {
+            "name": getattr(value, "name", ""),
+            "description": getattr(value, "description", ""),
+            "type": str(getattr(value, "type", "")),
+        }
+
+    def clean(obj):
+        if isinstance(obj, dict):
+            return {
+                str(k): clean(v)
+                for k, v in obj.items()
+                if str(k) not in _COMMAND_SYNC_VOLATILE_KEYS
+            }
+        if isinstance(obj, (list, tuple)):
+            return [clean(v) for v in obj]
+        return obj
+
+    return clean(raw)
+
+
+def _command_fingerprint(commands) -> str:
+    payload = [_command_definition(cmd) for cmd in commands]
+    payload.sort(key=lambda row: (str(row.get("name") or ""), str(row.get("type") or "")))
+    serial = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serial.encode("utf-8")).hexdigest()
+
+
+def _command_outline(commands):
+    return sorted(
+        (
+            str(getattr(cmd, "name", "") or ""),
+            str(getattr(cmd, "description", "") or ""),
+            str(getattr(cmd, "type", "") or ""),
+        )
+        for cmd in commands
+    )
+
+
+async def _sync_command_tree_if_changed():
+    """One canonical Discord command publisher, persisted across bot restarts."""
+    await collector.start()
+    await collector.db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clerk_command_sync_state(
+            scope_key TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            command_count INT NOT NULL DEFAULT 0,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+    if COMMAND_GUILD_ID:
+        guild_obj = discord.Object(id=COMMAND_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild_obj)
+        local_commands = list(bot.tree.get_commands(guild=guild_obj))
+        scope_key = f"GUILD:{COMMAND_GUILD_ID}"
+    else:
+        guild_obj = None
+        local_commands = list(bot.tree.get_commands())
+        scope_key = "GLOBAL"
+
+    local_fp = _command_fingerprint(local_commands)
+    state = await collector.db.fetchrow(
+        "SELECT fingerprint,command_count FROM clerk_command_sync_state WHERE scope_key=$1",
+        scope_key,
+    )
+    if state and str(state.get("fingerprint") or "") == local_fp:
+        log.info(
+            "[COMMAND SYNC] skipped unchanged tree scope=%s commands=%s",
+            scope_key, len(local_commands),
+        )
+        return local_commands
+
+    # On first V110 install, adopt the already-published tree without a PUT when
+    # its visible outline matches. This avoids immediately hitting Discord's bulk
+    # command rate limit after prior V101 + main double-publishing.
+    try:
+        remote_commands = list(await bot.tree.fetch_commands(guild=guild_obj))
+    except Exception as exc:
+        remote_commands = []
+        log.warning("[COMMAND SYNC] remote read failed scope=%s error=%s", scope_key, exc)
+
+    remote_matches = bool(remote_commands) and _command_fingerprint(remote_commands) == local_fp
+    first_install_outline_match = (
+        state is None
+        and bool(remote_commands)
+        and _command_outline(remote_commands) == _command_outline(local_commands)
+    )
+    if remote_matches or first_install_outline_match:
+        await collector.db.execute(
+            """
+            INSERT INTO clerk_command_sync_state(scope_key,fingerprint,command_count,synced_at)
+            VALUES($1,$2,$3,NOW())
+            ON CONFLICT(scope_key) DO UPDATE SET
+                fingerprint=EXCLUDED.fingerprint,
+                command_count=EXCLUDED.command_count,
+                synced_at=NOW()
+            """,
+            scope_key, local_fp, len(local_commands),
+        )
+        log.info(
+            "[COMMAND SYNC] adopted existing Discord tree scope=%s commands=%s",
+            scope_key, len(local_commands),
+        )
+        return local_commands
+
+    synced = await bot.tree.sync(guild=guild_obj)
+    await collector.db.execute(
+        """
+        INSERT INTO clerk_command_sync_state(scope_key,fingerprint,command_count,synced_at)
+        VALUES($1,$2,$3,NOW())
+        ON CONFLICT(scope_key) DO UPDATE SET
+            fingerprint=EXCLUDED.fingerprint,
+            command_count=EXCLUDED.command_count,
+            synced_at=NOW()
+        """,
+        scope_key, local_fp, len(synced),
+    )
+    source = "TEST_GUILD_ID" if (COMMAND_GUILD_ID and TEST_GUILD_ID) else ("GUILD_ID" if COMMAND_GUILD_ID else "GLOBAL")
+    log.info(
+        "[COMMAND SYNC] published changed tree scope=%s synced=%s source=%s",
+        scope_key, len(synced), source,
+    )
+    return synced
 
 
 def utc_now() -> datetime:
@@ -5025,19 +5163,11 @@ async def on_ready():
     if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
         hll_vip_sync_watch.start()
 
-    # Synchronize slash commands once per process. TEST_GUILD_ID wins when present
-    # so new commands appear in the battalion server immediately.
+    # V110: one persistent, fingerprint-based command publisher. Ticket commands
+    # are registered before this point but no longer run their own bulk sync.
     if not commands_synced:
         try:
-            if COMMAND_GUILD_ID:
-                guild_obj = discord.Object(id=COMMAND_GUILD_ID)
-                bot.tree.copy_global_to(guild=guild_obj)
-                synced = await bot.tree.sync(guild=guild_obj)
-                source = 'TEST_GUILD_ID' if TEST_GUILD_ID else 'GUILD_ID'
-                log.info('[COMMAND SYNC] synced=%s guild=%s source=%s', len(synced), COMMAND_GUILD_ID, source)
-            else:
-                synced = await bot.tree.sync()
-                log.info('[COMMAND SYNC] synced=%s globally', len(synced))
+            await _sync_command_tree_if_changed()
             commands_synced = True
         except Exception:
             log.exception('[COMMAND SYNC FAILED]')

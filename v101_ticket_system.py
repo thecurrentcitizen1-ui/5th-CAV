@@ -655,12 +655,9 @@ async def _install_commands(bot: commands.Bot):
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
 
-    if guild_obj:
-        synced = await bot.tree.sync(guild=guild_obj)
-        log.info("%s synced %s ticket commands to guild %s", VERSION, len(synced), GUILD_ID)
-    else:
-        synced = await bot.tree.sync()
-        log.info("%s synced %s global ticket commands", VERSION, len(synced))
+    # V110: registration only. The main bot owns the single fingerprint-based
+    # command-tree publication step after every module has registered commands.
+    log.info("%s registered %s ticket commands; publication delegated to main command sync", VERSION, len(commands_to_add))
 
 
 async def install(bot: commands.Bot):
