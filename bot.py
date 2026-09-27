@@ -170,7 +170,7 @@ LEGACY_RECRUITING_STATUS_ROLE_NAMES = {"Approved Replacement", "Prospective Repl
 
 APPOINTMENT_ROLE_BLUEPRINT = [
     "Battalion Commander", "Battalion Executive Officer", "Battalion Sergeant Major",
-    "S-1 OIC", "S-1 NCOIC", "S-3 OIC", "S-3 NCOIC", "S-4 OIC", "S-4 NCOIC",
+    "S-1 OIC", "S-1 NCOIC", "S-3 OIC", "S-3 NCOIC",
     "Company Commander", "Company Executive Officer", "First Sergeant",
     "Platoon Leader", "Platoon Sergeant", "Squad Leader", "Assistant Squad Leader", "Team Leader",
 ]
@@ -218,7 +218,7 @@ QUALIFICATION_ROLE_BLUEPRINT = [
     "Aviation Qualified", "Armor Qualified", "Medic Qualified",
 ]
 STAFF_ACCESS_ROLE_BLUEPRINT = [
-    "Command Staff", "S-1 Personnel", "S-3 Operations", "S-4 Supply",
+    "Command Staff", "S-1 Personnel", "S-3 Operations",
 ]
 
 ROLE_SECTIONS = [
@@ -284,17 +284,6 @@ CHANNEL_BLUEPRINT = [
             ("operations-briefing", "voice"),
             ("the-lz", "voice"),
             ("the-range", "voice"),
-        ],
-    },
-    {
-        "category": "S-4 SUPPLY & LOGISTICS",
-        "scope": "S4",
-        "channels": [
-            ("s4-supply", "text"),
-            ("arms-room", "text"),
-            ("property-book", "text"),
-            ("logistics", "text"),
-            ("supply-counter", "voice"),
         ],
     },
     {
@@ -450,7 +439,6 @@ COMMAND_APPOINTMENTS = {"Battalion Commander", "Battalion Executive Officer"}
 STAFF_APPOINTMENTS = {
     "S1": {"S-1 OIC", "S-1 NCOIC"},
     "S3": {"S-3 OIC", "S-3 NCOIC"},
-    "S4": {"S-4 OIC", "S-4 NCOIC"},
 }
 COMPANY_LEADERSHIP_APPOINTMENTS = {
     "Company Commander", "Company Executive Officer", "First Sergeant",
@@ -501,8 +489,6 @@ def _scope_overwrites(guild: discord.Guild, scope: str):
         _add_roles(overwrites, guild, {"S-1 Personnel", *STAFF_APPOINTMENTS["S1"]}, _overwrite_staff())
     elif scope == "S3":
         _add_roles(overwrites, guild, {"S-3 Operations", *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
-    elif scope == "S4":
-        _add_roles(overwrites, guild, {"S-4 Supply", *STAFF_APPOINTMENTS["S4"]}, _overwrite_staff())
     elif scope == "COMMAND":
         # Only Command Staff / Battalion Commander / Battalion XO were added above.
         pass
@@ -544,7 +530,7 @@ def _channel_overwrites(guild: discord.Guild, spec: dict, channel_name: str, cha
             overwrites[role] = _overwrite_member(view=True, send=False, voice=False)
         # Staff shops may publish the records relevant to them; Command may publish all.
         _add_roles(overwrites, guild, STAFF_ACCESS_ROLE_BLUEPRINT, _overwrite_staff())
-        _add_roles(overwrites, guild, {*COMMAND_APPOINTMENTS, *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"], *STAFF_APPOINTMENTS["S4"]}, _overwrite_staff())
+        _add_roles(overwrites, guild, {*COMMAND_APPOINTMENTS, *STAFF_APPOINTMENTS["S1"], *STAFF_APPOINTMENTS["S3"]}, _overwrite_staff())
 
     # Squad text/voice channels inside a platoon are visible only to the exact
     # company+platoon+squad assignment role. The parent platoon role is explicitly
@@ -730,6 +716,65 @@ async def reset_battalion_roles(guild: discord.Guild):
         except Exception as exc:
             failed.append(f"{role.name}: {exc}")
     return {"deleted":deleted,"failed":failed,"skipped":skipped}
+
+async def cleanup_retired_supply_staff_structure(guild: discord.Guild):
+    """Retire the obsolete supply staff shop and move its remaining workload to Command."""
+    deleted=[]; migrated=[]; failed=[]
+    me=guild.me
+
+    # Existing website Personnel Actions filed to the retired shop become HQ-owned
+    # so they surface in the Command workflow instead of becoming orphaned.
+    try:
+        await collector.start()
+        db=getattr(collector,'db',None)
+        if db and getattr(db,'pool',None):
+            await db.execute("""UPDATE personnel_actions
+                                   SET owning_section='HQ'
+                                 WHERE UPPER(COALESCE(owning_section,'')) IN ('S-4','S4')""")
+            migrated.append('PERSONNEL_ACTIONS:SUPPLY->HQ')
+    except Exception as exc:
+        failed.append(f'PERSONNEL ACTION MIGRATION: {exc}')
+
+    # Route future Supply request notifications to the existing Command desk when
+    # one is available. The Personnel Action itself is always HQ-owned regardless.
+    try:
+        command_channel=(discord.utils.get(guild.text_channels,name='command-desk')
+                         or discord.utils.get(guild.text_channels,name='command-actions'))
+        if command_channel:
+            await set_report_channel(guild.id,'REQUEST_SUPPLY',command_channel.id)
+            migrated.append(f'REQUEST_SUPPLY->{command_channel.name}')
+    except Exception as exc:
+        failed.append(f'SUPPLY ROUTE MIGRATION: {exc}')
+
+    # Remove the retired shop's channels/category. These names were created by
+    # Battalion Clerk's managed structure, so unrelated custom channels are untouched.
+    retired_category=discord.utils.get(guild.categories,name='S-4 SUPPLY & LOGISTICS')
+    if retired_category and me and me.guild_permissions.manage_channels:
+        for channel in list(retired_category.channels):
+            try:
+                await channel.delete(reason='Battalion Clerk — retire obsolete supply staff shop; Command now owns supply requests')
+                deleted.append(f'CHANNEL:{channel.name}')
+            except Exception as exc:
+                failed.append(f'CHANNEL {channel.name}: {exc}')
+        try:
+            await retired_category.delete(reason='Battalion Clerk — retire obsolete supply staff shop')
+            deleted.append('CATEGORY:S-4 SUPPLY & LOGISTICS')
+        except Exception as exc:
+            failed.append(f'CATEGORY S-4 SUPPLY & LOGISTICS: {exc}')
+
+    # Remove only the three explicitly retired managed roles.
+    if me and me.guild_permissions.manage_roles:
+        for role_name in ('S-4 OIC','S-4 NCOIC','S-4 Supply'):
+            role=discord.utils.get(guild.roles,name=role_name)
+            if role and role < me.top_role:
+                try:
+                    await role.delete(reason='Battalion Clerk — retire obsolete supply staff role; Command now owns supply requests')
+                    deleted.append(f'ROLE:{role_name}')
+                except Exception as exc:
+                    failed.append(f'ROLE {role_name}: {exc}')
+
+    return {'deleted':deleted,'migrated':migrated,'failed':failed}
+
 
 async def cleanup_legacy_platoon_structure(guild: discord.Guild):
     """Remove only old Battalion Clerk platoon channels/roles superseded by strict access."""
@@ -5299,6 +5344,20 @@ async def on_ready():
         await ensure_commendations_table()
     except Exception:
         log.exception("[COMMENDATIONS TABLE INIT FAILED]")
+    # Retire the obsolete supply staff shop and move any remaining Supply work
+    # to Command/HQ. Idempotent and restricted to the old Clerk-managed names.
+    if not getattr(bot, '_retired_supply_staff_cleanup_done', False):
+        for guild in bot.guilds:
+            if GUILD_ID and guild.id != GUILD_ID:
+                continue
+            try:
+                result=await cleanup_retired_supply_staff_structure(guild)
+                if result.get('deleted') or result.get('migrated') or result.get('failed'):
+                    log.info('[RETIRED SUPPLY STAFF CLEANUP] guild=%s result=%s',guild.id,result)
+            except Exception:
+                log.exception('[RETIRED SUPPLY STAFF CLEANUP FAILED] guild=%s',guild.id)
+        bot._retired_supply_staff_cleanup_done=True
+
     # Retire the pre-Welcome-Packet Approved Replacement Discord role. This is
     # idempotent and only touches the explicitly named legacy managed role.
     if not getattr(bot, '_legacy_recruit_role_cleanup_done', False):
@@ -7785,7 +7844,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # AUTOMATION EXPANSION — routed requests, inactivity, promotions, post-op
 # ---------------------------------------------------------------------------
 REQUEST_CATEGORY_SECTION = {
-    'PERSONNEL':'S-1','TRAINING':'S-3','SUPPLY':'S-4','LEADERSHIP':'HQ','TECHNICAL':'HQ'
+    'PERSONNEL':'S-1','TRAINING':'S-3','SUPPLY':'HQ','LEADERSHIP':'HQ','TECHNICAL':'HQ'
 }
 NCO_RANK_PRIORITY = {'CPL':1,'SGT':2,'SSG':3,'SFC':4,'MSG':5,'1SG':6,'SGM':7}
 
@@ -7850,7 +7909,7 @@ async def request_channel_status(interaction:discord.Interaction):
 HELPDESK_STAFF_ROLES = {
     'PERSONNEL': ('S-1 Personnel', 'Command Staff'),
     'TRAINING': ('S-3 Operations', 'Command Staff'),
-    'SUPPLY': ('S-4 Supply', 'Command Staff'),
+    'SUPPLY': ('Command Staff',),
     'LEADERSHIP': ('Command Staff',),
     'TECHNICAL': ('Command Staff',),
 }
@@ -8058,7 +8117,7 @@ async def helpdesk_panel(interaction:discord.Interaction,channel:discord.TextCha
     embed=discord.Embed(title='1ST BATTALION, 5TH CAVALRY — HELP DESK',description='Select the battalion office that best matches your request. Battalion Clerk will open a private channel visible only to you and the appropriate staff section.')
     embed.add_field(name='Personnel — S-1',value='Records, names, assignments, promotions, awards, access.',inline=False)
     embed.add_field(name='Training — S-3',value='Schools, qualifications, training records, operation questions.',inline=False)
-    embed.add_field(name='Supply — S-4',value='Weapons, equipment, issue/turn-in, supply discrepancies.',inline=False)
+    embed.add_field(name='Supply — Command',value='Weapons, equipment, issue/turn-in, supply discrepancies. Routed directly to Command.',inline=False)
     embed.add_field(name='Leadership / Technical',value='Chain-of-command concerns or website/Discord technical support.',inline=False)
     embed.set_footer(text='Each request creates a private ticket. Linked Soldiers also receive a website Personnel Action automatically.')
     await channel.send(embed=embed,view=HelpDeskPanelView())
@@ -8309,9 +8368,9 @@ async def inactivity_watch():
             elif days>=prop:
                 key='PROPERTY:21'
                 if await _notice_once(guild.id,pid,'INACTIVITY_PROPERTY',key):
-                    ch=await get_report_channel(guild,'INACTIVITY_S1')
-                    if ch: await ch.send(f'**PROPERTY ACCOUNTABILITY REVIEW**\n{name} — **{days} days inactive**. Assigned M16/property requires leadership contact and S-1/S-4 review.')
-                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'S-1','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Property accountability review — {name}',__import__('json').dumps({'inactive_days':days,'stage':'PROPERTY ACCOUNTABILITY REVIEW'}),f'INACTIVE-PROPERTY:{pid}')
+                    ch=await get_report_channel(guild,'INACTIVITY_COMMAND')
+                    if ch: await ch.send(f'**PROPERTY ACCOUNTABILITY REVIEW**\n{name} — **{days} days inactive**. Assigned M16/property requires leadership contact and Command review.')
+                    await db.execute("""INSERT INTO personnel_actions(personnel_id,action_type,subject,owning_section,status,priority,initiated_by,details_json,source_key) VALUES($1::uuid,'PERSONNEL',$2,'HQ','OPEN','HIGH','BATTALION CLERK',$3::jsonb,$4) ON CONFLICT(source_key) DO NOTHING""",str(pid),f'Property accountability review — {name}',__import__('json').dumps({'inactive_days':days,'stage':'PROPERTY ACCOUNTABILITY REVIEW'}),f'INACTIVE-PROPERTY:{pid}')
             elif days>=s1:
                 key='S1:14'
                 if await _notice_once(guild.id,pid,'INACTIVITY_S1',key):
