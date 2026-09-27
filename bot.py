@@ -77,9 +77,6 @@ collector = DataCollector()
 # seeding calls, VIP/admin RCON actions, identity verification, recruiting
 # broadcasts, and every full telemetry path follow the live server.
 hllv = HLLVTelemetryCollector(collector, server_slot=2, telemetry_only=False)
-# Retain the legacy slot only as a passive compatibility collector. Railway has
-# HLL_RCON_ENABLED=false for slot 1, so the retired server is not polled.
-hllv2 = HLLVTelemetryCollector(collector, server_slot=1, telemetry_only=True)
 collector_started = False
 commands_synced = False
 
@@ -5023,10 +5020,6 @@ async def on_ready():
         await hllv.start()
     except Exception:
         log.exception('[HLLV RCON STARTUP FAILED]')
-    try:
-        await hllv2.start()
-    except Exception:
-        log.exception('[HLLV RCON SERVER 2 STARTUP FAILED]')
     if HLL_VIP_SYNC_ENABLED and not hll_vip_sync_watch.is_running():
         hll_vip_sync_watch.start()
 
