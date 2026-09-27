@@ -769,45 +769,21 @@ async def recruiting_status_for(member: discord.Member):
         return {'ok':False,'exists':False}
 
 async def ensure_recruit_status_role(member: discord.Member, approved: bool=False):
-    if not AUTO_ROLE_SYNC_ENABLED:
-        log.info('[AUTO ROLE SYNC DISABLED] recruit status role unchanged member=%s', member.id)
-        return
-    # Approved applicants use the temporary Replacement access role and are recognized immediately as
-    # members of the 5th Cavalry Regiment. Formation/rank/MOS roles still wait for the
-    # authoritative Website assignment after Command files the Soldier formation.
-    desired_name='Replacement'
-    desired=discord.utils.get(member.guild.roles,name=desired_name)
-    if not desired:
-        desired=await _ensure_dynamic_role(member.guild,desired_name)
-    remove=[discord.utils.get(member.guild.roles,name=n) for n in RECRUITING_STATUS_ROLE_BLUEPRINT if n!=desired_name]
-    remove += [discord.utils.get(member.guild.roles,name=n) for n in LEGACY_RECRUITING_STATUS_ROLE_NAMES]
-    try:
-        remove=[r for r in remove if r and r in member.roles]
-        if remove: await member.remove_roles(*remove,reason='Recruiting case status synchronization')
-        add=[]
-        if desired and desired not in member.roles:
-            add.append(desired)
-        if approved:
-            membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
-            if membership and membership not in member.roles:
-                add.append(membership)
-        if add:
-            await member.add_roles(*add,reason='Recruiting case status synchronization')
-    except discord.Forbidden:
-        log.warning('[RECRUIT ROLE SYNC BLOCKED] member=%s',member.id)
+    """Recruiting status no longer grants Replacement before a saved assignment."""
+    return
 
 
 async def clear_recruit_status_roles(member: discord.Member):
-    if not AUTO_ROLE_SYNC_ENABLED:
-        log.info('[AUTO ROLE SYNC DISABLED] recruit status roles preserved member=%s', member.id)
-        return
-    roles=[discord.utils.get(member.guild.roles,name=name) for name in [*RECRUITING_STATUS_ROLE_BLUEPRINT,*LEGACY_RECRUITING_STATUS_ROLE_NAMES]]
+    """Legacy status cleanup never removes a current formation's Replacement marker."""
+    roles=[_role_by_name(member.guild,name) for name in LEGACY_RECRUITING_STATUS_ROLE_NAMES]
     roles=[role for role in roles if role and role in member.roles]
-    if not roles: return
+    if not roles:
+        return
     try:
-        await member.remove_roles(*roles,reason='Recruiting case closed or converted')
+        await member.remove_roles(*roles,reason='Battalion Clerk — obsolete recruiting status cleanup')
     except discord.Forbidden:
-        log.warning('[RECRUIT ROLE CLEAR BLOCKED] member=%s',member.id)
+        log.warning('[RECRUIT LEGACY ROLE CLEAR BLOCKED] member=%s',member.id)
+
 
 async def cleanup_legacy_recruiting_status_role(guild: discord.Guild):
     """Remove the obsolete Approved Replacement role without touching unrelated roles."""
@@ -2420,6 +2396,8 @@ def _assignment_sync_reason(reason: str) -> bool:
         "PLATOON ASSIGNMENT",
         "FORMATION ASSIGNMENT CONTROL",
         "ATOMIC REASSIGNMENT",
+        "COMMAND ASSIGNMENT MANAGER",
+        "REPLACEMENT RELEASED TO PERMANENT FORMATION",
         "UNASSIGNED FROM FORMATION",
     )
     return any(text.startswith(prefix) for prefix in exact_prefixes)
@@ -4142,7 +4120,7 @@ async def canonical_role_sync_watch():
                         except Exception: member=None
                     if not member:
                         raise RuntimeError('Discord member not found in guild')
-                    if ASSIGNMENT_ROLE_SYNC_ENABLED and _assignment_sync_reason(item.get('reason')):
+                    if _assignment_sync_reason(item.get('reason')):
                         recon=await reconcile_assignment_roles_from_canonical(member,item)
                     else:
                         # V116: all non-assignment canonical events are observation-only.
@@ -6764,9 +6742,36 @@ async def _ensure_new_arrival_role(guild: discord.Guild) -> Optional[discord.Rol
         return None
 
 
+async def _apply_join_roles(member: discord.Member) -> None:
+    """Every Discord join gets only the safe entry roles; prior staff/formation roles stay manual."""
+    if member.bot:
+        return
+    roles=[]
+    for name in ('PVT','5th Cavalry Regiment'):
+        role=_role_by_name(member.guild,name) or await _ensure_dynamic_role(member.guild,name)
+        if role and role not in member.roles:
+            roles.append(role)
+    if not roles:
+        return
+    me=member.guild.me
+    if not me or not me.guild_permissions.manage_roles:
+        log.warning('[JOIN ROLE BLOCKED] member=%s missing Manage Roles',member.id)
+        return
+    roles=[role for role in roles if role < me.top_role]
+    if not roles:
+        log.warning('[JOIN ROLE BLOCKED] member=%s roles above bot',member.id)
+        return
+    try:
+        role_sync_suppressed_members.add((member.guild.id,member.id))
+        await member.add_roles(*roles,reason='Battalion Clerk — PVT and 5th Cavalry Regiment on Discord join')
+        log.info('[JOIN ROLES ADDED] member=%s roles=%s',member.id,[role.name for role in roles])
+    except discord.Forbidden:
+        log.warning('[JOIN ROLE ADD FAILED] member=%s permission or hierarchy',member.id)
+    finally:
+        role_sync_suppressed_members.discard((member.guild.id,member.id))
+
+
 async def _apply_new_arrival_role(member: discord.Member, *, reason: str) -> bool:
-    if not AUTO_ROLE_SYNC_ENABLED:
-        return False
     if member.bot:
         return False
     joined_at = await _first_discord_join_at(member)
@@ -6789,8 +6794,6 @@ async def _apply_new_arrival_role(member: discord.Member, *, reason: str) -> boo
 
 
 async def _remove_expired_new_arrival_roles(guild: discord.Guild) -> int:
-    if not AUTO_ROLE_SYNC_ENABLED:
-        return 0
     role = _role_by_name(guild, NEW_ARRIVAL_ROLE_NAME)
     if not role:
         return 0
@@ -6980,6 +6983,7 @@ async def on_member_join(member: discord.Member):
         if last_rejoin_exc is not None:
             log.error('[PERSONNEL REJOIN RESTORE FAILED] member=%s after 3 attempts error=%s',member.id,last_rejoin_exc)
 
+        await _apply_join_roles(member)
         # Temporary seven-day visual marker, independent of recruiting/member status.
         await _apply_new_arrival_role(member, reason='Battalion Clerk — new Discord arrival')
         # Public reception notice is independent of recruiting status and is posted once on guild join.
@@ -7010,19 +7014,6 @@ async def on_member_join(member: discord.Member):
             log.error('[REJOIN ROLE SAFEGUARD FAILED] member=%s no authoritative linked personnel result after %s attempts',member.id,restore_attempts)
 
         if not (existing and existing.get('linked')):
-            # Every brand-new Discord arrival receives the entry-rank PVT role immediately.
-            # This is presentation/intake only: Website approval remains required before a
-            # new personnel record is provisioned, so the role cannot bypass recruiting.
-            if AUTO_ROLE_SYNC_ENABLED:
-                pvt_role=_role_by_name(member.guild,'PVT') or await _ensure_dynamic_role(member.guild,'PVT')
-                if pvt_role and pvt_role not in member.roles:
-                    try:
-                        role_sync_suppressed_members.add((member.guild.id,member.id))
-                        await member.add_roles(pvt_role,reason='Battalion Clerk — new arrival entry rank')
-                    except discord.Forbidden:
-                        log.warning('[PVT ARRIVAL ROLE BLOCKED] member=%s',member.id)
-                    finally:
-                        role_sync_suppressed_members.discard((member.guild.id,member.id))
             recruit=await recruiting_status_for(member)
             case=recruit.get('case') if recruit and recruit.get('exists') else None
             if case:
