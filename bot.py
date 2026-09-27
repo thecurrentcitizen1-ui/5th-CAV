@@ -717,36 +717,6 @@ async def reset_battalion_roles(guild: discord.Guild):
             failed.append(f"{role.name}: {exc}")
     return {"deleted":deleted,"failed":failed,"skipped":skipped}
 
-async def cleanup_legacy_platoon_structure(guild: discord.Guild):
-    """Remove only old Battalion Clerk platoon channels/roles superseded by strict access."""
-    deleted=[]; failed=[]
-    me=guild.me
-    # Old setup put 1st/2nd/3rd platoon text+voice channels directly in company categories.
-    for letter in ("A", "B", "C"):
-        category=discord.utils.get(guild.categories, name=f"{letter} COMPANY")
-        if not category:
-            continue
-        for old_name in ("1st-platoon", "2nd-platoon", "3rd-platoon", "4th-platoon"):
-            for channel in list(category.channels):
-                if channel.name == old_name:
-                    try:
-                        await channel.delete(reason="Battalion Clerk — replace legacy platoon channel with strict-access platoon category")
-                        deleted.append(f"CHANNEL:{letter} COMPANY/{old_name}")
-                    except Exception as exc:
-                        failed.append(f"{letter} COMPANY/{old_name}: {exc}")
-    # Old generic platoon/squad roles cannot safely gate assignment-specific channels
-    # because Discord permission overwrites are additive across roles. Remove them.
-    if me and me.guild_permissions.manage_roles:
-        for role in list(guild.roles):
-            if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES and role < me.top_role:
-                try:
-                    await role.delete(reason="Battalion Clerk — migrate to assignment-specific access role")
-                    deleted.append(f"ROLE:{role.name}")
-                except Exception as exc:
-                    failed.append(f"ROLE {role.name}: {exc}")
-    return {"deleted":deleted,"failed":failed}
-
-
 def structure_inventory(guild: discord.Guild):
     expected_roles=[]
     for divider,roles in ROLE_SECTIONS:
@@ -1922,23 +1892,6 @@ web = WebsiteClient()
 
 _COMMAND_SYNC_VOLATILE_KEYS = {"id", "application_id", "guild_id", "version"}
 
-# V111 — keep Discord's slash-command surface limited to current workflows.
-# These commands are retained in source for compatibility/recovery but are no longer
-# published because they are legacy aliases, completed migration/setup utilities,
-# testing-only controls, or a feature currently unsupported by HLL: Vietnam RCON.
-RETIRED_SLASH_COMMANDS = {
-    "weekly-battalion-report-channel",  # legacy alias -> battalionbrief-setup
-    "match-formation-setup",            # legacy alias -> combat-setup
-    "hll-unlink",                       # legacy alias -> unlink-game
-    "hll-vip-sync",                     # unsupported by current HLLV RCON build
-    "test-recruit-intake",              # test-only
-    "accessions-backfill",              # one-time migration/backfill
-    "strict-access-rebuild",            # completed Discord structure migration
-    "reset-roster",                     # superseded by website-authoritative personnel state
-    "organization-cleanup",             # completed duplicate-role migration utility
-}
-
-
 # V112 — compact command surface. Existing callbacks/checks are preserved; only
 # publication hierarchy changes. Member-facing commands remain easy to discover,
 # while administrative controls live under functional groups.
@@ -2099,20 +2052,6 @@ def _consolidate_slash_command_groups():
     return moved
 
 
-def _retire_obsolete_slash_commands():
-    retired=[]
-    for name in sorted(RETIRED_SLASH_COMMANDS):
-        try:
-            removed=bot.tree.remove_command(name)
-            if removed is not None:
-                retired.append(name)
-        except Exception:
-            log.exception("[COMMAND RETIRE FAILED] name=%s", name)
-    if retired:
-        log.info("[COMMAND RETIRE] removed obsolete commands from publication: %s", ", ".join(retired))
-    return retired
-
-
 def _command_definition(value):
     """Return a stable Discord command definition without server-generated IDs."""
     try:
@@ -2160,7 +2099,6 @@ def _command_outline(commands):
 
 async def _sync_command_tree_if_changed():
     """One canonical Discord command publisher, persisted across bot restarts."""
-    _retire_obsolete_slash_commands()
     _consolidate_slash_command_groups()
     await collector.start()
     await collector.db.execute(
@@ -3406,207 +3344,6 @@ async def setup_channels(interaction: discord.Interaction, confirm: bool):
         await interaction.followup.send(f'Channel setup failed: `{exc}`',ephemeral=True)
 
 
-async def organization_cleanup_inventory(guild: discord.Guild):
-    inv=structure_inventory(guild)
-    legacy=[r for r in guild.roles if any(_normalized_role_name(r.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES)]
-    desired_dynamic=set()
-    if WEBSITE_BASE_URL and CLERK_SYNC_KEY:
-        try:
-            data=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':guild.id})
-            for x in data.get('items',[]):
-                unit=str(x.get('unit_code') or '').upper().strip(); pl=str(x.get('platoon') or '').strip(); sq=str(x.get('squad') or '').strip(); letter=unit[:1] if unit[:1] in {'A','B','C'} else None
-                if letter and pl: desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()}"))
-                if letter and pl and sq: desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()} • {sq.title()}"))
-        except Exception: pass
-    dormant=[r for r in guild.roles if _is_managed_formation_role_name(r.name) and _normalized_role_name(r.name) not in desired_dynamic]
-    duplicate_details=[]
-    for item in inv.get('duplicate_managed_roles',[]):
-        canonical=_canonical_managed_role_name(item['name']) or item['name']
-        roles=_managed_role_group(guild,canonical)
-        duplicate_details.append({
-            'canonical':canonical,
-            'count':len(roles),
-            'member_links':sum(len(r.members) for r in roles),
-            'role_ids':[r.id for r in roles],
-        })
-    return {'duplicates':duplicate_details,'legacy':legacy,'dormant':dormant,'inventory':inv}
-
-async def run_organization_cleanup(guild: discord.Guild):
-    """Consolidate duplicate managed roles without changing website personnel authority."""
-    me=guild.me
-    if not me or not me.guild_permissions.manage_roles:
-        raise RuntimeError('Battalion Clerk needs Manage Roles permission.')
-    if not WEBSITE_BASE_URL or not CLERK_SYNC_KEY:
-        raise RuntimeError('Website connection is required; cleanup will not run without canonical personnel data.')
-
-    canonical_data=await web.request('GET','/internal/clerk/personnel/canonical-roster',params={'guild_id':guild.id})
-    snapshots={int(x['discord_user_id']):x for x in canonical_data.get('items',[]) if x.get('discord_user_id')}
-    touched=set(); migrated=0; deleted=[]; renamed=[]; preserved_permissions=0; failures=[]
-
-    # Freeze Discord->website role echo for every linked Soldier while the canonical website state is reapplied.
-    for uid in snapshots:
-        role_sync_suppressed_members.add((guild.id,uid)); touched.add(uid)
-    try:
-        # First restore every linked member from the WEBSITE snapshot. This prevents duplicate roles
-        # from becoming the source of truth during the maintenance window.
-        for uid,snapshot in snapshots.items():
-            member=guild.get_member(uid)
-            if not member:
-                try: member=await guild.fetch_member(uid)
-                except Exception: member=None
-            if not member: continue
-            try:
-                if ASSIGNMENT_ROLE_SYNC_ENABLED:
-                    await reconcile_assignment_roles_from_canonical(member,snapshot)
-                migrated+=1
-            except Exception as exc:
-                failures.append(f'MEMBER {uid}: {exc}')
-
-        # Consolidate exact managed-role aliases/case variants, including dynamically
-        # created active Platoon/Squad roles. Prefer canonical website-style spelling.
-        canonical_names=list(_all_managed_role_names())
-        canonical_names.extend([_canonical_managed_role_name(r.name) for r in guild.roles if _is_managed_formation_role_name(r.name)])
-        canonical_names=[x for x in dict.fromkeys(canonical_names) if x]
-        for canonical_name in canonical_names:
-            group=_managed_role_group(guild,canonical_name)
-            if not group: continue
-            canonical=discord.utils.get(group,name=canonical_name)
-            if canonical is None:
-                manageable=[r for r in group if r < me.top_role]
-                canonical=(manageable[0] if manageable else group[0])
-                if canonical < me.top_role:
-                    try:
-                        old=canonical.name
-                        await canonical.edit(name=canonical_name,reason='Battalion Clerk — normalize managed role display name')
-                        renamed.append(f'{old} -> {canonical_name}')
-                    except Exception as exc:
-                        failures.append(f'RENAME {canonical.name}: {exc}')
-            for duplicate in list(group):
-                if duplicate.id==canonical.id: continue
-                if duplicate >= me.top_role:
-                    failures.append(f'DUPLICATE ABOVE CLERK {duplicate.name} ({duplicate.id})')
-                    continue
-                # Preserve any custom/category permission references before moving members and deleting.
-                errs=await _preserve_duplicate_role_overwrites(guild,canonical,duplicate)
-                if not errs: preserved_permissions += 1
-                else: failures.extend([f'OVERWRITE {duplicate.name}: {x}' for x in errs])
-                try:
-                    members=list(duplicate.members)
-                    for member in members:
-                        role_sync_suppressed_members.add((guild.id,member.id)); touched.add(member.id)
-                        if canonical not in member.roles:
-                            await member.add_roles(canonical,reason='Battalion Clerk — consolidate duplicate managed role')
-                    await duplicate.delete(reason='Battalion Clerk — duplicate managed role consolidated into canonical role')
-                    deleted.append(f'DUPLICATE:{duplicate.name}:{duplicate.id}')
-                except Exception as exc:
-                    failures.append(f'DUPLICATE {duplicate.name} ({duplicate.id}): {exc}')
-
-        # Remove unused dynamically generated formation roles when they are truly disposable.
-        # If a dormant role still owns a channel/category overwrite, preserve it and report it rather
-        # than destroying access configuration that may be needed when that formation reactivates.
-        desired_dynamic=set()
-        for snapshot in snapshots.values():
-            unit=str(snapshot.get('unit_code') or '').upper().strip(); pl=str(snapshot.get('platoon') or '').strip(); sq=str(snapshot.get('squad') or '').strip()
-            letter=unit[:1] if unit[:1] in {'A','B','C'} else None
-            if letter and pl:
-                desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()}"))
-            if letter and pl and sq:
-                desired_dynamic.add(_normalized_role_name(f"{letter} Company • {pl.title()} • {sq.title()}"))
-        for role in list(guild.roles):
-            if not _is_managed_formation_role_name(role.name) or _normalized_role_name(role.name) in desired_dynamic:
-                continue
-            if role >= me.top_role:
-                failures.append(f'DORMANT FORMATION ABOVE CLERK {role.name} ({role.id})'); continue
-            if role.members:
-                failures.append(f'DORMANT FORMATION PRESERVED — {len(role.members)} MEMBER(S) STILL CARRY ROLE {role.name} ({role.id})')
-                continue
-            overwrite_fail=None
-            for channel in list(guild.channels):
-                if role not in channel.overwrites: continue
-                try:
-                    await channel.set_permissions(role,overwrite=None,reason='Battalion Clerk — remove dormant formation permission overwrite')
-                except Exception as exc:
-                    overwrite_fail=f'{getattr(channel,"name",channel.id)}: {exc}'; break
-            if overwrite_fail:
-                failures.append(f'DORMANT FORMATION PRESERVED — PERMISSION CLEANUP FAILED {role.name} ({role.id}) {overwrite_fail}')
-                continue
-            try:
-                await role.delete(reason='Battalion Clerk — remove unused website-unassigned formation role')
-                deleted.append(f'DORMANT:{role.name}:{role.id}')
-            except Exception as exc:
-                failures.append(f'DORMANT {role.name}: {exc}')
-
-        # Generic Platoon/Squad/Team roles are obsolete and unsafe for scoped permissions. Website canonical
-        # assignment has already been reapplied above, so these can be removed without guessing assignments.
-        for role in list(guild.roles):
-            if not any(_normalized_role_name(role.name)==_normalized_role_name(x) for x in LEGACY_ASSIGNMENT_ROLE_NAMES):
-                continue
-            if role >= me.top_role:
-                failures.append(f'LEGACY ABOVE CLERK {role.name} ({role.id})'); continue
-            try:
-                await role.delete(reason='Battalion Clerk — remove obsolete generic formation role after canonical migration')
-                deleted.append(f'LEGACY:{role.name}:{role.id}')
-            except Exception as exc:
-                failures.append(f'LEGACY {role.name}: {exc}')
-
-        # Reapply canonical roles one final time and rebuild channel overwrites to ensure automation,
-        # website syncing, and assignment-based Discord access finish in a known-good state.
-        for uid,snapshot in snapshots.items():
-            member=guild.get_member(uid)
-            if member and ASSIGNMENT_ROLE_SYNC_ENABLED:
-                try: await reconcile_assignment_roles_from_canonical(member,snapshot)
-                except Exception as exc: failures.append(f'FINAL MEMBER {uid}: {exc}')
-        roles=await build_battalion_roles(guild)
-        channels=await build_battalion_channels(guild)
-        failures.extend(roles.get('failed',[])); failures.extend(channels.get('failed',[]))
-    finally:
-        # Keep suppression through the Discord event burst, then resume normal syncing. The website has
-        # remained authoritative for the entire operation and no transient role state is written back.
-        await asyncio.sleep(2)
-        for uid in touched:
-            role_sync_suppressed_members.discard((guild.id,uid))
-
-    inv=structure_inventory(guild)
-    return {'canonical_members':len(snapshots),'members_reconciled':migrated,'deleted':deleted,'renamed':renamed,
-            'preserved_permissions':preserved_permissions,'failures':failures,'inventory':inv}
-
-
-@bot.tree.command(name='organization-cleanup', description='Safely consolidate duplicate 1/5 CAV roles using the website as authority.')
-@app_commands.describe(confirm='Set True to migrate members, preserve permissions, and remove safe duplicate/legacy managed roles')
-async def organization_cleanup_command(interaction: discord.Interaction, confirm: bool=False):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True)
-    preview=await organization_cleanup_inventory(interaction.guild)
-    if not confirm:
-        await interaction.followup.send(
-            '**1/5 CAV ORGANIZATION CLEANUP — PREVIEW**\n'
-            f"Duplicate managed name groups: **{len(preview['duplicates'])}**\n"
-            f"Obsolete generic Company/Platoon/Squad/Team roles: **{len(preview['legacy'])}**\n"
-            f"Dormant generated formation roles: **{len(preview.get('dormant',[]))}**\n\n"
-            'No changes were made. The cleanup uses the WEBSITE personnel record as authority, suppresses temporary Discord role-change echo, preserves active-role permissions, archives truly unused formation permission overwrites, then reapplies canonical roles and permissions.\n\n'
-            'Run `/organization-cleanup confirm:True` to execute.',ephemeral=True)
-        return
-    try:
-        result=await run_organization_cleanup(interaction.guild)
-    except Exception as exc:
-        await interaction.followup.send(f'**ORGANIZATION CLEANUP ABORTED**\n`{exc}`\nNo blind cleanup was attempted.',ephemeral=True); return
-    inv=result['inventory']
-    msg=(
-        '**1/5 CAV ORGANIZATION CLEANUP COMPLETE**\n'
-        f"Website-linked Soldiers read: **{result['canonical_members']}**\n"
-        f"Canonical member reconciliations: **{result['members_reconciled']}**\n"
-        f"Roles normalized/renamed: **{len(result['renamed'])}**\n"
-        f"Duplicate/legacy roles removed: **{len(result['deleted'])}**\n"
-        f"Duplicate permission sets preserved: **{result['preserved_permissions']}**\n"
-        f"Remaining duplicate managed role groups: **{len(inv.get('duplicate_managed_roles',[]))}**\n"
-        f"Failures requiring review: **{len(result['failures'])}**\n\n"
-        '**WEBSITE AUTHORITY PRESERVED** — the cleanup never derives Company/Platoon/Squad/Team from a temporary Discord role state.'
-    )
-    if result['failures']:
-        msg += '\n\n**Review**\n'+'\n'.join(f"• {x}" for x in result['failures'][:12])
-    await interaction.followup.send(msg,ephemeral=True)
-
-
 @bot.tree.command(name='battalion-setup', description='Build all 1/5 CAV roles, categories, channels, dividers, and access scopes.')
 @app_commands.describe(confirm='Set to True to build the complete server structure')
 async def battalion_setup(interaction: discord.Interaction, confirm: bool):
@@ -3647,7 +3384,6 @@ async def structure_status(interaction: discord.Interaction):
     if inv['missing_channels']: lines.append("\n**Missing Channels**\n"+"\n".join(f"• {x}" for x in inv['missing_channels'][:10]))
     if inv.get('duplicate_managed_roles'):
         lines.append("\n**Duplicate Managed Roles**\n"+"\n".join(f"• {x['name']} — {x['count']} COPIES" for x in inv['duplicate_managed_roles'][:10]))
-        lines.append("\nRun `/organization-cleanup` for a no-change preview, then `/organization-cleanup confirm:True` for website-authoritative consolidation.")
     await interaction.response.send_message("\n".join(lines),ephemeral=True)
 
 
@@ -3682,30 +3418,6 @@ async def permissions_repair(interaction: discord.Interaction, confirm: bool):
         f"Categories/channels checked/repaired: **{len(channels.get('repaired', []))}**\n"
         f"Failures: **{len(failures)}**\n\n"
         "Rank/MOS/qualification roles remain permission-neutral. Assignment roles control visibility; staff and appointments control functional authority.",
-        ephemeral=True)
-
-
-@bot.tree.command(name='strict-access-rebuild', description='Migrate company, platoon, and squad areas to strict assignment visibility.')
-@app_commands.describe(confirm='Set True to replace legacy access with strict company/platoon/squad access')
-async def strict_access_rebuild(interaction: discord.Interaction, confirm: bool):
-    if not await require_manage_guild(interaction): return
-    if not confirm:
-        await interaction.response.send_message(
-            'No changes made. Run `/strict-access-rebuild confirm:True` when ready.', ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
-    cleanup=await cleanup_legacy_platoon_structure(interaction.guild)
-    roles=await build_battalion_roles(interaction.guild)
-    channels=await build_battalion_channels(interaction.guild)
-    inv=structure_inventory(interaction.guild)
-    failures=cleanup['failed']+roles['failed']+channels['failed']
-    await interaction.followup.send(
-        f"**STRICT ASSIGNMENT ACCESS REBUILT**\n"
-        f"Legacy items removed: **{len(cleanup['deleted'])}**\n"
-        f"New/repaired role items: **{len(roles['created']) + len(roles.get('repaired', []))}**\n"
-        f"New/repaired category/channel items: **{len(channels['created']) + len(channels.get('repaired', []))}**\n"
-        f"Missing roles/categories/channels: **{len(inv['missing_roles'])}/{len(inv['missing_categories'])}/{len(inv['missing_channels'])}**\n"
-        f"Failures: **{len(failures)}**\n\n"
-        "Strict access is now enforced at all three levels: company, platoon, and squad. A Company cannot unlock B/C Company; A Company • 1st Platoon cannot unlock another platoon; and A Company • 1st Platoon • 1st Squad cannot see another squad's channels.",
         ephemeral=True)
 
 
@@ -4119,64 +3831,6 @@ async def orders_channel_status(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-
-
-@bot.tree.command(name='reset-roster', description='Clear the current personnel roster and rebuild only current rank-role holders.')
-@app_commands.describe(confirmation='Type RESET ROSTER exactly')
-async def reset_roster(interaction: discord.Interaction, confirmation: str):
-    if not await require_manage_guild(interaction):
-        return
-    if confirmation.strip().upper() != 'RESET ROSTER':
-        await interaction.response.send_message(
-            'RESET ABORTED. Type `RESET ROSTER` exactly in the confirmation field.',
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        result = await web.request(
-            'POST',
-            '/internal/clerk/personnel/reset',
-            json={'confirmation': 'RESET ROSTER', 'guild_id': interaction.guild_id},
-        )
-    except Exception as exc:
-        await interaction.followup.send(
-            f'ROSTER RESET FAILED: `{exc}`',
-            ephemeral=True,
-        )
-        return
-
-    rebuilt = 0
-    failed = 0
-
-    # The website itself decides whether each member has a recognized rank role.
-    # Members without a rank role remain off the roster.
-    for member in interaction.guild.members:
-        if member.bot:
-            continue
-        try:
-            sync = await sync_personnel_identity(
-                member,
-                create_if_missing=False,
-                reason='post_reset_rank_roster_rebuild',
-                deliver_credentials=True,
-            )
-            if sync and sync.get('created'):
-                rebuilt += 1
-        except Exception:
-            failed += 1
-            log.exception('[POST RESET SYNC FAILED] member=%s (%s)', member.display_name, member.id)
-
-    await interaction.followup.send(
-        '**HEADQUARTERS — BATTALION ROSTER RESET COMPLETE**\n'
-        f"Prior personnel records cleared: **{result.get('cleared_personnel', 0)}**\n"
-        f'Rank-role holders entered on roster: **{rebuilt}**\n'
-        f'Sync failures: **{failed}**\n\n'
-        'Only personnel presently holding a recognized rank role receive a 201 File.',
-        ephemeral=True,
-    )
 
 
 @bot.tree.command(name='duty-channel', description='Assign the permanent voice channel for Training, Operation, or Meeting duty.')
@@ -4963,13 +4617,6 @@ async def battalionbrief_off(interaction:discord.Interaction):
     if not await require_manage_guild(interaction): return
     await _save_brief_config(interaction.guild_id,enabled=False)
     await interaction.response.send_message('Automatic Weekly Battalion Brief posting is **OFF**. Configuration is preserved.',ephemeral=True)
-
-@bot.tree.command(name='weekly-battalion-report-channel', description='Legacy alias: set the Weekly Battalion Brief channel.')
-async def weekly_battalion_report_channel(interaction:discord.Interaction, channel:discord.TextChannel):
-    if not await require_manage_guild(interaction): return
-    await set_report_channel(interaction.guild_id,'WEEKLY_BATTALION_REPORT',channel.id)
-    await _save_brief_config(interaction.guild_id,channel_id=channel.id,enabled=True)
-    await interaction.response.send_message(f'Weekly Battalion Brief channel set to {channel.mention}. Use `/brief setup` to change the schedule.',ephemeral=True)
 
 @bot.tree.command(name='nco-accountability-channel', description='Set the channel for the weekly NCO/company member-attention rollup.')
 async def nco_accountability_channel(interaction:discord.Interaction, channel:discord.TextChannel):
@@ -6212,22 +5859,6 @@ async def combat_return(interaction:discord.Interaction):
     result=await _return_combat_members(interaction.guild,dict(row))
     await interaction.followup.send(f"Returned **{result['moved']}** member(s) to the Ready Room."+(f" Failures: {', '.join(result['failures'][:5])}" if result['failures'] else ''),ephemeral=True)
 
-# Backward-compatible command aliases from the original randomizer.
-@bot.tree.command(name='match-formation-setup', description='Legacy alias: configure Ready Room, roster channel, and side.')
-@app_commands.describe(voice_channel='Ready Room',text_channel='Combat roster text channel',side='Current faction')
-@app_commands.choices(side=[app_commands.Choice(name='U.S. side',value='US'),app_commands.Choice(name='NVA side',value='NVA')])
-async def match_formation_setup(interaction:discord.Interaction,voice_channel:discord.VoiceChannel,text_channel:discord.TextChannel,side:app_commands.Choice[str]):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message('Manage Server permission is required.',ephemeral=True); return
-    await interaction.response.defer(ephemeral=True); await ensure_match_formation_schema()
-    active=await _latest_active_hll_match_id(); done=await _latest_completed_hll_match_id()
-    await collector.db.execute("""INSERT INTO clerk_match_formation_config(guild_id,voice_channel_id,text_channel_id,side_mode,enabled,last_started_match_id,last_returned_match_id,updated_by)
-        VALUES($1,$2,$3,$4,TRUE,$5,$6,$7)
-        ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=EXCLUDED.voice_channel_id,text_channel_id=EXCLUDED.text_channel_id,
-          side_mode=EXCLUDED.side_mode,enabled=TRUE,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
-        interaction.guild_id,voice_channel.id,text_channel.id,side.value,active,done,interaction.user.id)
-    await interaction.followup.send('Combat roster base configuration saved. Use `/combat channel` for Infantry 1–3, Tank 1–3, and Helicopter 1–3.',ephemeral=True)
-
 @bot.tree.command(name='activity-channel-add', description='Allow a voice channel to count toward Soldier activity.')
 @app_commands.describe(channel='Voice channel to count as activity')
 async def activity_channel_add(interaction: discord.Interaction, channel: discord.VoiceChannel):
@@ -6554,33 +6185,13 @@ async def recruit_intake_health(interaction:discord.Interaction):
             f'Website queue reachable: **YES**\nPending manual interviews: **{len(cases)}**\n'
             f'Queue sample: **{sample}**\n'
             f'Configured battalion guild: **{GUILD_ID or "AUTO"}**\n'
-            'If a case is pending here for more than one poll cycle, use `/test-recruit-intake` to separate a Discord DM problem from a Website queue problem.',
+            'If a case is pending here for more than one poll cycle, run `/recruiting system-check` and review the intake health details.',
             ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(
             '**REPLACEMENT INTERVIEW PIPELINE — FAILED**\n'
             f'Website queue could not be read: `{type(exc).__name__}: {str(exc)[:350]}`\n'
             'Check the Website service URL, CLERK_SYNC_KEY on both services, and Railway logs.',ephemeral=True)
-
-
-@bot.tree.command(name='test-recruit-intake',description='Send the exact Replacement Interview DM directly to a Discord member for testing.')
-@app_commands.describe(member='Member who should receive the test DM')
-async def test_recruit_intake(interaction:discord.Interaction, member:discord.Member):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        await member.send(_manual_recruit_intake_message('TEST DELIVERY'),view=RecruitIntakePromptView())
-        await interaction.followup.send(
-            f'**TEST REPLACEMENT INTERVIEW SENT**\nRecipient: **{member.display_name}** (`{member.id}`)\n'
-            'This bypassed the Website queue and tested Discord DM delivery directly. The **BEGIN / RESUME INTAKE** button is live.',
-            ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            f'**TEST DM BLOCKED**\nDiscord would not allow Battalion Clerk to DM **{member.display_name}**. '
-            'Have the member enable server DMs or message/interact with the bot first.',ephemeral=True)
-    except Exception as exc:
-        await interaction.followup.send(
-            f'**TEST DM FAILED**\n`{type(exc).__name__}: {str(exc)[:400]}`',ephemeral=True)
 
 
 @bot.tree.command(name='apply',description='Begin or resume your 1/5 Cavalry recruiting intake in Discord.')
@@ -6698,113 +6309,6 @@ async def application_system_check(interaction:discord.Interaction):
         ephemeral=True
     )
 
-
-async def _retroactive_accession_member(member: discord.Member, *, send_message: bool=True) -> dict:
-    """Safely stage an existing Discord member into the website-authoritative accession flow.
-
-    This never creates personnel, never duplicates a Recruiting Case, and never changes an
-    established Soldier. It only reconciles the recruit-status role and optionally sends the
-    same website-first instructions used for a new Discord arrival.
-    """
-    if member.bot:
-        return {'status':'BOT','messaged':False}
-    await collector.upsert_member(member)
-    existing=await sync_personnel_identity(member,create_if_missing=False,reason='accessions_backfill',deliver_credentials=False)
-    if existing and existing.get('linked'):
-        await clear_recruit_status_roles(member)
-        return {'status':'LINKED SOLDIER','messaged':False}
-
-    recruit=await recruiting_status_for(member)
-    case=recruit.get('case') if recruit and recruit.get('exists') else None
-    if case:
-        # Presence in the guild resolves any historical auto-join/OAuth failure.
-        try:
-            await web.request('POST',f"/internal/clerk/recruiting/{case.get('id')}/join-status",json={'joined':True,'guild_id':member.guild.id})
-        except Exception as exc:
-            log.warning('[RECRUIT PRESENCE RECONCILE FAILED] member=%s case=%s error=%s',member.id,case.get('case_number'),exc)
-    status=str((case or {}).get('status') or '').upper()
-    if status in {'DENIED','CLOSED','ENLISTED'}:
-        await clear_recruit_status_roles(member)
-        return {'status':status or 'CLOSED','messaged':False}
-
-    approved=bool(case and status in {'REPLACEMENT_DEPOT','APPROVED_AWAITING_PROCESSING'})
-    await ensure_recruit_status_role(member,approved=approved)
-    if approved:
-        await process_approved_recruit_case(member.guild,case,member=member)
-        return {'status':'APPROVED REPLACEMENT','messaged':False}
-
-    if not send_message:
-        return {'status':status or 'NO INTAKE','messaged':False}
-
-    if case:
-        if status=='MORE_INFO_REQUIRED':
-            status_url=f"{WEBSITE_BASE_URL}/recruiting/status/{case.get('public_token')}" if WEBSITE_BASE_URL else 'your Recruiting Case status page'
-            msg=(f"**1/5 CAV — RECRUITING CASE ACTION REQUIRED**\n"
-                 f"Recruiting Case **{case.get('case_number')}** needs additional information.\n"
-                 f"Respond here: {status_url}")
-        else:
-            msg=(f"**1/5 CAV — RECRUITING CASE LOCATED**\n"
-                 f"Recruiting Case **{case.get('case_number')}** is already on file and linked to your Discord account.\n"
-                 f"Status: **{(status or 'COMMAND REVIEW').replace('_',' ')}**\n\n"
-                 "Do **not** start another intake. Battalion Clerk will notify you when Headquarters acts on your case.")
-    else:
-        app_url=f"{WEBSITE_BASE_URL}/recruiting" if WEBSITE_BASE_URL else 'the battalion website — Enlist page'
-        msg=("**1/5 CAV — REPORT TO RECRUITING**\n\n"
-             "You are in the battalion Discord, but no linked Soldier Record or Recruiting Case was found for you.\n\n"
-             f"Start your enlistment in Discord with **/apply**. Recruiting information: {app_url}\n\n"
-             "Once accepted, Battalion Clerk will assign the temporary Replacement access state until Command files your formation, then switch you to Member and issue your website access automatically.\n\n"
-             "If you have a legacy Recruiting Case, use **/apply** and choose **LINK EXISTING CASE** to attach it.")
-    try:
-        await member.send(msg)
-        return {'status':status or 'NO INTAKE','messaged':True}
-    except discord.Forbidden:
-        return {'status':status or 'NO INTAKE','messaged':False,'dm_blocked':True}
-
-
-@bot.tree.command(name='accessions-backfill', description='Command: sweep existing Discord arrivals into the 1/5 Cav accession pipeline.')
-@app_commands.describe(send_messages='DM website-first recruiting instructions to unlinked arrivals during this sweep.')
-async def accessions_backfill(interaction: discord.Interaction, send_messages: bool=True):
-    if not await require_manage_guild(interaction):
-        return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    guild=interaction.guild
-    if not guild:
-        await interaction.followup.send('This command must be run inside the battalion Discord.',ephemeral=True)
-        return
-    counts={'linked':0,'prospective':0,'case':0,'approved':0,'messaged':0,'blocked':0,'closed':0,'errors':0}
-    errors=[]
-    for member in list(guild.members):
-        if member.bot:
-            continue
-        try:
-            result=await _retroactive_accession_member(member,send_message=send_messages)
-            state=str(result.get('status') or '')
-            if state=='LINKED SOLDIER': counts['linked']+=1
-            elif state=='APPROVED REPLACEMENT': counts['approved']+=1
-            elif state in {'DENIED','CLOSED','ENLISTED'}: counts['closed']+=1
-            elif state=='NO INTAKE': counts['prospective']+=1
-            else: counts['case']+=1
-            if result.get('messaged'): counts['messaged']+=1
-            if result.get('dm_blocked'): counts['blocked']+=1
-        except Exception as exc:
-            counts['errors']+=1
-            if len(errors)<5:
-                errors.append(f'{member.display_name}: {str(exc)[:120]}')
-            log.warning('[ACCESSIONS BACKFILL FAILED] member=%s error=%s',member.id,exc)
-        await asyncio.sleep(0.15)
-    summary=("**ACCESSIONS BACKFILL COMPLETE**\n"
-             f"Established Soldiers untouched: **{counts['linked']}**\n"
-             f"Replacements staged: **{counts['prospective']}**\n"
-             f"Existing recruiting cases reconciled: **{counts['case']}**\n"
-             f"Approved Replacements reconciled: **{counts['approved']}**\n"
-             f"Recruiting DMs sent: **{counts['messaged']}**\n"
-             f"DMs blocked: **{counts['blocked']}**\n"
-             f"Closed/enlisted cases skipped: **{counts['closed']}**\n"
-             f"Errors: **{counts['errors']}**")
-    if errors:
-        summary += "\n\nFirst errors:\n" + "\n".join(f"• {e}" for e in errors)
-    summary += "\n\nNo personnel records or duplicate Recruiting Cases were created by this sweep."
-    await interaction.followup.send(summary[:1900],ephemeral=True)
 
 @bot.tree.command(name="application-status", description="Show the recruiting case linked to your Discord account.")
 async def application_status(interaction: discord.Interaction):
@@ -8801,19 +8305,6 @@ async def unlink_game(interaction:discord.Interaction):
     )
 
 
-@bot.tree.command(name='hll-unlink', description='Legacy alias: unlink your HLL identity before using /link-game again.')
-async def hll_unlink(interaction:discord.Interaction):
-    # Keep the old command working for members who already know it, but route it
-    # through the same safe identity-only behavior as /unlink-game.
-    if not interaction.guild:
-        await interaction.response.send_message('Use this command inside the 1/5 CAV Discord server.',ephemeral=True); return
-    ok=await hllv.unlink_personnel(interaction.guild.id,interaction.user.id)
-    await interaction.response.send_message(
-        'Your HLL game identity was unlinked. Your historical telemetry was preserved. Use `/link-game` to file the correct identity.'
-        if ok else 'No HLL identity link was on file. You can use `/link-game` now.',
-        ephemeral=True
-    )
-
 @bot.tree.command(name='unlink-member-game', description='Command: unlink a Soldier’s incorrect SteamID64 or console gamertag.')
 @app_commands.describe(member='Soldier whose current HLL game identity should be cleared')
 async def unlink_member_game(interaction:discord.Interaction, member:discord.Member):
@@ -9024,17 +8515,6 @@ async def server_message_clear(interaction:discord.Interaction):
     if not result.get('ok'):
         await interaction.followup.send(f"Server message could not be cleared: **{result.get('error','unknown error')}**",ephemeral=True); return
     await interaction.followup.send('**SERVER MESSAGE CLEARED**',ephemeral=True)
-
-@bot.tree.command(name='hll-vip-sync', description='Command staff: reconcile active 1/5 Cav Soldiers with the HLL VIP whitelist.')
-async def hll_vip_sync_command(interaction: discord.Interaction):
-    if not await require_manage_guild(interaction): return
-    await interaction.response.defer(ephemeral=True,thinking=True)
-    try:
-        await hll_vip_sync_watch()
-        await interaction.followup.send(f'VIP reconciliation requested. Reserved VIP slots: **{HLL_VIP_RESERVED_SLOTS}**. Manual VIPs not managed by Battalion Clerk are protected.',ephemeral=True)
-    except Exception as exc:
-        await interaction.followup.send(f'VIP reconciliation failed: `{exc}`',ephemeral=True)
-
 
 hll_group = app_commands.Group(name='hll', description='HLL: Vietnam telemetry status, research, and member statistics.')
 
