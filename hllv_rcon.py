@@ -1694,6 +1694,151 @@ class HLLVTelemetryCollector:
             "player_count": int(row.get("last_player_count") or 0) if row else 0,
         }
 
+    @staticmethod
+    def _identity_platform_family(value: Any) -> str:
+        compact=''.join(ch for ch in str(value or '').casefold() if ch.isalnum())
+        if not compact:
+            return 'UNKNOWN'
+        if 'steam' in compact:
+            return 'STEAM'
+        if any(token in compact for token in (
+            'xbox','microsoft','msstore','microsoftstore','windowsstore',
+            'gamepass','xboxapp','gdk','wingdk','xboxpc','pcxbox'
+        )):
+            return 'XBOX'
+        if any(token in compact for token in ('playstation','ps5','psn','sony')):
+            return 'PS5'
+        if compact in {'pc','windows','win','win32','win64','eos','epic','unknown','desktop','computer'}:
+            return 'NEUTRAL'
+        return 'UNKNOWN'
+
+    async def _console_identity_candidates(self, name: str) -> list[dict]:
+        rows=await self.db.fetch(
+            """SELECT steam_id,player_name,platform,platform_user_id,eos_id,last_seen_at
+                 FROM hll_player_match_stats
+                WHERE LOWER(TRIM(COALESCE(player_name,'')))=LOWER(TRIM($1))
+                ORDER BY last_seen_at DESC NULLS LAST
+                LIMIT 100""",
+            str(name or '').strip())
+        unique={}
+        for obj in rows or []:
+            row=dict(obj)
+            key=str(row.get('steam_id') or '').strip()
+            if key and key not in unique:
+                unique[key]=row
+        return list(unique.values())
+
+    async def _resolve_console_identity(self, platform: str, name: str):
+        platform=str(platform or '').strip().upper()
+        rows=await self._console_identity_candidates(name)
+        if not rows:
+            return None,'NOT_OBSERVED',(
+                f"No {platform} player named '{name}' has been observed by Battalion Clerk yet. "
+                "Have them join the 1/5 CAV server once, then retry."
+            )
+
+        direct=[row for row in rows if self._identity_platform_family(row.get('platform'))==platform]
+        if len(direct)==1:
+            return direct[0],'PLATFORM_FAMILY',None
+        if len(direct)>1:
+            return None,'AMBIGUOUS',(
+                f"Multiple durable HLL identities named '{name}' were observed for {platform}. "
+                "Battalion Clerk will not guess."
+            )
+
+        safe=[
+            row for row in rows
+            if self._identity_platform_family(row.get('platform')) in {'NEUTRAL','UNKNOWN',platform}
+        ]
+        if len(safe)==1:
+            return safe[0],'UNIQUE_EXACT_NAME',None
+        if len(safe)>1:
+            return None,'AMBIGUOUS',(
+                f"More than one durable HLL identity uses the exact in-game name '{name}'. "
+                "Battalion Clerk will not guess."
+            )
+
+        labels=', '.join(sorted({str(row.get('platform') or 'UNKNOWN').strip() or 'UNKNOWN' for row in rows}))
+        return None,'PLATFORM_CONFLICT',(
+            f"The exact in-game name '{name}' was observed only on a conflicting platform label ({labels})."
+        )
+
+    async def _complete_console_identity_claim(self, claim: dict) -> bool:
+        platform=str(claim.get('platform') or '').strip().upper()
+        name=str(claim.get('claimed_identity') or '').strip()
+        personnel_id=str(claim.get('personnel_id') or '').strip()
+        if platform not in {'XBOX','PS5'} or not name or not personnel_id:
+            return False
+
+        row,basis,error=await self._resolve_console_identity(platform,name)
+        if not row:
+            if basis!='NOT_OBSERVED':
+                await self.db.execute(
+                    "UPDATE hll_identity_claims SET status='CONFLICT',error=$1,updated_at=NOW() WHERE id=$2",
+                    str(error or 'Identity could not be resolved')[:500],claim['id'])
+            return False
+
+        player_key=str(row.get('steam_id') or '').strip()
+        if not player_key:
+            return False
+        other=await self.db.fetchrow(
+            'SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1',
+            player_key)
+        if other and str(other.get('personnel_id') or '').strip()!=personnel_id:
+            await self.db.execute(
+                "UPDATE hll_identity_claims SET status='CONFLICT',error='Observed HLL account is already linked to another Soldier',updated_at=NOW() WHERE id=$1",
+                claim['id'])
+            return False
+        owned=await self.db.fetchrow(
+            'SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1 LIMIT 1',
+            personnel_id)
+        if owned and str(owned.get('steam_id') or '').strip()!=player_key:
+            await self.db.execute(
+                "UPDATE hll_identity_claims SET status='CONFLICT',error='Soldier already linked to a different HLL identity',updated_at=NOW() WHERE id=$1",
+                claim['id'])
+            return False
+
+        await self.db.execute(
+            """INSERT INTO hll_personnel_links(
+                   steam_id,personnel_id,discord_user_id,hll_player_name,platform,
+                   platform_user_id,eos_id,linked_by,verified,updated_at)
+               VALUES($1,$2,$3,$4,$5,$6,$7,'IDENTITY COMPAT AUTO-VERIFY',TRUE,NOW())
+               ON CONFLICT(steam_id) DO UPDATE SET
+                   personnel_id=EXCLUDED.personnel_id,
+                   discord_user_id=EXCLUDED.discord_user_id,
+                   hll_player_name=EXCLUDED.hll_player_name,
+                   platform=EXCLUDED.platform,
+                   platform_user_id=EXCLUDED.platform_user_id,
+                   eos_id=EXCLUDED.eos_id,
+                   linked_by='IDENTITY COMPAT AUTO-VERIFY',
+                   verified=TRUE,
+                   updated_at=NOW()""",
+            player_key,personnel_id,str(claim.get('discord_user_id') or '').strip() or None,
+            row.get('player_name'),row.get('platform'),row.get('platform_user_id'),row.get('eos_id'))
+        await self.db.execute(
+            'UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)',
+            personnel_id,player_key)
+        try:
+            await self.db.execute(
+                'UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)',
+                personnel_id,player_key)
+        except Exception:
+            pass
+        await self.db.execute(
+            "UPDATE hll_identity_claims SET status='VERIFIED',linked_player_key=$1,error=NULL,linked_at=NOW(),updated_at=NOW() WHERE id=$2",
+            player_key,claim['id'])
+        try:
+            if claim.get('recruiting_case_id'):
+                await self.db.execute(
+                    "UPDATE recruiting_cases SET game_identity_link_status='VERIFIED',game_identity_link_error=NULL,game_identity_linked_at=NOW(),updated_at=NOW() WHERE id=$1",
+                    claim.get('recruiting_case_id'))
+        except Exception:
+            pass
+        log.info(
+            '[HLL PENDING CLAIM %s] claim=%s personnel=%s name=%s requested=%s observed_platform=%s',
+            basis,claim.get('id'),personnel_id,row.get('player_name'),platform,row.get('platform'))
+        return True
+
     async def _reconcile_pending_identity_claims(self):
         """Resolve recruiting-filed HLL identities without requiring a Discord command."""
         claims = await self.db.fetch("""
@@ -1735,45 +1880,9 @@ class HLLVTelemetryCollector:
                         pass
                     continue
 
-                if platform not in {"XBOX", "PS5"}:
+                if platform in {"XBOX", "PS5"}:
+                    await self._complete_console_identity_claim(claim)
                     continue
-                if platform == "XBOX":
-                    pred = "LOWER(COALESCE(platform,'')) LIKE '%xbox%'"
-                else:
-                    pred = "(LOWER(COALESCE(platform,'')) LIKE '%playstation%' OR LOWER(COALESCE(platform,'')) LIKE '%ps5%' OR LOWER(COALESCE(platform,'')) LIKE '%psn%')"
-                row = await self.db.fetchrow(f"""
-                    SELECT steam_id,player_name,platform,platform_user_id,eos_id,last_seen_at
-                    FROM hll_player_match_stats
-                    WHERE LOWER(player_name)=LOWER($1) AND {pred}
-                    ORDER BY last_seen_at DESC LIMIT 1
-                """, identity)
-                if not row:
-                    continue
-                player_key=str(row.get("steam_id") or "").strip()
-                if not player_key:
-                    continue
-                conflict=await self.db.fetchrow("SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1",player_key)
-                if conflict and str(conflict.get("personnel_id") or "") != personnel_id:
-                    await self.db.execute("UPDATE hll_identity_claims SET status='CONFLICT',error=$1,updated_at=NOW() WHERE id=$2", "Observed console account already linked to another Soldier", claim["id"])
-                    continue
-                owned=await self.db.fetchrow("SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1",personnel_id)
-                if owned and str(owned.get("steam_id") or "") != player_key:
-                    await self.db.execute("UPDATE hll_identity_claims SET status='CONFLICT',error=$1,updated_at=NOW() WHERE id=$2", "Soldier already linked to a different HLL identity", claim["id"])
-                    continue
-                await self.db.execute("""
-                    INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,hll_player_name,platform,platform_user_id,eos_id,linked_by,verified,updated_at)
-                    VALUES($1,$2,$3,$4,$5,$6,$7,'RECRUITING AUTO-VERIFY',TRUE,NOW())
-                    ON CONFLICT(steam_id) DO UPDATE SET personnel_id=EXCLUDED.personnel_id,discord_user_id=EXCLUDED.discord_user_id,
-                      hll_player_name=EXCLUDED.hll_player_name,platform=EXCLUDED.platform,platform_user_id=EXCLUDED.platform_user_id,eos_id=EXCLUDED.eos_id,
-                      linked_by='RECRUITING AUTO-VERIFY',verified=TRUE,updated_at=NOW()
-                """, player_key, personnel_id, discord_user_id, row.get("player_name"), row.get("platform"), row.get("platform_user_id"), row.get("eos_id"))
-                await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2",personnel_id,player_key)
-                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2",personnel_id,player_key)
-                await self.db.execute("UPDATE hll_identity_claims SET status='VERIFIED',linked_player_key=$1,error=NULL,linked_at=NOW(),updated_at=NOW() WHERE id=$2",player_key,claim["id"])
-                try:
-                    await self.db.execute("UPDATE recruiting_cases SET game_identity_link_status='VERIFIED',game_identity_link_error=NULL,game_identity_linked_at=NOW(),updated_at=NOW() WHERE id=$1", claim.get("recruiting_case_id"))
-                except Exception:
-                    pass
             except Exception as exc:
                 log.warning("[HLLV IDENTITY CLAIM] id=%s platform=%s error=%s", claim.get("id"), platform, exc)
                 await self.db.execute("UPDATE hll_identity_claims SET error=$1,updated_at=NOW() WHERE id=$2", str(exc)[:500], claim["id"])
@@ -1849,60 +1958,78 @@ class HLLVTelemetryCollector:
         return {"ok": True, "personnel_id": person["personnel_id"], "soldier": name, "steam_id": steam_id}
 
     async def link_console_personnel(self, guild_id: int, discord_user_id: int, platform: str, gamertag: str, linked_by: str) -> dict:
-        """Resolve an Xbox/PlayStation display name to the durable RCON identity
-        already observed on this server, then link it to a Soldier Record.
-        """
+        """Resolve Xbox/Microsoft Store PC/PlayStation display names without guessing identity."""
         await self.collector.start()
-        platform = str(platform or "").strip().upper()
-        gamertag = str(gamertag or "").strip()
-        if platform not in {"XBOX", "PS5"}:
-            return {"ok": False, "error": "Platform must be Xbox or PlayStation 5."}
+        platform=str(platform or '').strip().upper()
+        gamertag=str(gamertag or '').strip()
+        if platform not in {'XBOX','PS5'}:
+            return {'ok':False,'error':'Platform must be Xbox/Microsoft Store PC or PlayStation 5.'}
         if not gamertag:
-            return {"ok": False, "error": "Enter the console gamertag / PSN Online ID."}
-        person = await self._person_for_discord(guild_id, discord_user_id)
+            return {'ok':False,'error':'Enter the exact in-game Xbox/Microsoft gamertag or PSN Online ID.'}
+
+        person=await self._person_for_discord(guild_id,discord_user_id)
         if not person:
-            return {"ok": False, "error": "No active Soldier Record is linked to that Discord account."}
-        # HLLV platform labels vary slightly by RCON/client build. Match the
-        # requested console family plus the exact visible in-game name.
-        if platform == "XBOX":
-            platform_pred = "LOWER(COALESCE(platform,'')) LIKE '%xbox%'"
-        else:
-            platform_pred = "(LOWER(COALESCE(platform,'')) LIKE '%playstation%' OR LOWER(COALESCE(platform,'')) LIKE '%ps5%' OR LOWER(COALESCE(platform,'')) LIKE '%psn%')"
-        row = await self.db.fetchrow(f"""
-            SELECT steam_id,player_name,platform,platform_user_id,eos_id,last_seen_at
-            FROM hll_player_match_stats
-            WHERE LOWER(player_name)=LOWER($1) AND {platform_pred}
-            ORDER BY last_seen_at DESC LIMIT 1
-        """, gamertag)
+            return {'ok':False,'error':'No active Soldier Record is linked to that Discord account.'}
+
+        row,basis,error=await self._resolve_console_identity(platform,gamertag)
         if not row:
-            return {"ok": False, "error": f"No {platform} player named '{gamertag}' has been observed by Battalion Clerk yet. Have them join the 1/5 CAV server once, then run this command again."}
-        player_key = str(row.get("steam_id") or "").strip()
+            return {'ok':False,'error':error,'match_state':basis}
+
+        player_key=str(row.get('steam_id') or '').strip()
+        personnel_id=str(person['personnel_id'])
         if not player_key:
-            return {"ok": False, "error": "The server saw that player name but did not expose a stable platform identity. Try again while the player is currently in the server."}
-        existing_identity = await self.db.fetchrow("SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1 LIMIT 1", player_key)
-        if existing_identity and str(existing_identity.get("personnel_id") or "") != str(person["personnel_id"]):
-            return {"ok": False, "error": "That console identity is already linked to another Soldier Record. Command/S-1 must resolve the ownership conflict."}
-        owned_identity = await self.db.fetchrow("SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1 LIMIT 1", str(person["personnel_id"]))
-        if owned_identity and str(owned_identity.get("steam_id") or "") != player_key:
-            return {"ok": False, "error": "Your Soldier Record still has a different game identity on file. Run /unlink-game first, then retry /link-game."}
+            return {'ok':False,'error':'The server saw that exact name but did not expose a durable player ID.'}
+
+        other=await self.db.fetchrow(
+            'SELECT personnel_id FROM hll_personnel_links WHERE steam_id=$1 LIMIT 1',
+            player_key)
+        if other and str(other.get('personnel_id') or '').strip()!=personnel_id:
+            return {'ok':False,'error':'That HLL identity is already linked to another Soldier Record. Command/S-1 must resolve it.'}
+        owned=await self.db.fetchrow(
+            'SELECT steam_id FROM hll_personnel_links WHERE personnel_id=$1 LIMIT 1',
+            personnel_id)
+        if owned and str(owned.get('steam_id') or '').strip()!=player_key:
+            return {'ok':False,'error':'Your Soldier Record still has a different game identity on file. Run /unlink-game first.'}
+
         try:
-            if existing_identity:
-                await self.db.execute("""UPDATE hll_personnel_links SET discord_user_id=$1,hll_player_name=$2,platform=$3,platform_user_id=$4,eos_id=$5,linked_by=$6,verified=TRUE,updated_at=NOW() WHERE steam_id=$7 AND personnel_id=$8""",
-                                      str(discord_user_id),row.get("player_name"),row.get("platform"),row.get("platform_user_id"),row.get("eos_id"),linked_by,player_key,str(person["personnel_id"]))
-            else:
-                await self.db.execute("""
-                    INSERT INTO hll_personnel_links(steam_id,personnel_id,discord_user_id,hll_player_name,platform,platform_user_id,eos_id,linked_by,verified,updated_at)
-                    VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,NOW())
-                """, player_key, str(person["personnel_id"]), str(discord_user_id), row.get("player_name"), row.get("platform"), row.get("platform_user_id"), row.get("eos_id"), linked_by)
-            await self.db.execute("UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), player_key)
+            await self.db.execute(
+                """INSERT INTO hll_personnel_links(
+                       steam_id,personnel_id,discord_user_id,hll_player_name,platform,
+                       platform_user_id,eos_id,linked_by,verified,updated_at)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,NOW())
+                   ON CONFLICT(steam_id) DO UPDATE SET
+                       personnel_id=EXCLUDED.personnel_id,
+                       discord_user_id=EXCLUDED.discord_user_id,
+                       hll_player_name=EXCLUDED.hll_player_name,
+                       platform=EXCLUDED.platform,
+                       platform_user_id=EXCLUDED.platform_user_id,
+                       eos_id=EXCLUDED.eos_id,
+                       linked_by=EXCLUDED.linked_by,
+                       verified=TRUE,
+                       updated_at=NOW()""",
+                player_key,personnel_id,str(discord_user_id),row.get('player_name'),
+                row.get('platform'),row.get('platform_user_id'),row.get('eos_id'),linked_by)
+            await self.db.execute(
+                'UPDATE hll_player_match_stats SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)',
+                personnel_id,player_key)
             try:
-                await self.db.execute("UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)", str(person["personnel_id"]), player_key)
+                await self.db.execute(
+                    'UPDATE hll_research_samples SET personnel_id=$1 WHERE steam_id=$2 AND (personnel_id IS NULL OR personnel_id=$1)',
+                    personnel_id,player_key)
             except Exception:
                 pass
         except Exception as exc:
-            return {"ok": False, "error": f"Link conflict: {exc}"}
-        name = f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
-        return {"ok": True, "status":"VERIFIED", "verified":True, "personnel_id": person["personnel_id"], "soldier": name, "player_name": row.get("player_name"), "platform": platform, "player_key": player_key}
+            return {'ok':False,'error':f'Link conflict: {exc}'}
+
+        soldier=f"{person.get('rank_code') or ''} {person.get('first_name') or ''} {person.get('last_name') or ''}".strip()
+        log.info(
+            '[HLL IDENTITY LINK %s] personnel=%s name=%s requested=%s observed_platform=%s',
+            basis,personnel_id,row.get('player_name'),platform,row.get('platform'))
+        return {
+            'ok':True,'status':'VERIFIED','verified':True,'personnel_id':personnel_id,
+            'soldier':soldier,'player_name':row.get('player_name'),'platform':platform,
+            'observed_platform':row.get('platform'),'player_key':player_key,'matched_by':basis,
+        }
 
     async def staff_link_identity(self, guild_id: int, discord_user_id: int, platform: str, identity: str, linked_by: str) -> dict:
         """Command-staff repair path for HLL identity links.
