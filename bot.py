@@ -717,65 +717,6 @@ async def reset_battalion_roles(guild: discord.Guild):
             failed.append(f"{role.name}: {exc}")
     return {"deleted":deleted,"failed":failed,"skipped":skipped}
 
-async def cleanup_retired_supply_staff_structure(guild: discord.Guild):
-    """Retire the obsolete supply staff shop and move its remaining workload to Command."""
-    deleted=[]; migrated=[]; failed=[]
-    me=guild.me
-
-    # Existing website Personnel Actions filed to the retired shop become HQ-owned
-    # so they surface in the Command workflow instead of becoming orphaned.
-    try:
-        await collector.start()
-        db=getattr(collector,'db',None)
-        if db and getattr(db,'pool',None):
-            await db.execute("""UPDATE personnel_actions
-                                   SET owning_section='HQ'
-                                 WHERE UPPER(COALESCE(owning_section,'')) IN ('S-4','S4')""")
-            migrated.append('PERSONNEL_ACTIONS:SUPPLY->HQ')
-    except Exception as exc:
-        failed.append(f'PERSONNEL ACTION MIGRATION: {exc}')
-
-    # Route future Supply request notifications to the existing Command desk when
-    # one is available. The Personnel Action itself is always HQ-owned regardless.
-    try:
-        command_channel=(discord.utils.get(guild.text_channels,name='command-desk')
-                         or discord.utils.get(guild.text_channels,name='command-actions'))
-        if command_channel:
-            await set_report_channel(guild.id,'REQUEST_SUPPLY',command_channel.id)
-            migrated.append(f'REQUEST_SUPPLY->{command_channel.name}')
-    except Exception as exc:
-        failed.append(f'SUPPLY ROUTE MIGRATION: {exc}')
-
-    # Remove the retired shop's channels/category. These names were created by
-    # Battalion Clerk's managed structure, so unrelated custom channels are untouched.
-    retired_category=discord.utils.get(guild.categories,name='S-4 SUPPLY & LOGISTICS')
-    if retired_category and me and me.guild_permissions.manage_channels:
-        for channel in list(retired_category.channels):
-            try:
-                await channel.delete(reason='Battalion Clerk — retire obsolete supply staff shop; Command now owns supply requests')
-                deleted.append(f'CHANNEL:{channel.name}')
-            except Exception as exc:
-                failed.append(f'CHANNEL {channel.name}: {exc}')
-        try:
-            await retired_category.delete(reason='Battalion Clerk — retire obsolete supply staff shop')
-            deleted.append('CATEGORY:S-4 SUPPLY & LOGISTICS')
-        except Exception as exc:
-            failed.append(f'CATEGORY S-4 SUPPLY & LOGISTICS: {exc}')
-
-    # Remove only the three explicitly retired managed roles.
-    if me and me.guild_permissions.manage_roles:
-        for role_name in ('S-4 OIC','S-4 NCOIC','S-4 Supply'):
-            role=discord.utils.get(guild.roles,name=role_name)
-            if role and role < me.top_role:
-                try:
-                    await role.delete(reason='Battalion Clerk — retire obsolete supply staff role; Command now owns supply requests')
-                    deleted.append(f'ROLE:{role_name}')
-                except Exception as exc:
-                    failed.append(f'ROLE {role_name}: {exc}')
-
-    return {'deleted':deleted,'migrated':migrated,'failed':failed}
-
-
 async def cleanup_legacy_platoon_structure(guild: discord.Guild):
     """Remove only old Battalion Clerk platoon channels/roles superseded by strict access."""
     deleted=[]; failed=[]
@@ -5344,20 +5285,6 @@ async def on_ready():
         await ensure_commendations_table()
     except Exception:
         log.exception("[COMMENDATIONS TABLE INIT FAILED]")
-    # Retire the obsolete supply staff shop and move any remaining Supply work
-    # to Command/HQ. Idempotent and restricted to the old Clerk-managed names.
-    if not getattr(bot, '_retired_supply_staff_cleanup_done', False):
-        for guild in bot.guilds:
-            if GUILD_ID and guild.id != GUILD_ID:
-                continue
-            try:
-                result=await cleanup_retired_supply_staff_structure(guild)
-                if result.get('deleted') or result.get('migrated') or result.get('failed'):
-                    log.info('[RETIRED SUPPLY STAFF CLEANUP] guild=%s result=%s',guild.id,result)
-            except Exception:
-                log.exception('[RETIRED SUPPLY STAFF CLEANUP FAILED] guild=%s',guild.id)
-        bot._retired_supply_staff_cleanup_done=True
-
     # Retire the pre-Welcome-Packet Approved Replacement Discord role. This is
     # idempotent and only touches the explicitly named legacy managed role.
     if not getattr(bot, '_legacy_recruit_role_cleanup_done', False):
