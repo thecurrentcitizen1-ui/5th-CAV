@@ -2436,13 +2436,37 @@ async def reconcile_assignment_roles_from_canonical(member: discord.Member, resu
     """
     if not result.get('linked'):
         return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
-    if not ASSIGNMENT_ROLE_SYNC_ENABLED:
-        return {'ok':True,'manual_mode':True,'scope':'ASSIGNMENT_ONLY_DISABLED','added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
-
     reason=str(result.get('reason') or '')
     if not _assignment_sync_reason(reason):
         log.info('[ASSIGNMENT ROLE SYNC SKIP] member=%s reason=%s',member.id,reason)
         return {'ok':True,'manual_mode':True,'scope':'NON_ASSIGNMENT_IGNORED','added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
+
+    # Replacement is the post-assignment marker. Intake alone never grants it.
+    unit_name=_normalized_role_name(result.get('unit_code') or '')
+    assigned=bool(result.get('unit_node_id') and unit_name not in {'','UNASSIGNED','REPLACEMENT','REPLACEMENT DETACHMENT'})
+    replacement=_role_by_name(member.guild,'Replacement')
+    if assigned and not replacement:
+        replacement=await _ensure_dynamic_role(member.guild,'Replacement')
+    replacement_added=[]; replacement_removed=[]
+    if replacement and ((assigned and replacement not in member.roles) or (not assigned and replacement in member.roles)):
+        me=member.guild.me
+        if not me or not me.guild_permissions.manage_roles or replacement >= me.top_role:
+            return {'ok':False,'error':'Battalion Clerk role hierarchy/permissions blocked Replacement synchronization','added':[],'removed':[]}
+        try:
+            role_sync_suppressed_members.add((member.guild.id,member.id))
+            if assigned:
+                await member.add_roles(replacement,reason='Battalion Clerk — website assignment filed')
+                replacement_added=[replacement.name]
+            else:
+                await member.remove_roles(replacement,reason='Battalion Clerk — website assignment closed')
+                replacement_removed=[replacement.name]
+        except discord.Forbidden:
+            return {'ok':False,'error':'Battalion Clerk could not update Replacement role','added':[],'removed':[]}
+        finally:
+            role_sync_suppressed_members.discard((member.guild.id,member.id))
+    if not ASSIGNMENT_ROLE_SYNC_ENABLED:
+        return {'ok':True,'scope':'REPLACEMENT_ASSIGNMENT_ONLY','added':replacement_added,'removed':replacement_removed,
+                'created':[],'actual_roles':member_role_names(member),'expected':{'assigned':assigned,'replacement':assigned}}
 
     unit=str(result.get('unit_code') or '').strip()
     platoon=str(result.get('platoon') or '').strip()
@@ -2506,6 +2530,8 @@ async def reconcile_assignment_roles_from_canonical(member: discord.Member, resu
     finally:
         role_sync_suppressed_members.discard((member.guild.id,member.id))
 
+    added_names=replacement_added+added_names
+    removed_names=replacement_removed+removed_names
     log.info('[ASSIGNMENT ROLE SYNC] member=%s reason=%s added=%s removed=%s',member.id,reason,added_names,removed_names)
     return {
         'ok':True,'scope':'ASSIGNMENT_ONLY','added':added_names,'removed':removed_names,'created':created,
