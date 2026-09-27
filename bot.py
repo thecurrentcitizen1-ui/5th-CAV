@@ -115,7 +115,7 @@ pending_personnel_sync: Dict[Tuple[int, int], asyncio.Task] = {}
 # on_member_update must not echo transient cleanup states back into the website.
 role_sync_suppressed_members = set()
 
-RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","WO1","CW2","CW3","CW4","2LT","1LT","CPT","MAJ","LTC"}
+RANK_ROLE_CODES = {"PVT","PFC","CPL","SP4","SP5","SGT","SP6","SSG","SFC","SP7","MSG","1SG","SGM","WO1","CW2","CW3","CW4","2LT","1LT","CPT","MAJ","LTC","COL"}
 MOS_ROLE_CODES = {"00C","11L","11R","11G","11M","91M","12E","76S","11S","11N","19C","19K","67L","67F","11O","11A","11T"}
 RANK_ROLE_ALIASES = {
     "PRIVATE":"PVT","PRIVATE FIRST CLASS":"PFC","CORPORAL":"CPL","SERGEANT":"SGT",
@@ -152,7 +152,7 @@ DIVIDER_ROLE_NAMES = [
 ]
 
 RANK_ROLE_BLUEPRINT = [
-    "LTC", "MAJ", "CPT", "1LT", "2LT", "CW4", "CW3", "CW2", "WO1",
+    "COL", "LTC", "MAJ", "CPT", "1LT", "2LT", "CW4", "CW3", "CW2", "WO1",
     "SGM", "1SG", "MSG", "SFC", "SSG", "SGT", "SP7", "SP6", "SP5",
     "SP4", "CPL", "PFC", "PVT",
 ]
@@ -2384,6 +2384,44 @@ async def _ensure_dynamic_role(guild: discord.Guild, name: str) -> discord.Role 
         return None
 
 
+def _promotion_sync_reason(reason: str) -> bool:
+    text=" ".join(str(reason or "").upper().strip().split())
+    return text.startswith('RANK ') or text.startswith('COMMAND ASSIGNMENT MANAGER — RANK CHANGE')
+
+
+async def reconcile_promotion_role_from_canonical(member: discord.Member, result: dict) -> dict:
+    """Change only Discord rank roles when a website rank action is filed."""
+    if not result.get('linked'):
+        return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
+    code=str(result.get('rank_code') or '').upper().strip()
+    if code not in RANK_ROLE_CODES:
+        return {'ok':False,'error':f'Website rank {code or "(empty)"} has no Discord rank role mapping','added':[],'removed':[]}
+    desired=_role_by_name(member.guild,code) or await _ensure_dynamic_role(member.guild,code)
+    if not desired:
+        return {'ok':False,'error':f'Could not find or create Discord rank role {code}','added':[],'removed':[]}
+    old=[role for role in member.roles if role.name.upper() in RANK_ROLE_CODES and role.name.upper()!=code]
+    add=desired not in member.roles
+    me=member.guild.me
+    if not me or not me.guild_permissions.manage_roles or desired>=me.top_role or any(role>=me.top_role for role in old):
+        return {'ok':False,'error':'Battalion Clerk role hierarchy/permissions blocked promotion synchronization','added':[],'removed':[]}
+    added=[]; removed=[]
+    try:
+        role_sync_suppressed_members.add((member.guild.id,member.id))
+        if old:
+            await member.remove_roles(*old,reason='Battalion Clerk — website rank order')
+            removed=[role.name for role in old]
+        if add:
+            await member.add_roles(desired,reason='Battalion Clerk — website rank order')
+            added=[desired.name]
+    except discord.Forbidden:
+        return {'ok':False,'error':'Discord rejected the promotion rank role change','added':added,'removed':removed}
+    finally:
+        role_sync_suppressed_members.discard((member.guild.id,member.id))
+    log.info('[PROMOTION ROLE SYNC] member=%s rank=%s added=%s removed=%s',member.id,code,added,removed)
+    return {'ok':True,'scope':'PROMOTION_RANK_ONLY','added':added,'removed':removed,'created':[],
+            'actual_roles':member_role_names(member),'expected':{'rank_code':code}}
+
+
 def _assignment_sync_reason(reason: str) -> bool:
     """Return True only for website events that represent formation placement lifecycle."""
     text=" ".join(str(reason or "").upper().strip().split())
@@ -4146,11 +4184,22 @@ async def canonical_role_sync_watch():
                         except Exception: member=None
                     if not member:
                         raise RuntimeError('Discord member not found in guild')
+                    results=[]
                     if _assignment_sync_reason(item.get('reason')):
-                        recon=await reconcile_assignment_roles_from_canonical(member,item)
+                        results.append(await reconcile_assignment_roles_from_canonical(member,item))
+                    if _promotion_sync_reason(item.get('reason')):
+                        results.append(await reconcile_promotion_role_from_canonical(member,item))
+                    if results:
+                        recon={'ok':all(bool(part.get('ok')) for part in results),
+                               'scope':'+'.join(str(part.get('scope') or '') for part in results),
+                               'added':[name for part in results for name in part.get('added',[])],
+                               'removed':[name for part in results for name in part.get('removed',[])],
+                               'created':[name for part in results for name in part.get('created',[])],
+                               'actual_roles':member_role_names(member),
+                               'expected':{key:value for part in results for key,value in (part.get('expected') or {}).items()},
+                               'error':next((part.get('error') for part in results if not part.get('ok')),None)}
                     else:
-                        # V116: all non-assignment canonical events are observation-only.
-                        # Rank/MOS/appointment/staff role writes cannot be re-enabled by a flag.
+                        # MOS, appointments and staff roles remain manual.
                         recon={'ok':True,'manual_mode':True,'scope':'NON_ASSIGNMENT_IGNORED',
                                'added':[],'removed':[],'created':[],'actual_roles':member_role_names(member),
                                'expected':{'role_sync':'manual','reason':item.get('reason')}}
