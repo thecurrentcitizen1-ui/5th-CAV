@@ -2601,150 +2601,11 @@ async def reconcile_assignment_roles_from_canonical(member: discord.Member, resu
     }
 
 
-async def reconcile_member_roles_from_canonical(member: discord.Member, result: dict):
-    """Mirror the authoritative website record into Discord and report exactly what changed."""
-    if not result.get('linked'):
-        return {'ok':False,'error':'personnel record not linked','added':[],'removed':[]}
-    if not AUTO_ROLE_SYNC_ENABLED:
-        log.info('[AUTO ROLE SYNC DISABLED] canonical Discord roles not changed member=%s', member.id)
-        return {'ok':True,'manual_mode':True,'added':[],'removed':[],'created':[],'actual_roles':member_role_names(member)}
-    rank=result.get('rank_code'); mos=result.get('mos_code')
-    lifecycle=str(result.get('lifecycle_state') or '').upper()
-    unit=str(result.get('unit_code') or '').upper().strip()
-    platoon=str(result.get('platoon') or '').strip()
-    squad=str(result.get('squad') or '').strip()
-    field_status=str(result.get('field_status') or '').upper().strip()
-    desired=[]; remove=[]; created=[]
-    rank_role=_guild_role_for_code(member.guild,rank,RANK_ROLE_CODES)
-    mos_role=_guild_role_for_code(member.guild,mos,MOS_ROLE_CODES)
-    if rank_role: desired.append(rank_role)
-    if mos_role: desired.append(mos_role)
-    current_ranks,current_mos=_role_code_hits(member)
+# V116 — Full personnel-role reconciliation retired.
+# Discord no longer mirrors rank, MOS, appointments, staff roles, or membership from
+# canonical personnel data. Identity sync is presentation/linkage only. The separate
+# assignment-only formation reconciler remains available behind its own feature flag.
 
-    company_aliases={
-        'A/1-5 CAV':{'A COMPANY','ALPHA COMPANY','A/1-5 CAV'},
-        'B/1-5 CAV':{'B COMPANY','BRAVO COMPANY','B/1-5 CAV'},
-        'C/1-5 CAV':{'C COMPANY','CHARLIE COMPANY','C/1-5 CAV'},
-        'HHC/1-5 CAV':{'HHC','HHC/1-5 CAV','HEADQUARTERS & HEADQUARTERS COMPANY'},
-    }
-    all_company_names=set().union(*company_aliases.values())
-    canonical_company_name={'A/1-5 CAV':'A Company','B/1-5 CAV':'B Company','C/1-5 CAV':'C Company','HHC/1-5 CAV':'HHC'}.get(unit)
-    desired_company={_normalized_role_name(canonical_company_name)} if canonical_company_name else set()
-    company_letter=unit[:1] if unit[:1] in {'A','B','C'} else None
-    pretty_platoon=platoon.title() if platoon else ''
-    pretty_squad=squad.title() if squad else ''
-    desired_platoon_name=f"{company_letter} Company • {pretty_platoon}" if company_letter and platoon else None
-    desired_squad_name=f"{company_letter} Company • {pretty_platoon} • {pretty_squad}" if company_letter and platoon and squad else None
-    is_member = bool(field_status=='ASSIGNED' and (platoon or unit.startswith('HHC')) and lifecycle not in {'SEPARATED','ARCHIVED'})
-
-    # Remove stale managed personnel roles. Protected/manual roles are never touched.
-    for code,_ in current_ranks:
-        if code!=rank:
-            r=_guild_role_for_code(member.guild,code,RANK_ROLE_CODES)
-            if r: remove.append(r)
-    for code,_ in current_mos:
-        if code!=mos:
-            r=_guild_role_for_code(member.guild,code,MOS_ROLE_CODES)
-            if r: remove.append(r)
-    for role in member.roles:
-        n=_normalized_role_name(role.name)
-        if n in all_company_names and n not in desired_company: remove.append(role)
-        if _is_managed_formation_role_name(role.name):
-            if desired_squad_name and n==_normalized_role_name(desired_squad_name): pass
-            elif desired_platoon_name and n==_normalized_role_name(desired_platoon_name): pass
-            else: remove.append(role)
-        if role.name in LEGACY_ASSIGNMENT_ROLE_NAMES or role.name in LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
-        if role.name=='5th Cavalry Regiment' and not (is_member or discord.utils.get(member.roles,name='Replacement')): remove.append(role)
-
-    # Separated/archived Soldiers retain protected/manual Discord roles only.
-    # Every Battalion Clerk-managed appointment is reconstructed from the
-    # authoritative Website personnel record when the Soldier is active.
-    managed_appointment_names=set(APPOINTMENT_ROLE_BLUEPRINT)
-    if lifecycle in {'SEPARATED','ARCHIVED'}:
-        for role in member.roles:
-            if role.name in managed_appointment_names or _managed_role_category(role.name) in {'COMPANY','PLATOON','SQUAD','MEMBERSHIP'}:
-                remove.append(role)
-        desired=[]
-    else:
-        # Company role is a display/access output of the website assignment.
-        for role in member.guild.roles:
-            if _normalized_role_name(role.name) in desired_company: desired.append(role)
-        # Only active formations get Discord roles. No unused future combinations are generated.
-        if desired_platoon_name:
-            r=await _ensure_dynamic_role(member.guild,desired_platoon_name)
-            if r: desired.append(r); created.append(r.name) if r not in member.roles else None
-        if desired_squad_name:
-            r=await _ensure_dynamic_role(member.guild,desired_squad_name)
-            if r: desired.append(r); created.append(r.name) if r not in member.roles else None
-        # Team is website-only; this intentionally removes legacy Alpha/Bravo Discord roles.
-        if is_member or discord.utils.get(member.roles,name='Replacement'):
-            membership=await _ensure_dynamic_role(member.guild,'5th Cavalry Regiment')
-            if membership: desired.append(membership)
-        if is_member:
-            member_access=await _ensure_dynamic_role(member.guild,'Member')
-            if member_access: desired.append(member_access)
-            for role in member.roles:
-                if role.name in set(RECRUITING_STATUS_ROLE_BLUEPRINT)|LEGACY_RECRUITING_STATUS_ROLE_NAMES: remove.append(role)
-
-        desired_appointment_names=set(result.get('appointment_roles') or []) & managed_appointment_names
-        for role in member.roles:
-            if role.name in managed_appointment_names and role.name not in desired_appointment_names: remove.append(role)
-        for role_name in desired_appointment_names:
-            role=_role_by_name(member.guild,role_name)
-            if not role:
-                role=await _ensure_dynamic_role(member.guild,role_name)
-                if role: created.append(role.name)
-            if role: desired.append(role)
-
-        # Staff access is reconstructed from authoritative structural appointments.
-        # These are access mirrors, never independent sources of personnel authority.
-        appointment_access_map={
-            'Battalion Commander':'Command Staff',
-            'Battalion Executive Officer':'Command Staff',
-            'Battalion Sergeant Major':'Command Staff',
-            'S-1 OIC':'S-1 Personnel','S-1 NCOIC':'S-1 Personnel',
-            'S-3 OIC':'S-3 Operations','S-3 NCOIC':'S-3 Operations',
-            'S-4 OIC':'S-4 Supply','S-4 NCOIC':'S-4 Supply',
-        }
-        desired_staff={appointment_access_map[x] for x in desired_appointment_names if x in appointment_access_map}
-        for staff_name in STAFF_ACCESS_ROLE_BLUEPRINT:
-            staff_role=_role_by_name(member.guild,staff_name)
-            if staff_name in desired_staff:
-                if not staff_role:
-                    staff_role=await _ensure_dynamic_role(member.guild,staff_name)
-                    if staff_role: created.append(staff_role.name)
-                if staff_role: desired.append(staff_role)
-            elif staff_role and staff_role in member.roles:
-                remove.append(staff_role)
-
-        # Battalion policy: CPL and every higher NCO/enlisted leadership rank receives
-        # the NCO Discord role. This is rank-derived and survives leave/rejoin.
-        nco_rank_codes={'CPL','SGT','SSG','SFC','MSG','1SG','SGM'}
-        nco_role=_role_by_name(member.guild,'NCO')
-        if str(rank or '').upper() in nco_rank_codes:
-            if not nco_role:
-                nco_role=await _ensure_dynamic_role(member.guild,'NCO')
-                if nco_role: created.append(nco_role.name)
-            if nco_role: desired.append(nco_role)
-        elif nco_role and nco_role in member.roles:
-            remove.append(nco_role)
-
-    remove=list(dict.fromkeys(remove)); desired=list(dict.fromkeys(desired))
-    removed_names=[]; added_names=[]
-    try:
-        actual_remove=[r for r in remove if r in member.roles]
-        if actual_remove:
-            await member.remove_roles(*actual_remove,reason='Website personnel record is authoritative')
-            removed_names=[r.name for r in actual_remove]
-        add=[r for r in desired if r not in member.roles]
-        if add:
-            await member.add_roles(*add,reason='Synchronize authoritative battalion personnel record')
-            added_names=[r.name for r in add]
-    except discord.Forbidden as exc:
-        log.warning('[CANONICAL ROLE SYNC BLOCKED] member=%s bot role hierarchy/permissions',member.id)
-        return {'ok':False,'error':'Battalion Clerk role hierarchy/permissions blocked reconciliation','added':added_names,'removed':removed_names,'created':created}
-    return {'ok':True,'added':added_names,'removed':removed_names,'created':created,'actual_roles':member_role_names(member),
-            'expected':{'rank':rank,'mos':mos,'unit_code':unit,'platoon':platoon,'squad':squad,'fire_team':result.get('fire_team'),'member':is_member}}
 
 async def sync_personnel_identity(member: discord.Member, *, create_if_missing=False,
                                   reason="identity_sync", deliver_credentials=True):
@@ -2759,8 +2620,7 @@ async def sync_personnel_identity(member: discord.Member, *, create_if_missing=F
     except Exception as exc:
         log.warning("[PERSONNEL SYNC FAILED] member=%s (%s) error=%s",member.display_name,member.id,exc)
         return None
-    if result.get("linked") and not result.get("created"):
-        await reconcile_member_roles_from_canonical(member,result)
+    # V116 authority boundary: identity/name/link synchronization never mutates Discord roles.
     if result.get("created"):
         log.info("[201 FILE OPENED] %s (%s) roster=%s rank=%s",
                  member.display_name,member.id,result.get("roster_number"),result.get("rank_code"))
@@ -3610,7 +3470,8 @@ async def run_organization_cleanup(guild: discord.Guild):
                 except Exception: member=None
             if not member: continue
             try:
-                await reconcile_member_roles_from_canonical(member,snapshot)
+                if ASSIGNMENT_ROLE_SYNC_ENABLED:
+                    await reconcile_assignment_roles_from_canonical(member,snapshot)
                 migrated+=1
             except Exception as exc:
                 failures.append(f'MEMBER {uid}: {exc}')
@@ -3706,8 +3567,8 @@ async def run_organization_cleanup(guild: discord.Guild):
         # website syncing, and assignment-based Discord access finish in a known-good state.
         for uid,snapshot in snapshots.items():
             member=guild.get_member(uid)
-            if member:
-                try: await reconcile_member_roles_from_canonical(member,snapshot)
+            if member and ASSIGNMENT_ROLE_SYNC_ENABLED:
+                try: await reconcile_assignment_roles_from_canonical(member,snapshot)
                 except Exception as exc: failures.append(f'FINAL MEMBER {uid}: {exc}')
         roles=await build_battalion_roles(guild)
         channels=await build_battalion_channels(guild)
@@ -4621,12 +4482,9 @@ async def canonical_role_sync_watch():
                         raise RuntimeError('Discord member not found in guild')
                     if ASSIGNMENT_ROLE_SYNC_ENABLED and _assignment_sync_reason(item.get('reason')):
                         recon=await reconcile_assignment_roles_from_canonical(member,item)
-                    elif AUTO_ROLE_SYNC_ENABLED:
-                        recon=await reconcile_member_roles_from_canonical(member,item)
                     else:
-                        # Manual mode for every non-assignment event: consume the queue
-                        # without mutating Discord so stale rank/MOS/admin jobs cannot
-                        # accumulate or later replay if settings change.
+                        # V116: all non-assignment canonical events are observation-only.
+                        # Rank/MOS/appointment/staff role writes cannot be re-enabled by a flag.
                         recon={'ok':True,'manual_mode':True,'scope':'NON_ASSIGNMENT_IGNORED',
                                'added':[],'removed':[],'created':[],'actual_roles':member_role_names(member),
                                'expected':{'role_sync':'manual','reason':item.get('reason')}}
