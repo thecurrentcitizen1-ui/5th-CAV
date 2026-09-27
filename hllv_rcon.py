@@ -701,7 +701,71 @@ class HLLVTelemetryCollector:
             VALUES($1,$2,FALSE,$3,$4,$5)
             ON CONFLICT(id) DO UPDATE SET enabled=EXCLUDED.enabled,host=EXCLUDED.host,port=EXCLUDED.port,server_key=EXCLUDED.server_key,updated_at=NOW()
         """, self.health_id, bool(self.enabled), self.host or None, self.port, self.server_key)
+        if self.configured and not getattr(HLLVTelemetryCollector,"_completed_game_history_repair_done",False):
+            try:
+                await self._repair_false_offensive_splits()
+            except Exception:
+                log.exception("[HISTORICAL COMPLETED GAME REPAIR FAILED]")
         log.info("[HLLV RCON SCHEMA READY]")
+
+    async def _repair_false_offensive_splits(self):
+        """Reversibly tombstone historical Offensive timer-extension splits."""
+        if getattr(HLLVTelemetryCollector,"_completed_game_history_repair_done",False):
+            return
+        if not self.db.pool:
+            return
+        threshold=max(120,RCON_POLL_SECONDS*4)
+        await self.db.execute(
+            """CREATE TABLE IF NOT EXISTS hll_match_session_repairs (
+                   match_id BIGINT PRIMARY KEY REFERENCES hll_match_sessions(id) ON DELETE CASCADE,
+                   repair_code TEXT NOT NULL,
+                   original_ended_at TIMESTAMPTZ,
+                   repaired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+               )"""
+        )
+        candidates=await self.db.fetch(
+            """WITH ordered AS (
+                   SELECT id,server_key,map_id,game_mode,started_at,ended_at,last_remaining_seconds,
+                          LEAD(id) OVER (PARTITION BY COALESCE(server_key,'server_1') ORDER BY started_at,id) AS next_id,
+                          LEAD(map_id) OVER (PARTITION BY COALESCE(server_key,'server_1') ORDER BY started_at,id) AS next_map_id,
+                          LEAD(game_mode) OVER (PARTITION BY COALESCE(server_key,'server_1') ORDER BY started_at,id) AS next_game_mode,
+                          LEAD(started_at) OVER (PARTITION BY COALESCE(server_key,'server_1') ORDER BY started_at,id) AS next_started_at
+                   FROM hll_match_sessions
+               )
+               SELECT id,next_id,ended_at,last_remaining_seconds,map_id,game_mode,next_started_at
+               FROM ordered
+               WHERE ended_at IS NOT NULL
+                 AND ended_at > started_at
+                 AND UPPER(COALESCE(game_mode,'')) LIKE '%OFFENSIVE%'
+                 AND COALESCE(last_remaining_seconds,0) > $1
+                 AND next_started_at IS NOT NULL
+                 AND ABS(EXTRACT(EPOCH FROM (next_started_at-ended_at))) <= 120
+                 AND COALESCE(next_map_id,'') = COALESCE(map_id,'')
+                 AND UPPER(COALESCE(next_game_mode,'')) = UPPER(COALESCE(game_mode,''))""",
+            threshold,
+        )
+        ids=[int(row["id"]) for row in (candidates or [])]
+        dry_run=str(os.getenv("STAGING_OFFLINE_MODE","")).strip().lower() in {"1","true","yes","on","enabled"}
+        if dry_run:
+            log.info("[COMPLETED GAME REPAIR DRY RUN] candidates=%s ids=%s",len(ids),ids[:100])
+            setattr(HLLVTelemetryCollector,"_completed_game_history_repair_done",True)
+            return
+        repaired=0
+        for row in candidates or []:
+            match_id=int(row["id"])
+            await self.db.execute(
+                """INSERT INTO hll_match_session_repairs(match_id,repair_code,original_ended_at,repaired_at)
+                   VALUES($1,'OFFENSIVE_TIMER_EXTENSION_SPLIT',$2,NOW())
+                   ON CONFLICT(match_id) DO NOTHING""",
+                match_id,row.get("ended_at"))
+            await self.db.execute(
+                """UPDATE hll_match_sessions
+                   SET ended_at=started_at,result_verified_at=NULL,winner_side=NULL,winner_faction_id=NULL
+                   WHERE id=$1 AND ended_at IS NOT NULL AND ended_at > started_at""",
+                match_id)
+            repaired+=1
+        log.info("[COMPLETED GAME REPAIR APPLIED] repaired=%s ids=%s",repaired,ids[:100])
+        setattr(HLLVTelemetryCollector,"_completed_game_history_repair_done",True)
 
     async def start(self):
         await self.collector.start()
@@ -1340,7 +1404,21 @@ class HLLVTelemetryCollector:
             current_length=int(server.get("match_length") or 0)
             previous=await self.db.fetchrow("SELECT last_remaining_seconds,last_match_length_seconds FROM hll_match_sessions WHERE id=$1",self._active_match_id)
             previous_remaining=int((previous or {}).get("last_remaining_seconds") or 0)
-            timer_reset=bool(previous_remaining>0 and current_remaining>previous_remaining+max(120,RCON_POLL_SECONDS*4))
+            reset_threshold=max(120,RCON_POLL_SECONDS*4)
+            offensive_extension=bool(
+                "OFFENSIVE" in str(server.get("game_mode") or "").upper()
+                and previous_remaining>reset_threshold
+                and current_remaining>previous_remaining+reset_threshold
+            )
+            timer_reset=bool(
+                previous_remaining>0
+                and current_remaining>previous_remaining+reset_threshold
+                and not offensive_extension
+            )
+            if offensive_extension:
+                log.info(
+                    "[HLLV OFFENSIVE TIMER EXTENSION] match=%s previous_remaining=%s current_remaining=%s action=CONTINUE_SAME_GAME",
+                    self._active_match_id,previous_remaining,current_remaining)
             if not timer_reset:
                 # Preserve the latest score from THIS active round on every poll.
                 await self.db.execute("""UPDATE hll_match_sessions SET last_seen_at=NOW(),
