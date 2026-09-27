@@ -1334,7 +1334,20 @@ async def mark_operation_reminder_sent(guild_id:int,event_id:str,minutes_before:
       str(guild_id),str(event_id),int(minutes_before))
 
 async def post_operation_reminder(guild:discord.Guild,event:dict,minutes_before:int):
-    channel=await resolve_operation_notice_channel(guild)
+    channel=None
+    event_id=str(event.get('id') or event.get('event_id') or '')
+    try:
+        db=getattr(collector,'db',None)
+        if event_id and db and getattr(db,'pool',None):
+            async with db.pool.acquire() as conn:
+                selected=await conn.fetchval(
+                    "SELECT channel_id FROM clerk_operation_schedule_notices WHERE guild_id=$1 AND event_id=$2",
+                    str(guild.id),event_id)
+            channel=guild.get_channel(int(selected)) if selected else None
+    except Exception:
+        log.exception('[OPERATION REMINDER CHANNEL LOOKUP FAILED] guild=%s event=%s',guild.id,event_id)
+    if not isinstance(channel,discord.TextChannel):
+        channel=await resolve_operation_notice_channel(guild)
     if not isinstance(channel,discord.TextChannel): return False
     start=event_timestamp(event.get('starts_at'))
     if not start: return False
@@ -1397,8 +1410,9 @@ async def resolve_operation_notice_channel(guild:discord.Guild):
             return ch
     return None
 
-async def post_operation_scheduled_notice(guild:discord.Guild,event:dict):
-    channel=await resolve_operation_notice_channel(guild)
+async def post_operation_scheduled_notice(guild:discord.Guild,event:dict,channel:Optional[discord.TextChannel]=None):
+    if not isinstance(channel,discord.TextChannel):
+        channel=await resolve_operation_notice_channel(guild)
     if not isinstance(channel,discord.TextChannel): return False
     event_id=str(event.get('id') or event.get('event_id') or '')
     roster=await _scheduled_event_rsvps('OPERATION',event_id) if event_id else []
@@ -3170,10 +3184,17 @@ OPERATION_KIND_CHOICES = [
 ]
 
 @bot.tree.command(name='schedule-operation',description='Schedule and publish an Operation, campaign, or special battalion event.')
-@app_commands.describe(title='Operation / event title',date='Date in YYYY-MM-DD',time='Eastern step-off time',duration_minutes='Planned duration in minutes',voice_channel='Discord voice channel used for official operation attendance',kind='Operation, campaign, or special event',area_of_operations='Optional area / map / campaign name',notes='Optional mission or event notes')
+@app_commands.describe(title='Operation / event title',date='Date in YYYY-MM-DD',time='Eastern step-off time',duration_minutes='Planned duration in minutes',voice_channel='Discord voice channel used for official operation attendance',announcement_channel='Text channel where the Operation announcement / RSVP board should be posted',kind='Operation, campaign, or special event',area_of_operations='Optional area / map / campaign name',notes='Optional mission or event notes')
 @app_commands.choices(kind=OPERATION_KIND_CHOICES)
-async def schedule_operation_command(interaction:discord.Interaction,title:str,date:str,time:str,duration_minutes:app_commands.Range[int,45,720],voice_channel:discord.VoiceChannel,kind:Optional[app_commands.Choice[str]]=None,area_of_operations:Optional[str]=None,notes:Optional[str]=None):
+async def schedule_operation_command(interaction:discord.Interaction,title:str,date:str,time:str,duration_minutes:app_commands.Range[int,45,720],voice_channel:discord.VoiceChannel,announcement_channel:discord.TextChannel,kind:Optional[app_commands.Choice[str]]=None,area_of_operations:Optional[str]=None,notes:Optional[str]=None):
     if not await require_operation_scheduler(interaction): return
+    me=interaction.guild.me if interaction.guild else None
+    perms=announcement_channel.permissions_for(me) if me else None
+    if perms and (not perms.send_messages or not perms.embed_links):
+        await interaction.response.send_message(
+            f'Battalion Clerk cannot post operation notices in {announcement_channel.mention}. Grant Send Messages and Embed Links or choose another channel.',
+            ephemeral=True)
+        return
     try: start_et=_parse_training_et(date,time)
     except Exception as exc:
         await interaction.response.send_message(f'Invalid date/time: **{exc}**. Use `YYYY-MM-DD` and `20:00` or `8:00PM`.',ephemeral=True); return
@@ -3196,16 +3217,20 @@ async def schedule_operation_command(interaction:discord.Interaction,title:str,d
     event['notes']=(notes or '')[:2000] or event.get('notes')
     posted_channel_id=None
     try:
-        posted_channel_id=await post_operation_scheduled_notice(interaction.guild,event)
+        posted_channel_id=await post_operation_scheduled_notice(interaction.guild,event,announcement_channel)
         if posted_channel_id:
             await mark_operation_schedule_notice_sent(interaction.guild_id,event,posted_channel_id)
-    except Exception:
+    except Exception as exc:
         log.exception('[COMMAND OPERATION SCHEDULE NOTICE FAILED] operation=%s',result.get('operation_id'))
-    notice=(f'<#{posted_channel_id}>' if posted_channel_id else 'configured Operations notice channel when available')
+        await interaction.followup.send(
+            f"Operation was filed, but the Discord announcement could not be posted in {announcement_channel.mention}: `{str(exc)[:240]}`",
+            ephemeral=True)
+        return
     await interaction.followup.send(
         f"**OPERATION SCHEDULED — {result.get('operation_number') or 'FILED'}**\n"
         f"**{title}** • <t:{int(start_et.timestamp())}:F>\n"
-        f"Operation Voice: {voice_channel.mention}\nNotice: {notice}\n"
+        f"Operation Voice: {voice_channel.mention}\n"
+        f"Announcement Channel: {announcement_channel.mention}\n"
         "Attendance, reminders, HLL telemetry, M16 field-use tracking, and the website Operation record are armed.",ephemeral=True)
 
 
