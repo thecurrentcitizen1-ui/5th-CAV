@@ -763,9 +763,9 @@ class HLLVTelemetryCollector:
                 last_players_filed,last_player_errors,last_partial_error,updated_at
             ) VALUES(
                 $8,$9,$1,$10,$11,$12,
-                CASE WHEN $1 THEN $2 ELSE NULL END,
-                CASE WHEN $1 THEN NULL ELSE $2 END,
-                CASE WHEN $1 THEN NULL ELSE $3 END,
+                CASE WHEN $1 THEN $2::timestamptz ELSE NULL END,
+                CASE WHEN $1 THEN NULL ELSE $2::timestamptz END,
+                CASE WHEN $1 THEN NULL ELSE $3::text END,
                 $4,$5,$6,$7,$13,$14,$15,NOW()
             )
             ON CONFLICT(id) DO UPDATE SET

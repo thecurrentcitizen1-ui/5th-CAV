@@ -4378,7 +4378,7 @@ async def squad_handoff_watch():
     # Close handoffs even if the NCO has not opened the website since the recruit
     # completed First 24 Hours; this prevents stale Discord delivery.
     try:
-        await db.execute("""UPDATE squad_handoff_tasks sht SET status='COMPLETE',completed_at=COALESCE(completed_at,NOW())
+        await db.execute("""UPDATE squad_handoff_tasks sht SET status='COMPLETE',completed_at=COALESCE(sht.completed_at,NOW())
                           FROM welcome_packets wp WHERE wp.personnel_id=sht.recruit_personnel_id
                             AND sht.status<>'COMPLETE' AND UPPER(COALESCE(wp.status,'')) IN ('COMPLETE','CLOSED','ARCHIVED')""")
     except Exception:
@@ -8250,8 +8250,8 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
 @bot.tree.command(name='link-game', description='Link your HLL: Vietnam Steam, Xbox, or PlayStation identity to your Soldier Record.')
 @app_commands.describe(platform='Platform you play HLL: Vietnam on', game_id='SteamID64, Xbox Gamertag, or PSN Online ID')
 @app_commands.choices(platform=[
-    app_commands.Choice(name='Steam / PC', value='STEAM'),
-    app_commands.Choice(name='Xbox', value='XBOX'),
+    app_commands.Choice(name='Steam / PC (Steam)', value='STEAM'),
+    app_commands.Choice(name='Xbox / Microsoft Store PC', value='XBOX'),
     app_commands.Choice(name='PlayStation 5', value='PS5'),
 ])
 async def link_game(interaction:discord.Interaction, platform:app_commands.Choice[str], game_id:str):
@@ -8381,8 +8381,8 @@ async def unlink_member_game(interaction:discord.Interaction, member:discord.Mem
     game_id='SteamID64, Xbox Gamertag, or PSN Online ID exactly as used in-game'
 )
 @app_commands.choices(platform=[
-    app_commands.Choice(name='Steam / PC', value='STEAM'),
-    app_commands.Choice(name='Xbox', value='XBOX'),
+    app_commands.Choice(name='Steam / PC (Steam)', value='STEAM'),
+    app_commands.Choice(name='Xbox / Microsoft Store PC', value='XBOX'),
     app_commands.Choice(name='PlayStation 5', value='PS5'),
 ])
 async def hll_link_soldier(interaction:discord.Interaction, member:discord.Member, platform:app_commands.Choice[str], game_id:str):
