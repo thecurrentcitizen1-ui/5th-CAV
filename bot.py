@@ -8314,16 +8314,40 @@ async def commend(interaction:discord.Interaction, member:discord.Member, catego
     app_commands.Choice(name='PlayStation 5', value='PS5'),
 ])
 async def link_game(interaction:discord.Interaction, platform:app_commands.Choice[str], game_id:str):
-    """Single onboarding-friendly self-link command for every supported platform."""
+    """Always complete the interaction, including missing-server and backend failures."""
+    if not interaction.guild_id:
+        await interaction.response.send_message(
+            'Use this command inside the **1/5 CAV Discord server**, rather than a direct message.',
+            ephemeral=True
+        )
+        return
     await interaction.response.defer(ephemeral=True)
+    try:
+        await asyncio.wait_for(_link_game_impl(interaction, platform, game_id), timeout=45.0)
+    except asyncio.TimeoutError:
+        log.exception('[LINK-GAME TIMEOUT] guild=%s user=%s', interaction.guild_id, interaction.user.id)
+        await interaction.edit_original_response(content=
+            '**GAME LINK CHECK TIMED OUT**\nBattalion Clerk could not confirm the result. '
+            'Check your game link on the website before retrying, or contact S-1 if it is still missing.'
+        )
+    except Exception:
+        log.exception('[LINK-GAME FAILED] guild=%s user=%s', interaction.guild_id, interaction.user.id)
+        await interaction.edit_original_response(content=
+            '**GAME LINK COULD NOT BE CONFIRMED**\nBattalion Clerk encountered an error. '
+            'Check your game link on the website before retrying, or contact S-1 if it is still missing.'
+        )
+
+
+async def _link_game_impl(interaction:discord.Interaction, platform:app_commands.Choice[str], game_id:str):
+    """Single onboarding-friendly self-link command for every supported platform."""
     identity=(game_id or '').strip()
     if not identity:
         await interaction.followup.send('Enter the game identity exactly as it appears for your platform.',ephemeral=True); return
-    result=await hllv.staff_link_identity(interaction.guild.id,interaction.user.id,platform.value,identity,f'DISCORD LINK-GAME:{interaction.user.id}')
+    result=await hllv.staff_link_identity(interaction.guild_id,interaction.user.id,platform.value,identity,f'DISCORD LINK-GAME:{interaction.user.id}')
     if not result.get('ok') and 'No active Soldier Record is linked' in str(result.get('error') or ''):
         try:
             staged=await web.request('POST','/internal/clerk/recruiting/prelink-game',json={
-                'guild_id':interaction.guild.id,'discord_user_id':interaction.user.id,'platform':platform.value,'game_identity':identity,
+                'guild_id':interaction.guild_id,'discord_user_id':interaction.user.id,'platform':platform.value,'game_identity':identity,
                 'username':getattr(interaction.user,'name',str(interaction.user)),
                 'display_name':getattr(interaction.user,'display_name',getattr(interaction.user,'name',str(interaction.user)))
             })
@@ -8342,10 +8366,10 @@ async def link_game(interaction:discord.Interaction, platform:app_commands.Choic
         await collector.start()
         await collector.db.execute(
             "DELETE FROM clerk_game_link_reminders WHERE guild_id=$1 AND personnel_id=$2",
-            str(interaction.guild.id),str(result.get('personnel_id') or '')
+            str(interaction.guild_id),str(result.get('personnel_id') or '')
         )
     except Exception as exc:
-        log.warning('[GAME LINK REMINDER CLEAR FAILED] guild=%s member=%s error=%s',interaction.guild.id,interaction.user.id,exc)
+        log.warning('[GAME LINK REMINDER CLEAR FAILED] guild=%s member=%s error=%s',interaction.guild_id,interaction.user.id,exc)
     verified=str(result.get('status') or '').upper()=='VERIFIED'
     state='VERIFIED' if verified else 'PENDING SERVER VERIFICATION'
     await interaction.followup.send(
