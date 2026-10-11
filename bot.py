@@ -1041,6 +1041,8 @@ async def reset_discord_routing(guild_id:int):
             duty_voice_presence.pop(key,None)
     return {'paused':True,'duty_channels_cleared':cleared_duty}
 
+# Temporarily paused at Command's request; set SEEDING_MESSAGES_ENABLED=true to resume.
+SEEDING_MESSAGES_ENABLED = os.getenv('SEEDING_MESSAGES_ENABLED', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
 SEEDING_TIMEZONE = ZoneInfo('America/New_York')
 SEEDING_EVENING_SLOTS = ((18, 0), (18, 30), (19, 0), (19, 30), (20, 0), (20, 30))
 SEEDING_WEEKEND_SLOTS = ((14, 0), (14, 30), (15, 0), (15, 30), (16, 0), (16, 30))
@@ -8514,6 +8516,8 @@ async def seeding_message_watch():
     earned at any hour whenever the observed official server is below 50 players.
     Discord reminders remain a focused 6 PM-9 PM Eastern recruiting/seeding push.
     """
+    if not SEEDING_MESSAGES_ENABLED:
+        return
     now_et=datetime.now(SEEDING_TIMEZONE)
     if not (18 <= now_et.hour < 21):
         return
@@ -8581,6 +8585,7 @@ async def seeding_status(interaction:discord.Interaction):
     st=await hllv.status()
     await interaction.response.send_message(
         '**1/5 CAV SEEDING AUTOMATION**\n'
+        f"**Messages:** {'ENABLED' if SEEDING_MESSAGES_ENABLED else 'PAUSED'}\n"
         f"Channel: {f'<#{channel_id}>' if channel_id else '**NOT SET**'}\n"
         '**Daily message window:** 6:00 / 6:30 / 7:00 / 7:30 / 8:00 / 8:30 PM Eastern\n'
         '**Credit rule:** Any time of day while the observed server population is below 50\n'
