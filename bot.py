@@ -5018,10 +5018,58 @@ GAME_INTERESTS = (
 )
 GAME_PANEL_TITLE = '**CHOOSE YOUR GAMES**'
 _game_role_locks = {}
+_game_panels = {}
+_game_panel_signatures = {}
+_game_count_overrides = {}
+_game_panel_locks = {}
+
+def game_role_count(guild, role_name):
+    role = discord.utils.get(guild.roles, name=role_name)
+    if not role:
+        return 0
+    ids = {m.id for m in role.members if not m.bot}
+    for (gid, rid, uid), selected in list(_game_count_overrides.items()):
+        if gid != guild.id or rid != role.id:
+            continue
+        if guild.get_member(uid) is None:
+            _game_count_overrides.pop((gid, rid, uid), None)
+            continue
+        if (uid in ids) == selected:
+            _game_count_overrides.pop((gid, rid, uid), None)
+        elif selected:
+            ids.add(uid)
+        else:
+            ids.discard(uid)
+    return len(ids)
+
+async def refresh_game_panel(guild):
+    message = _game_panels.get(guild.id)
+    if message is None:
+        return
+    async with _game_panel_locks.setdefault(guild.id, asyncio.Lock()):
+        signature = tuple(game_role_count(guild, f'Game | {name}') for _, name in GAME_INTERESTS)
+        if _game_panel_signatures.get(guild.id) != signature:
+            await message.edit(view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
+            _game_panel_signatures[guild.id] = signature
+            log.info('[GAME PANEL COUNTS UPDATED] guild=%s counts=%s', guild.id, signature)
+
+@tasks.loop(seconds=30)
+async def game_panel_count_watch():
+    for guild in bot.guilds:
+        try:
+            await refresh_game_panel(guild)
+        except Exception:
+            log.exception('[GAME PANEL COUNT REFRESH FAILED] guild=%s', guild.id)
+
+@game_panel_count_watch.before_loop
+async def before_game_panel_count_watch():
+    await bot.wait_until_ready()
 
 class GameInterestButton(discord.ui.Button):
-    def __init__(self, key, name, row):
-        super().__init__(label=name, style=discord.ButtonStyle.secondary,
+    def __init__(self, key, name, row, count=0):
+        self.game_name = name
+        styles = (discord.ButtonStyle.primary, discord.ButtonStyle.success, discord.ButtonStyle.danger)
+        super().__init__(label=f'{name} · {count}', style=styles[row % 3],
                          custom_id=f'5thcav:game-interest:{key}', row=row)
         self.role_name = f'Game | {name}'
 
@@ -5029,7 +5077,7 @@ class GameInterestButton(discord.ui.Button):
         if not interaction.guild_id or (GUILD_ID and interaction.guild_id != GUILD_ID):
             await interaction.response.send_message('Use the game buttons in the 5th Cav server.', ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             async with asyncio.timeout(30):
                 guild = bot.get_guild(interaction.guild_id)
@@ -5049,17 +5097,23 @@ class GameInterestButton(discord.ui.Button):
                     else:
                         await member.add_roles(role, reason='Member game interest selection', atomic=True)
                         action = 'Added'
-                await interaction.edit_original_response(content=f'{action} **{self.label}**. You can select multiple games. Click again to toggle this game.')
+                _game_count_overrides[(guild.id, role.id, member.id)] = action == 'Added'
+                try:
+                    await refresh_game_panel(guild)
+                except Exception:
+                    log.exception('[GAME PANEL BUTTON REFRESH FAILED] guild=%s', guild.id)
+                await interaction.edit_original_response(content=f'{action} **{self.game_name}**. You can select multiple games. Click again to toggle this game.')
         except Exception:
             log.exception('[GAME ROLE TOGGLE FAILED] guild=%s user=%s role=%s',
                           interaction.guild_id, interaction.user.id, self.role_name)
             await interaction.edit_original_response(content='I could not confirm that role change. Please try again or contact Command.')
 
 class GameInterestView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild=None):
         super().__init__(timeout=None)
         for index, (key, name) in enumerate(GAME_INTERESTS):
-            self.add_item(GameInterestButton(key, name, index // 3))
+            self.add_item(GameInterestButton(key, name, index // 3,
+                game_role_count(guild, f'Game | {name}') if guild else 0))
 
 
 async def ensure_game_categories(guild):
@@ -5129,17 +5183,29 @@ async def ensure_game_interest_panel():
                 }, reason='Permanent optional game role selector')
             content = (GAME_PANEL_TITLE + '\n\n'
                        'Pick the games you play so we can find players and organize groups.\n'
-                       '**Choose as many as you want.** Click a button to add its role; click again to remove it.\n\n'
+                       '**Choose as many as you want.** Click a button to add its role; click again to remove it.\n'
+                       'The number on each button shows current members with that game role.\n\n'
                        'These are game interests only. Your 5th Cav rank and assignment stay the same.')
             message = None
+            panels = []
             async for candidate in channel.history(limit=100):
-                if candidate.author.id == bot.user.id and candidate.content.startswith(GAME_PANEL_TITLE):
-                    message = candidate
-                    break
+                is_panel = any(str(getattr(child, 'custom_id', '')).startswith('5thcav:game-interest:')
+                               for row in candidate.components for child in row.children)
+                if candidate.author.id == bot.user.id and (candidate.content.startswith(GAME_PANEL_TITLE) or is_panel):
+                    panels.append(candidate)
+            if panels:
+                message = panels[-1]
             if message:
-                await message.edit(content=content, view=GameInterestView(), allowed_mentions=discord.AllowedMentions.none())
+                await message.edit(content=content, view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
             else:
                 message = await channel.send(content, view=GameInterestView(), allowed_mentions=discord.AllowedMentions.none())
+            _game_panels[guild.id] = message
+            _game_panel_signatures[guild.id] = tuple(game_role_count(guild, f'Game | {name}') for _, name in GAME_INTERESTS)
+            for duplicate in panels:
+                if duplicate.id != message.id:
+                    await duplicate.delete()
+            if not game_panel_count_watch.is_running():
+                game_panel_count_watch.start()
             log.info('[GAME ROLE PANEL READY] guild=%s channel=%s message=%s games=%s',
                      guild.id, channel.id, message.id, len(GAME_INTERESTS))
         except Exception:
