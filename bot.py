@@ -5168,7 +5168,7 @@ async def ensure_game_interest_panel():
                                             hoist=False, mentionable=False, reason='Optional member game interests')
                 elif len(matches) != 1 or matches[0].managed or matches[0].permissions.value:
                     raise RuntimeError(f'Unsafe or duplicate game role: {role_name}')
-            await ensure_game_categories(guild)
+            # Existing game categories are managed in place; panel recovery never recreates them.
             channels = [c for c in guild.text_channels if c.name == 'game-roles']
             if len(channels) > 1:
                 raise RuntimeError('Multiple game-roles channels; staff must resolve')
