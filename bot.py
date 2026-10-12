@@ -5198,7 +5198,7 @@ async def ensure_game_interest_panel():
             if message:
                 await message.edit(content=content, view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
             else:
-                message = await channel.send(content, view=GameInterestView(), allowed_mentions=discord.AllowedMentions.none())
+                message = await channel.send(content, view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
             _game_panels[guild.id] = message
             _game_panel_signatures[guild.id] = tuple(game_role_count(guild, f'Game | {name}') for _, name in GAME_INTERESTS)
             for duplicate in panels:
