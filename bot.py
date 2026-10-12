@@ -5061,6 +5061,46 @@ class GameInterestView(discord.ui.View):
         for index, (key, name) in enumerate(GAME_INTERESTS):
             self.add_item(GameInterestButton(key, name, index // 3))
 
+
+async def ensure_game_categories(guild):
+    """Role-scoped game spaces; channels inherit one authoritative category policy."""
+    roles = await guild.fetch_roles()
+    for key, name in GAME_INTERESTS:
+        matches = [r for r in roles if r.name == f'Game | {name}']
+        if len(matches) != 1 or matches[0].managed or matches[0].permissions.value:
+            raise RuntimeError(f'Unsafe or missing game role: {name}')
+        role = matches[0]
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            role: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                send_messages=True, connect=True, speak=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                send_messages=True, connect=True, speak=True, manage_channels=True)
+        }
+        categories = [c for c in guild.categories if c.name == f'GAME | {name}']
+        if len(categories) > 1:
+            raise RuntimeError(f'Duplicate game category: {name}')
+        category = categories[0] if categories else await guild.create_category(
+            f'GAME | {name}', overwrites=overwrites, reason='Private game channels by optional game role')
+        if categories:
+            await category.edit(overwrites=overwrites, reason='Game role category access')
+        text_name = f'{key}-chat'
+        voice_name = f'{name} Voice'
+        texts = [c for c in category.text_channels if c.name == text_name]
+        voices = [c for c in category.voice_channels if c.name == voice_name]
+        if len(texts) > 1 or len(voices) > 1:
+            raise RuntimeError(f'Duplicate game channels: {name}')
+        text = texts[0] if texts else await guild.create_text_channel(
+            text_name, category=category, reason='Game discussion')
+        voice = voices[0] if voices else await guild.create_voice_channel(
+            voice_name, category=category, reason='Game voice')
+        for channel in (text, voice):
+            if not channel.permissions_synced:
+                await channel.edit(sync_permissions=True, reason='Inherit private game role access')
+        log.info('[GAME CATEGORY READY] guild=%s game=%s role=%s category=%s text=%s voice=%s',
+                 guild.id, key, role.id, category.id, text.id, voice.id)
+
+
 async def ensure_game_interest_panel():
     for guild in bot.guilds:
         if not GUILD_ID or guild.id != GUILD_ID:
@@ -5074,6 +5114,7 @@ async def ensure_game_interest_panel():
                                             hoist=False, mentionable=False, reason='Optional member game interests')
                 elif len(matches) != 1 or matches[0].managed or matches[0].permissions.value:
                     raise RuntimeError(f'Unsafe or duplicate game role: {role_name}')
+            await ensure_game_categories(guild)
             channels = [c for c in guild.text_channels if c.name == 'game-roles']
             if len(channels) > 1:
                 raise RuntimeError('Multiple game-roles channels; staff must resolve')
