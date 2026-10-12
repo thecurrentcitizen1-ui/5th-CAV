@@ -5003,8 +5003,114 @@ async def first30_retention_watch():
 async def before_first30_retention_watch():
     await bot.wait_until_ready()
 
+
+# Optional game interests are separate from battalion rank and assignment roles.
+GAME_INTERESTS = (
+    ('wardogs', 'WAR DOGS'),
+    ('tarkov', 'Escape from Tarkov'),
+    ('hll-vietnam', 'Hell Let Loose Vietnam'),
+    ('squad', 'Squad'),
+    ('gears', 'Gears of War'),
+    ('glory', 'Glory to the Heroes'),
+    ('ready-or-not', 'Ready or Not'),
+    ('bodycam', 'Bodycam'),
+    ('runescape', 'RuneScape'),
+)
+GAME_PANEL_TITLE = '**CHOOSE YOUR GAMES**'
+_game_role_locks = {}
+
+class GameInterestButton(discord.ui.Button):
+    def __init__(self, key, name, row):
+        super().__init__(label=name, style=discord.ButtonStyle.secondary,
+                         custom_id=f'5thcav:game-interest:{key}', row=row)
+        self.role_name = f'Game | {name}'
+
+    async def callback(self, interaction):
+        if not interaction.guild_id or (GUILD_ID and interaction.guild_id != GUILD_ID):
+            await interaction.response.send_message('Use the game buttons in the 5th Cav server.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with asyncio.timeout(30):
+                guild = bot.get_guild(interaction.guild_id)
+                if guild is None:
+                    raise RuntimeError('server not available')
+                matches = [r for r in guild.roles if r.name == self.role_name]
+                role = matches[0] if len(matches) == 1 else None
+                if not role or role.managed or role.permissions.value or not guild.me or role >= guild.me.top_role:
+                    await interaction.edit_original_response(content='This game role needs a staff permissions check. Please contact Command.')
+                    return
+                lock = _game_role_locks.setdefault((guild.id, interaction.user.id), asyncio.Lock())
+                async with lock:
+                    member = await guild.fetch_member(interaction.user.id)
+                    if role in member.roles:
+                        await member.remove_roles(role, reason='Member game interest selection', atomic=True)
+                        action = 'Removed'
+                    else:
+                        await member.add_roles(role, reason='Member game interest selection', atomic=True)
+                        action = 'Added'
+                await interaction.edit_original_response(content=f'{action} **{self.label}**. You can select multiple games. Click again to toggle this game.')
+        except Exception:
+            log.exception('[GAME ROLE TOGGLE FAILED] guild=%s user=%s role=%s',
+                          interaction.guild_id, interaction.user.id, self.role_name)
+            await interaction.edit_original_response(content='I could not confirm that role change. Please try again or contact Command.')
+
+class GameInterestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for index, (key, name) in enumerate(GAME_INTERESTS):
+            self.add_item(GameInterestButton(key, name, index // 3))
+
+async def ensure_game_interest_panel():
+    for guild in bot.guilds:
+        if not GUILD_ID or guild.id != GUILD_ID:
+            continue
+        try:
+            for key, name in GAME_INTERESTS:
+                role_name = f'Game | {name}'
+                matches = [r for r in guild.roles if r.name == role_name]
+                if not matches:
+                    await guild.create_role(name=role_name, permissions=discord.Permissions.none(),
+                                            hoist=False, mentionable=False, reason='Optional member game interests')
+                elif len(matches) != 1 or matches[0].managed or matches[0].permissions.value:
+                    raise RuntimeError(f'Unsafe or duplicate game role: {role_name}')
+            channels = [c for c in guild.text_channels if c.name == 'game-roles']
+            if len(channels) > 1:
+                raise RuntimeError('Multiple game-roles channels; staff must resolve')
+            channel = channels[0] if channels else await guild.create_text_channel(
+                'game-roles', topic='Choose your games. Click to add or remove a game role; multiple games allowed.',
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                        send_messages=False, create_public_threads=False, create_private_threads=False,
+                        send_messages_in_threads=False),
+                    guild.me: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                        send_messages=True, manage_messages=True)
+                }, reason='Permanent optional game role selector')
+            content = (GAME_PANEL_TITLE + '\n\n'
+                       'Pick the games you play so we can find players and organize groups.\n'
+                       '**Choose as many as you want.** Click a button to add its role; click again to remove it.\n\n'
+                       'These are game interests only. Your 5th Cav rank and assignment stay the same.')
+            message = None
+            async for candidate in channel.history(limit=100):
+                if candidate.author.id == bot.user.id and candidate.content.startswith(GAME_PANEL_TITLE):
+                    message = candidate
+                    break
+            if message:
+                await message.edit(content=content, view=GameInterestView(), allowed_mentions=discord.AllowedMentions.none())
+            else:
+                message = await channel.send(content, view=GameInterestView(), allowed_mentions=discord.AllowedMentions.none())
+            log.info('[GAME ROLE PANEL READY] guild=%s channel=%s message=%s games=%s',
+                     guild.id, channel.id, message.id, len(GAME_INTERESTS))
+        except Exception:
+            log.exception('[GAME ROLE PANEL SETUP FAILED] guild=%s', guild.id)
+
+
 @bot.event
 async def on_ready():
+    if not getattr(bot, '_game_interest_panel_registered', False):
+        bot.add_view(GameInterestView())
+        bot._game_interest_panel_registered = True
+        bot._game_interest_setup_task = asyncio.create_task(ensure_game_interest_panel())
     try:
         await ensure_commendations_table()
     except Exception:
@@ -7233,8 +7339,9 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     if GUILD_ID and after.guild.id != GUILD_ID:
         return
-    before_roles={r.id for r in before.roles}
-    after_roles={r.id for r in after.roles}
+    game_role_names = {f'Game | {name}' for _, name in GAME_INTERESTS}
+    before_roles={r.id for r in before.roles if r.name not in game_role_names}
+    after_roles={r.id for r in after.roles if r.name not in game_role_names}
     if before.name == after.name and before.display_name == after.display_name and before_roles == after_roles:
         return
     await collector.upsert_member(after)
