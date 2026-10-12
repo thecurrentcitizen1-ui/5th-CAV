@@ -5058,6 +5058,7 @@ async def game_panel_count_watch():
     for guild in bot.guilds:
         try:
             await refresh_game_panel(guild)
+            await refresh_tonight_poll(guild)
         except Exception:
             log.exception('[GAME PANEL COUNT REFRESH FAILED] guild=%s', guild.id)
 
@@ -5155,6 +5156,217 @@ async def ensure_game_categories(guild):
                  guild.id, key, role.id, category.id, text.id, voice.id)
 
 
+
+# Shared multi-game LFG and daily availability poll.
+_LFG_CHANNEL_NAME = 'looking-for-group'
+_LFG_PANEL_TITLE = '**FIND A GROUP**'
+_TONIGHT_PANEL_TITLE = '**WHO IS PLAYING TONIGHT?**'
+_lfg_channels = {}
+_tonight_messages = {}
+_tonight_signatures = {}
+_tonight_locks = {}
+_lfg_post_locks = {}
+_lfg_last_post = {}
+_TONIGHT_TIMES = [('Now', 'NOW')] + [(f'{h % 12 or 12}:00 {"PM" if h >= 12 else "AM"} Eastern', f'{h:02d}:00') for h in (18,19,20,21,22,23)] + [('Midnight Eastern', '00:00'), ('1:00 AM Eastern', '01:00'), ('2:00 AM Eastern', '02:00')]
+
+async def ensure_tonight_table():
+    await collector.start()
+    await collector.db.execute("""CREATE TABLE IF NOT EXISTS clerk_game_availability(
+        guild_id TEXT NOT NULL, poll_date DATE NOT NULL, discord_user_id TEXT NOT NULL,
+        game_key TEXT NOT NULL, time_slot TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(guild_id,poll_date,discord_user_id,game_key))""")
+
+async def refresh_tonight_poll(guild):
+    message = _tonight_messages.get(guild.id)
+    if not message:
+        return
+    async with _tonight_locks.setdefault(guild.id, asyncio.Lock()):
+        today = datetime.now(SEEDING_TIMEZONE).date()
+        rows = await collector.db.fetch("""SELECT game_key,time_slot,COUNT(*) AS members
+            FROM clerk_game_availability WHERE guild_id=$1 AND poll_date=$2
+            GROUP BY game_key,time_slot ORDER BY game_key,time_slot""", str(guild.id), today)
+        signature = (str(today), tuple((r['game_key'],r['time_slot'],int(r['members'])) for r in rows))
+        if _tonight_signatures.get(guild.id) == signature:
+            return
+        names = dict(GAME_INTERESTS)
+        times = dict((value,label) for label,value in _TONIGHT_TIMES)
+        grouped = {}
+        for r in rows:
+            grouped.setdefault(r['game_key'], []).append(f'{r["time_slot"]}: {r["members"]}')
+        lines = [f'**{names.get(key,key)}** — ' + ' · '.join(slots) for key,slots in grouped.items()]
+        content = (_TONIGHT_PANEL_TITLE + f'\n**{today.strftime("%B %d")} · Eastern time**\n\n'
+            'Choose a game and time below. You can vote for multiple games; voting again updates your time for that game.\n'
+            'Availability votes do not ping anyone. Use **FIND A GROUP** when you are ready to recruit players.\n\n'
+            + ('\n'.join(lines) if lines else 'No availability votes yet. Be the first!')
+            + '\n\nThis poll resets for each new day in Eastern time.')
+        await message.edit(content=content,view=TonightPanelView(),allowed_mentions=discord.AllowedMentions.none())
+        _tonight_signatures[guild.id] = signature
+
+class GameChoiceSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder='Choose a game',options=[discord.SelectOption(label=name,value=key) for key,name in GAME_INTERESTS])
+    async def callback(self, interaction):
+        self.view.game_key = self.values[0]
+        await interaction.response.defer()
+
+class TonightTimeSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder='Choose your start time (Eastern)',options=[discord.SelectOption(label=label,value=value) for label,value in _TONIGHT_TIMES])
+    async def callback(self, interaction):
+        self.view.time_slot = self.values[0]
+        await interaction.response.defer()
+
+class LFGDetailsModal(discord.ui.Modal, title='Find players'):
+    party_size = discord.ui.TextInput(label='Total party size (including you)',placeholder='Example: 4',max_length=3)
+    start_time = discord.ui.TextInput(label='Start time (Eastern)',placeholder='Example: Now, or tonight at 9:00 PM',max_length=80)
+    def __init__(self, game_key):
+        super().__init__()
+        self.game_key = game_key
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            size = int(str(self.party_size).strip())
+            if not 2 <= size <= 100:
+                raise ValueError()
+        except ValueError:
+            await interaction.edit_original_response(content='Enter a total party size from 2 to 100, including yourself.')
+            return
+        try:
+            async with asyncio.timeout(30):
+                guild = bot.get_guild(interaction.guild_id)
+                channel = _lfg_channels.get(interaction.guild_id)
+                name = dict(GAME_INTERESTS).get(self.game_key)
+                role = discord.utils.get(guild.roles,name=f'Game | {name}') if guild and name else None
+                if not channel or not role:
+                    await interaction.edit_original_response(content='The game channel or role is unavailable. Contact staff.')
+                    return
+                key = (guild.id, interaction.user.id)
+                async with _lfg_post_locks.setdefault(key,asyncio.Lock()):
+                    now = datetime.now(timezone.utc)
+                    last = _lfg_last_post.get(key)
+                    if last and (now-last).total_seconds() < 300:
+                        await interaction.edit_original_response(content='Please wait five minutes between group requests.')
+                        return
+                    start = discord.utils.escape_markdown(str(self.start_time).strip())
+                    await channel.send(
+                        f'{role.mention}\n**{name} — LOOKING FOR GROUP**\n'
+                        f'Host: {interaction.user.mention}\nTotal party: **{size}** ({size-1} more players wanted)\n'
+                        f'Start: **{start}** (Eastern)\n\nReply here or contact the host to join.',
+                        allowed_mentions=discord.AllowedMentions(everyone=False,roles=[role],users=[interaction.user]))
+                    _lfg_last_post[key] = now
+                await interaction.edit_original_response(content=f'Posted your {name} group request in {channel.mention}.')
+        except Exception:
+            log.exception('[LFG POST FAILED] user=%s',interaction.user.id)
+            await interaction.edit_original_response(content='Could not confirm the group post. Check the channel before retrying.')
+
+class GamePickerView(discord.ui.View):
+    def __init__(self, mode):
+        super().__init__(timeout=180)
+        self.mode = mode
+        self.game_key = None
+        self.time_slot = None
+        self.add_item(GameChoiceSelect())
+        if mode == 'poll':
+            self.add_item(TonightTimeSelect())
+    @discord.ui.button(label='Continue / Save',style=discord.ButtonStyle.success)
+    async def submit(self, interaction, button):
+        if not self.game_key or (self.mode == 'poll' and not self.time_slot):
+            await interaction.response.send_message('Choose a game' + (' and a time.' if self.mode == 'poll' else '.'),ephemeral=True)
+            return
+        if self.mode == 'lfg':
+            await interaction.response.send_modal(LFGDetailsModal(self.game_key))
+            return
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            async with asyncio.timeout(30):
+                today = datetime.now(SEEDING_TIMEZONE).date()
+                await collector.db.execute("""INSERT INTO clerk_game_availability(guild_id,poll_date,discord_user_id,game_key,time_slot)
+                    VALUES($1,$2,$3,$4,$5) ON CONFLICT(guild_id,poll_date,discord_user_id,game_key)
+                    DO UPDATE SET time_slot=EXCLUDED.time_slot,updated_at=NOW()""",
+                    str(interaction.guild_id),today,str(interaction.user.id),self.game_key,self.time_slot)
+                await refresh_tonight_poll(bot.get_guild(interaction.guild_id))
+                await interaction.edit_original_response(content='Your availability is saved. You can add another game or update your time.')
+        except Exception:
+            log.exception('[TONIGHT VOTE FAILED] user=%s',interaction.user.id)
+            await interaction.edit_original_response(content='Could not confirm your vote. Please check the poll and try again.')
+    @discord.ui.button(label='Remove availability',style=discord.ButtonStyle.secondary)
+    async def remove(self, interaction, button):
+        if self.mode != 'poll' or not self.game_key:
+            await interaction.response.send_message('Choose the game whose availability you want to remove.',ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            async with asyncio.timeout(30):
+                await collector.db.execute("""DELETE FROM clerk_game_availability
+                    WHERE guild_id=$1 AND poll_date=$2 AND discord_user_id=$3 AND game_key=$4""",
+                    str(interaction.guild_id),datetime.now(SEEDING_TIMEZONE).date(),str(interaction.user.id),self.game_key)
+                await refresh_tonight_poll(bot.get_guild(interaction.guild_id))
+                await interaction.edit_original_response(content='Removed your availability for that game.')
+        except Exception:
+            log.exception('[TONIGHT REMOVE FAILED] user=%s',interaction.user.id)
+            await interaction.edit_original_response(content='Could not confirm removal. Please try again.')
+
+async def open_game_picker(interaction, mode):
+    if not interaction.guild_id or (GUILD_ID and interaction.guild_id != GUILD_ID):
+        await interaction.response.send_message('Use this panel in the community server.',ephemeral=True)
+        return
+    view = GamePickerView(mode)
+    if mode == 'lfg':
+        view.remove_item(next(item for item in view.children if getattr(item,'label','') == 'Remove availability'))
+    await interaction.response.send_message('Choose your game' + (' and time.' if mode == 'poll' else ', then enter your party size and start time.'),view=view,ephemeral=True)
+
+class LFGPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label='FIND A GROUP',style=discord.ButtonStyle.primary,custom_id='5thcav:lfg:open')
+    async def open(self, interaction, button):
+        await open_game_picker(interaction,'lfg')
+
+class TonightPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label='WHO IS PLAYING TONIGHT?',style=discord.ButtonStyle.success,custom_id='5thcav:tonight:open')
+    async def open(self, interaction, button):
+        await open_game_picker(interaction,'poll')
+
+async def ensure_lfg_panels():
+    try:
+        await ensure_tonight_table()
+        for guild in bot.guilds:
+            if not GUILD_ID or guild.id != GUILD_ID:
+                continue
+            channels = [c for c in guild.text_channels if c.name == _LFG_CHANNEL_NAME]
+            if len(channels) > 1:
+                raise RuntimeError('Multiple looking-for-group channels; staff must resolve')
+            channel = channels[0] if channels else await guild.create_text_channel(
+                _LFG_CHANNEL_NAME,topic='Find players across all community games. Times are Eastern.',
+                overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=True,read_message_history=True,
+                    send_messages=True),guild.me:discord.PermissionOverwrite(view_channel=True,read_message_history=True,
+                    send_messages=True,manage_messages=True)},reason='Shared multi-game group finder')
+            _lfg_channels[guild.id] = channel
+            found = {}
+            async for message in channel.history(limit=100):
+                if message.author.id != bot.user.id:
+                    continue
+                for title in (_LFG_PANEL_TITLE,_TONIGHT_PANEL_TITLE):
+                    if message.content.startswith(title):
+                        found[title] = message
+            lfg_content = (_LFG_PANEL_TITLE + '\n\nChoose a game, total party size, and start time. '
+                'The bot will post your request here and ping only that game role.\n'
+                'One group request per person every five minutes. Times are Eastern.')
+            if _LFG_PANEL_TITLE in found:
+                await found[_LFG_PANEL_TITLE].edit(content=lfg_content,view=LFGPanelView(),allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await channel.send(lfg_content,view=LFGPanelView(),allowed_mentions=discord.AllowedMentions.none())
+            _tonight_messages[guild.id] = found.get(_TONIGHT_PANEL_TITLE) or await channel.send(
+                _TONIGHT_PANEL_TITLE,view=TonightPanelView(),allowed_mentions=discord.AllowedMentions.none())
+            await refresh_tonight_poll(guild)
+            log.info('[LFG PANELS READY] guild=%s channel=%s tonight_message=%s',
+                guild.id,channel.id,_tonight_messages[guild.id].id)
+    except Exception:
+        log.exception('[LFG PANEL SETUP FAILED]')
+
+
 async def ensure_game_interest_panel():
     for guild in bot.guilds:
         if not GUILD_ID or guild.id != GUILD_ID:
@@ -5214,6 +5426,10 @@ async def ensure_game_interest_panel():
 
 @bot.event
 async def on_ready():
+    if not getattr(bot, '_lfg_views_registered', False):
+        bot.add_view(LFGPanelView())
+        bot.add_view(TonightPanelView())
+        bot._lfg_views_registered = True
     if not getattr(bot, '_game_interest_panel_registered', False):
         bot.add_view(GameInterestView())
         bot._game_interest_panel_registered = True
@@ -5281,6 +5497,9 @@ async def on_ready():
     if not collector_started:
         await collector.start()
         collector_started = True
+
+    if not getattr(bot, '_lfg_setup_task', None):
+        bot._lfg_setup_task = asyncio.create_task(ensure_lfg_panels())
 
     # HLL: Vietnam RCON is a read-only telemetry layer. A failed/unconfigured
     # RCON connection must never prevent Discord or website automation startup.
