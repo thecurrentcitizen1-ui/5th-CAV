@@ -5047,7 +5047,7 @@ async def refresh_game_panel(guild):
     if message is None:
         return
     async with _game_panel_locks.setdefault(guild.id, asyncio.Lock()):
-        signature = tuple(game_role_count(guild, f'Game | {name}') for _, name in GAME_INTERESTS)
+        signature = tuple(game_role_count(guild, game_interest_role_name(key, name)) for key, name in GAME_INTERESTS)
         if _game_panel_signatures.get(guild.id) != signature:
             await message.edit(view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
             _game_panel_signatures[guild.id] = signature
@@ -5066,13 +5066,60 @@ async def game_panel_count_watch():
 async def before_game_panel_count_watch():
     await bot.wait_until_ready()
 
+
+def game_interest_role_name(key, name):
+    return '5th Cavalry Regiment' if key == 'hll-vietnam' else f'Game | {name}'
+
+async def join_hll_regiment(member):
+    guild = member.guild
+    regiment = _role_by_name(guild, '5th Cavalry Regiment')
+    ranks, _ = _role_code_hits(member)
+    private = _guild_role_for_code(guild, 'PVT', RANK_ROLE_CODES) if not ranks else None
+    if not regiment or (not ranks and not private):
+        raise RuntimeError('Existing Regiment/PVT role missing; staff must restore it')
+    additions = [r for r in (regiment, private) if r and r not in member.roles]
+    me = guild.me
+    for role in additions:
+        p = role.permissions
+        if role.managed or not me or role >= me.top_role or any(getattr(p, flag, False) for flag in
+            ('administrator','manage_roles','manage_guild','manage_channels','ban_members','kick_members')):
+            raise RuntimeError('Regiment entry role permissions or hierarchy require staff review')
+    if additions:
+        await member.add_roles(*additions, atomic=True, reason='Member opted into Hell Let Loose Vietnam')
+    return regiment, bool(private and private in additions)
+
+async def migrate_hll_interest_access(guild):
+    regiment = _role_by_name(guild, '5th Cavalry Regiment')
+    if not regiment:
+        raise RuntimeError('Existing Regiment role missing')
+    legacy = _role_by_name(guild, 'Game | Hell Let Loose Vietnam')
+    migrated = 0
+    if legacy:
+        for channel in guild.channels:
+            if legacy in channel.overwrites:
+                old = channel.overwrites_for(legacy)
+                if old.view_channel is True:
+                    current = channel.overwrites_for(regiment)
+                    for field, value in old:
+                        if value is True:
+                            setattr(current, field, True)
+                    await channel.set_permissions(regiment, overwrite=current,
+                        reason='Use existing Regiment membership for HLL game access')
+        for member in list(legacy.members):
+            if not member.bot:
+                await join_hll_regiment(member)
+                migrated += 1
+    log.info('[HLL REGIMENT BUTTON READY] guild=%s legacy_members=%s', guild.id, migrated)
+
+
 class GameInterestButton(discord.ui.Button):
     def __init__(self, key, name, row, count=0):
         self.game_name = name
         styles = (discord.ButtonStyle.primary, discord.ButtonStyle.success, discord.ButtonStyle.danger)
         super().__init__(label=f'{name} · {count}', style=styles[row % 3],
                          custom_id=f'5thcav:game-interest:{key}', row=row)
-        self.role_name = f'Game | {name}'
+        self.game_key = key
+        self.role_name = game_interest_role_name(key, name)
 
     async def callback(self, interaction):
         if not interaction.guild_id or (GUILD_ID and interaction.guild_id != GUILD_ID):
@@ -5084,6 +5131,19 @@ class GameInterestButton(discord.ui.Button):
                 guild = bot.get_guild(interaction.guild_id)
                 if guild is None:
                     raise RuntimeError('server not available')
+                if self.game_key == 'hll-vietnam':
+                    async with _game_role_locks.setdefault((guild.id, interaction.user.id), asyncio.Lock()):
+                        member = await guild.fetch_member(interaction.user.id)
+                        regiment, new_private = await join_hll_regiment(member)
+                    _game_count_overrides[(guild.id, regiment.id, member.id)] = True
+                    await interaction.edit_original_response(content='You have **5th Cavalry Regiment** access. ' +
+                        ('**PVT** was added because you had no existing rank. ' if new_private else 'Your existing rank is preserved. ') +
+                        'Clicking again will not remove your unit membership or rank.')
+                    try:
+                        await refresh_game_panel(guild)
+                    except Exception:
+                        log.exception('[HLL PANEL REFRESH FAILED] guild=%s', guild.id)
+                    return
                 matches = [r for r in guild.roles if r.name == self.role_name]
                 role = matches[0] if len(matches) == 1 else None
                 if not role or role.managed or role.permissions.value or not guild.me or role >= guild.me.top_role:
@@ -5236,7 +5296,7 @@ class LFGDetailsModal(discord.ui.Modal, title='Find players'):
                 guild = bot.get_guild(interaction.guild_id)
                 channel = _lfg_channels.get(interaction.guild_id)
                 name = dict(GAME_INTERESTS).get(self.game_key)
-                role = discord.utils.get(guild.roles,name=f'Game | {name}') if guild and name else None
+                role = _role_by_name(guild,game_interest_role_name(self.game_key, name)) if guild and name else None
                 if not channel or not role:
                     await interaction.edit_original_response(content='The game channel or role is unavailable. Contact staff.')
                     return
@@ -5372,7 +5432,10 @@ async def ensure_game_interest_panel():
         if not GUILD_ID or guild.id != GUILD_ID:
             continue
         try:
+            await migrate_hll_interest_access(guild)
             for key, name in GAME_INTERESTS:
+                if key == 'hll-vietnam':
+                    continue
                 role_name = f'Game | {name}'
                 matches = [r for r in guild.roles if r.name == role_name]
                 if not matches:
@@ -5397,7 +5460,7 @@ async def ensure_game_interest_panel():
                        'Pick the games you play so we can find players and organize groups.\n'
                        '**Choose as many as you want.** Click a button to add its role; click again to remove it.\n'
                        'The number on each button shows current members with that game role.\n\n'
-                       'These are game interests only. Your 5th Cav rank and assignment stay the same.')
+                       '**Hell Let Loose Vietnam:** Adds 5th Cavalry Regiment and PVT only if you have no rank. Existing ranks are preserved; clicking again does not remove unit membership. Other games toggle on/off.')
             message = None
             panels = []
             async for candidate in channel.history(limit=100):
