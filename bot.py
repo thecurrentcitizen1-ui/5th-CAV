@@ -5115,8 +5115,9 @@ async def migrate_hll_interest_access(guild):
 class GameInterestButton(discord.ui.Button):
     def __init__(self, key, name, row, count=0):
         self.game_name = name
-        styles = (discord.ButtonStyle.primary, discord.ButtonStyle.success, discord.ButtonStyle.danger)
-        super().__init__(label=f'{name} · {count}', style=styles[row % 3],
+        icons = {'wardogs':'🐺','tarkov':'🎒','hll-vietnam':'🚁','squad':'🪖','gears':'⚙️','glory':'🛡️','ready-or-not':'🚔','bodycam':'📹','runescape':'⚔️'}
+        super().__init__(label=f'{name} · {count}', emoji=icons.get(key, '🎮'),
+                         style=discord.ButtonStyle.success if key == 'hll-vietnam' else discord.ButtonStyle.primary,
                          custom_id=f'5thcav:game-interest:{key}', row=row)
         self.game_key = key
         self.role_name = game_interest_role_name(key, name)
@@ -5428,63 +5429,50 @@ async def ensure_lfg_panels():
 
 
 async def ensure_game_interest_panel():
+    """Presentation-only refresh: never provision roles, channels, or categories."""
     for guild in bot.guilds:
         if not GUILD_ID or guild.id != GUILD_ID:
             continue
         try:
-            await migrate_hll_interest_access(guild)
-            for key, name in GAME_INTERESTS:
-                if key == 'hll-vietnam':
-                    continue
-                role_name = f'Game | {name}'
-                matches = [r for r in guild.roles if r.name == role_name]
-                if not matches:
-                    await guild.create_role(name=role_name, permissions=discord.Permissions.none(),
-                                            hoist=False, mentionable=False, reason='Optional member game interests')
-                elif len(matches) != 1 or matches[0].managed or matches[0].permissions.value:
-                    raise RuntimeError(f'Unsafe or duplicate game role: {role_name}')
-            # Existing game categories are managed in place; panel recovery never recreates them.
             channels = [c for c in guild.text_channels if c.name == 'game-roles']
-            if len(channels) > 1:
-                raise RuntimeError('Multiple game-roles channels; staff must resolve')
-            channel = channels[0] if channels else await guild.create_text_channel(
-                'game-roles', topic='Choose your games. Click to add or remove a game role; multiple games allowed.',
-                overwrites={
-                    guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
-                        send_messages=False, create_public_threads=False, create_private_threads=False,
-                        send_messages_in_threads=False),
-                    guild.me: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
-                        send_messages=True, manage_messages=True)
-                }, reason='Permanent optional game role selector')
-            content = (GAME_PANEL_TITLE + '\n\n'
-                       'Pick the games you play so we can find players and organize groups.\n'
-                       '**Choose as many as you want.** Click a button to add its role; click again to remove it.\n'
-                       'The number on each button shows current members with that game role.\n\n'
-                       '**Hell Let Loose Vietnam:** Adds 5th Cavalry Regiment and PVT only if you have no rank. Existing ranks are preserved; clicking again does not remove unit membership. Other games toggle on/off.')
-            message = None
+            if len(channels) != 1:
+                log.warning('[GAME PANEL EDIT SKIPPED] guild=%s expected_existing_channel=true', guild.id)
+                continue
+            channel = channels[0]
             panels = []
             async for candidate in channel.history(limit=100):
                 is_panel = any(str(getattr(child, 'custom_id', '')).startswith('5thcav:game-interest:')
                                for row in candidate.components for child in row.children)
                 if candidate.author.id == bot.user.id and (candidate.content.startswith(GAME_PANEL_TITLE) or is_panel):
                     panels.append(candidate)
-            if panels:
-                message = panels[-1]
-            if message:
-                await message.edit(content=content, view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
-            else:
-                message = await channel.send(content, view=GameInterestView(guild), allowed_mentions=discord.AllowedMentions.none())
+            if not panels:
+                log.warning('[GAME PANEL EDIT SKIPPED] guild=%s expected_existing_message=true', guild.id)
+                continue
+            message = panels[-1]
+            embed = discord.Embed(
+                title='CHOOSE YOUR GAMES',
+                description='**Choose your games. Unlock your channels. Find your people.**\n\n'
+                            'Select as many games as you like using the buttons below.',
+                colour=0xC5A34E)
+            embed.set_author(name='5TH CAV GAMING', **({'icon_url':str(guild.icon.url)} if guild.icon else {}))
+            if guild.icon:
+                embed.set_thumbnail(url=str(guild.icon.url))
+            embed.add_field(name='🎮 YOUR GAMES', value='Blue buttons add or remove a game role and its channel access.', inline=False)
+            embed.add_field(name='🚁 HELL LET LOOSE VIETNAM', value='The green button joins **5th Cavalry Regiment**.\n'
+                '**PVT** is added only if you have no rank. Existing ranks are preserved.\n'
+                'Clicking again will not remove unit membership.', inline=False)
+            embed.set_footer(text='Button numbers show current role holders • Multiple games welcome')
+            await message.edit(content='', embed=embed, view=GameInterestView(guild),
+                               allowed_mentions=discord.AllowedMentions.none())
             _game_panels[guild.id] = message
-            _game_panel_signatures[guild.id] = tuple(game_role_count(guild, f'Game | {name}') for _, name in GAME_INTERESTS)
-            for duplicate in panels:
-                if duplicate.id != message.id:
-                    await duplicate.delete()
+            _game_panel_signatures[guild.id] = tuple(
+                game_role_count(guild, game_interest_role_name(key, name)) for key, name in GAME_INTERESTS)
             if not game_panel_count_watch.is_running():
                 game_panel_count_watch.start()
-            log.info('[GAME ROLE PANEL READY] guild=%s channel=%s message=%s games=%s',
-                     guild.id, channel.id, message.id, len(GAME_INTERESTS))
+            log.info('[GAME PANEL DESIGN UPDATED] guild=%s channel=%s message=%s',
+                     guild.id, channel.id, message.id)
         except Exception:
-            log.exception('[GAME ROLE PANEL SETUP FAILED] guild=%s', guild.id)
+            log.exception('[GAME PANEL DESIGN FAILED] guild=%s', guild.id)
 
 
 @bot.event
