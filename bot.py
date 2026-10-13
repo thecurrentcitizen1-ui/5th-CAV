@@ -5022,17 +5022,27 @@ _game_panels = {}
 _game_panel_signatures = {}
 _game_count_overrides = {}
 _game_panel_locks = {}
+_game_count_members = {}
+_game_count_loaded_at = {}
+
+async def load_game_role_members(guild):
+    snapshot = {}
+    async with asyncio.timeout(45):
+        async for member in guild.fetch_members(limit=None):
+            if not member.bot:
+                for role in member.roles:
+                    snapshot.setdefault(role.id, set()).add(member.id)
+    _game_count_members[guild.id] = snapshot
+    _game_count_loaded_at[guild.id] = datetime.now(timezone.utc)
+
 
 def game_role_count(guild, role_name):
     role = _role_by_name(guild, role_name)
     if not role:
         return 0
-    ids = {m.id for m in role.members if not m.bot}
+    ids = set(_game_count_members[guild.id].get(role.id, set())) if guild.id in _game_count_members else {m.id for m in role.members if not m.bot}
     for (gid, rid, uid), selected in list(_game_count_overrides.items()):
         if gid != guild.id or rid != role.id:
-            continue
-        if guild.get_member(uid) is None:
-            _game_count_overrides.pop((gid, rid, uid), None)
             continue
         if (uid in ids) == selected:
             _game_count_overrides.pop((gid, rid, uid), None)
@@ -5057,6 +5067,9 @@ async def refresh_game_panel(guild):
 async def game_panel_count_watch():
     for guild in bot.guilds:
         try:
+            last = _game_count_loaded_at.get(guild.id)
+            if guild.id in _game_panels and (not last or (datetime.now(timezone.utc)-last).total_seconds() >= 120):
+                await load_game_role_members(guild)
             await refresh_game_panel(guild)
             await refresh_tonight_poll(guild)
         except Exception:
@@ -5435,7 +5448,7 @@ async def ensure_game_interest_panel():
             continue
         try:
             # Populate the full member cache before deriving existing role-holder counts.
-            await asyncio.wait_for(guild.chunk(cache=True), timeout=90)
+            await load_game_role_members(guild)
             counts = {name: game_role_count(guild, game_interest_role_name(key, name))
                       for key, name in GAME_INTERESTS}
             log.info('[GAME ROLE COUNTS BACKFILLED] guild=%s members=%s counts=%s',
