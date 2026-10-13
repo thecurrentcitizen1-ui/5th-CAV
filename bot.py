@@ -5024,7 +5024,7 @@ _game_count_overrides = {}
 _game_panel_locks = {}
 
 def game_role_count(guild, role_name):
-    role = discord.utils.get(guild.roles, name=role_name)
+    role = _role_by_name(guild, role_name)
     if not role:
         return 0
     ids = {m.id for m in role.members if not m.bot}
@@ -5434,6 +5434,12 @@ async def ensure_game_interest_panel():
         if not GUILD_ID or guild.id != GUILD_ID:
             continue
         try:
+            # Populate the full member cache before deriving existing role-holder counts.
+            await asyncio.wait_for(guild.chunk(cache=True), timeout=90)
+            counts = {name: game_role_count(guild, game_interest_role_name(key, name))
+                      for key, name in GAME_INTERESTS}
+            log.info('[GAME ROLE COUNTS BACKFILLED] guild=%s members=%s counts=%s',
+                     guild.id, len(guild.members), counts)
             channels = [c for c in guild.text_channels if c.name == 'game-roles']
             if len(channels) != 1:
                 log.warning('[GAME PANEL EDIT SKIPPED] guild=%s expected_existing_channel=true', guild.id)
