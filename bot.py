@@ -5084,7 +5084,7 @@ async def before_game_panel_count_watch():
 
 
 def game_interest_role_name(key, name):
-    return '5th Cavalry Regiment' if key == 'hll-vietnam' else f'Game | {name}'
+    return '5th Cavalry Regiment' if key == 'hll-vietnam' else name
 
 async def join_hll_regiment(member):
     guild = member.guild
@@ -5161,7 +5161,7 @@ class GameInterestButton(discord.ui.Button):
                     except Exception:
                         log.exception('[HLL PANEL REFRESH FAILED] guild=%s', guild.id)
                     return
-                matches = [r for r in guild.roles if r.name == self.role_name]
+                matches = [r for r in guild.roles if _normalized_role_name(r.name) == _normalized_role_name(self.role_name)]
                 role = matches[0] if len(matches) == 1 else None
                 if not role or role.managed or role.permissions.value or not guild.me or role >= guild.me.top_role:
                     await interaction.edit_original_response(content='This game role needs a staff permissions check. Please contact Command.')
