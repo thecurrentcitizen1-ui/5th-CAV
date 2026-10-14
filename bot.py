@@ -5188,7 +5188,7 @@ class GameInterestView(discord.ui.View):
         super().__init__(timeout=None)
         for index, (key, name) in enumerate(GAME_INTERESTS):
             self.add_item(GameInterestButton(key, name, index // 3,
-                game_role_count(guild, f'Game | {name}') if guild else 0))
+                game_role_count(guild, game_interest_role_name(key, name)) if guild else 0))
 
 
 async def ensure_game_categories(guild):
@@ -5488,6 +5488,9 @@ async def ensure_game_interest_panel():
                 game_role_count(guild, game_interest_role_name(key, name)) for key, name in GAME_INTERESTS)
             if not game_panel_count_watch.is_running():
                 game_panel_count_watch.start()
+            verified = await channel.fetch_message(message.id)
+            labels = [child.label for row in verified.components for child in row.children if hasattr(child, 'label')]
+            log.info('[GAME BUTTON LABELS VERIFIED] guild=%s labels=%s', guild.id, labels)
             log.info('[GAME PANEL DESIGN UPDATED] guild=%s channel=%s message=%s',
                      guild.id, channel.id, message.id)
         except Exception:
