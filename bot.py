@@ -5032,6 +5032,9 @@ async def load_game_role_members(guild):
             if not member.bot:
                 for role in member.roles:
                     snapshot.setdefault(role.id, set()).add(member.id)
+    log.info('[GAME ROLE INVENTORY] guild=%s roles=%s', guild.id,
+        [(r.id, r.name, len(snapshot.get(r.id, set()))) for r in guild.roles
+         if any(name.lower() in r.name.lower() for _, name in GAME_INTERESTS)])
     _game_count_members[guild.id] = snapshot
     _game_count_loaded_at[guild.id] = datetime.now(timezone.utc)
 
